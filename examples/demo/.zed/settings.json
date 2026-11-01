@@ -1,4 +1,6 @@
 {
+  "code_lens": "on",
+  "inlay_hints": { "enabled": true },
   "languages": {
     "Rust": {
       "language_servers": ["rust-analyzer", "wish", "..."],

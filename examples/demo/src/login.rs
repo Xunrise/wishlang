@@ -9,8 +9,10 @@ pub struct SimpleLoginScreen {
     title: String,
     user_name_field: Field,
     password_field: PasswordField,
-    login_button_color: String,
+    login_button_color: Color,
 }
+
+pub enum Color {}
 
 /// A single-line text input with a label.
 ///
@@ -31,14 +33,18 @@ pub struct PasswordField {
 impl Field {
     /// Creates an empty field labelled `label`.
     pub fn new(label: impl Into<String>) -> Self {
-        Field { label: label.into() }
+        Field {
+            label: label.into(),
+        }
     }
 }
 
 impl PasswordField {
     /// Creates an empty password field labelled `label`.
     pub fn new(label: impl Into<String>) -> Self {
-        PasswordField { label: label.into() }
+        PasswordField {
+            label: label.into(),
+        }
     }
 }
 
