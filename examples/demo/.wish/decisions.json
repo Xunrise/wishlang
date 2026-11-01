@@ -27,5 +27,18 @@
     "why": "main's last expression is `.run()` with no semicolon, so it has to evaluate to `()`.",
     "crates": [],
     "status": "proposed"
+  },
+  {
+    "id": 3,
+    "kind": "architecture",
+    "title": "How an App holds its content",
+    "choice": "`App::contains` takes any `impl Screen` (a trait with `describe()`), stored as `Box<dyn Screen>`; `SimpleLoginScreen` implements it in src/login.rs",
+    "alternatives": [
+      "A fixed enum of known screens",
+      "Generic `App<S>` type parameter"
+    ],
+    "why": "Lets you pass your own screen structs to `contains` without the App knowing about them.",
+    "crates": [],
+    "status": "proposed"
   }
 ]

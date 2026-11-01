@@ -1,1 +1,26 @@
-[]
+[
+  {
+    "id": 1,
+    "file": "src/main.rs",
+    "reason": "This is the last compile error. Field default values (`= ...`) only work on nightly Rust, and `\"Hello World\"` is a `&str`, not a `String`. `SimpleLoginScreen::new()` already sets the title to \"Hello World\".",
+    "replace": "    title: String = \"Hello World\",",
+    "with": "    title: String,",
+    "status": "proposed"
+  },
+  {
+    "id": 2,
+    "file": "src/main.rs",
+    "reason": "The app is built but never started, so no window opens. Calling `run()` opens the 800x600 window and prints the login screen.",
+    "replace": "    );\n}",
+    "with": "    );\n    app.run();\n}",
+    "status": "proposed"
+  },
+  {
+    "id": 3,
+    "file": "src/main.rs",
+    "reason": "`withLoginButtonOfColor` has nowhere to keep the colour, so for now it only prints it. Adding a field lets the screen remember it (it's a `String` for now; a colour type can come later).",
+    "replace": "    password_field: PasswordField\n}",
+    "with": "    password_field: PasswordField,\n    login_button_color: String,\n}",
+    "status": "proposed"
+  }
+]

@@ -1,4 +1,5 @@
 use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
@@ -15,22 +16,30 @@ pub enum Mode {
 /// A window that has been described but not yet shown.
 pub struct WindowSpec {
     title: String,
+    size: Option<(u32, u32)>,
 }
 
 /// A window that is configured to open and ready to [`run`](OpenWindow::run).
 pub struct OpenWindow {
     title: String,
     mode: Mode,
+    size: Option<(u32, u32)>,
 }
 
 impl WindowSpec {
     pub(crate) fn new(title: String) -> Self {
-        WindowSpec { title }
+        WindowSpec { title, size: None }
+    }
+
+    /// Sets the window's inner size in logical pixels.
+    pub fn size(mut self, width: u32, height: u32) -> Self {
+        self.size = Some((width, height));
+        self
     }
 
     /// Chooses the [`Mode`] the window opens in. Nothing is shown until `run`.
     pub fn open(self, mode: Mode) -> OpenWindow {
-        OpenWindow { title: self.title, mode }
+        OpenWindow { title: self.title, mode, size: self.size }
     }
 }
 
@@ -57,9 +66,12 @@ impl ApplicationHandler for Handler {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title(self.spec.title.clone())
             .with_maximized(self.spec.mode == Mode::Maximized);
+        if let Some((width, height)) = self.spec.size {
+            attrs = attrs.with_inner_size(LogicalSize::new(width, height));
+        }
         self.window = Some(event_loop.create_window(attrs).expect("could not create the window"));
     }
 
