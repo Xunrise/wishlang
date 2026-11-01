@@ -12,8 +12,8 @@ use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use notify::Watcher;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::Child;
+use std::io::Write;
+use crate::preview::Preview;
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
@@ -31,9 +31,10 @@ fn out(line: &str) {
     let _ = o.flush();
 }
 
-const HELP: &str = "\x1b[1mkeys\x1b[0m  c compile · f force (re-ask Claude) · w toggle compile-on-save · r restart preview · u undo last cycle\n      d decisions · s suggestions · i items · : command (adopt X, decide 1 accept, accept 2, note <text>…) · q quit";
+const HELP: &str = "\x1b[1mkeys\x1b[0m  c compile · f force (re-ask Claude) · w toggle compile-on-save · r restart preview · u undo last cycle · I implement prototype\n      d decisions · s suggestions · i items · : command (adopt X, decide 1 accept, accept 2, note <text>…) · q quit";
 
 pub fn run(project: Project) -> Result<()> {
+    engine::ensure_journal(&project, &crate::git::Git::open(&project.root)?)?;
     let root = project.root.clone();
     let (tx, rx) = mpsc::channel::<Msg>();
 
@@ -59,7 +60,7 @@ struct Dev {
     tx: Sender<Msg>,
     busy: bool,
     auto: bool,
-    preview: Option<Child>,
+    preview: Preview,
     last_seen: BTreeMap<String, String>,
     pending_change: Option<Instant>,
     cmdline: Option<String>,
@@ -67,7 +68,7 @@ struct Dev {
 
 fn event_loop(project: Project, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Result<()> {
     let last_seen = project.protected_files();
-    let mut d = Dev { project, tx, busy: false, auto: true, preview: None, last_seen, pending_change: None, cmdline: None };
+    let mut d = Dev { project, tx, busy: false, auto: true, preview: Preview::default(), last_seen, pending_change: None, cmdline: None };
     out(&format!("\x1b[1mwishlang dev\x1b[0m: {} · watching {}", d.project.root.display(), d.project.cfg.protected.files.join(", ")));
     out(HELP);
     d.compile(false, None);
@@ -104,11 +105,8 @@ fn event_loop(project: Project, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Res
                 }
             }
         }
-        if let Some(c) = d.preview.as_mut() {
-            if let Ok(Some(status)) = c.try_wait() {
-                out(&format!("\x1b[2m[app exited: {status}]\x1b[0m"));
-                d.preview = None;
-            }
+        if let Some(status) = d.preview.exited() {
+            out(&format!("\x1b[2m[app exited: {status}]\x1b[0m"));
         }
         if event::poll(Duration::from_millis(80))? {
             if let TermEvent::Key(k) = event::read()? {
@@ -118,9 +116,7 @@ fn event_loop(project: Project, tx: Sender<Msg>, rx: mpsc::Receiver<Msg>) -> Res
             }
         }
     }
-    if let Some(mut c) = d.preview.take() {
-        let _ = c.kill();
-    }
+    d.preview.stop();
     Ok(())
 }
 
@@ -139,6 +135,10 @@ impl Dev {
     }
 
     fn compile(&mut self, force: bool, note: Option<String>) {
+        self.run_cycle(Options { force, note, mode: engine::Mode::Prototype });
+    }
+
+    fn run_cycle(&mut self, opts: Options) {
         if self.busy {
             out("\x1b[2m(already compiling)\x1b[0m");
             return;
@@ -158,7 +158,7 @@ impl Dev {
             });
             let ok = match Project::load(&root) {
                 Ok(mut p) => {
-                    let ok = engine::compile(&mut p, &mut sink, &Options { force, note }).unwrap_or_else(|e| {
+                    let ok = engine::compile(&mut p, &mut sink, &opts).unwrap_or_else(|e| {
                         let _ = sink.0.send(Event::Violation { msg: format!("{e:#}") });
                         false
                     });
@@ -215,23 +215,11 @@ impl Dev {
     }
 
     fn restart_preview(&mut self) {
-        if let Some(mut c) = self.preview.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        match engine::spawn_preview(&self.project, true) {
-            Ok(mut c) => {
-                for stream in [c.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), c.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten() {
-                    let tx = self.tx.clone();
-                    std::thread::spawn(move || {
-                        for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                            let _ = tx.send(Msg::Ev(Event::App { line }));
-                        }
-                    });
-                }
-                out("\x1b[1m▸ preview running\x1b[0m");
-                self.preview = Some(c);
-            }
+        let tx = self.tx.clone();
+        match self.preview.restart(&self.project, move |line| {
+            let _ = tx.send(Msg::Ev(Event::App { line }));
+        }) {
+            Ok(()) => out("\x1b[1m▸ preview running\x1b[0m"),
             Err(e) => out(&format!("could not start preview: {e}")),
         }
     }
@@ -278,6 +266,7 @@ impl Dev {
             }
             KeyCode::Char('r') => self.restart_preview(),
             KeyCode::Char('u') => self.undo(),
+            KeyCode::Char('I') => self.run_cycle(commands::implement_options(None, None)),
             KeyCode::Char('d') => self.show(commands::decisions(&self.project)),
             KeyCode::Char('s') => self.show(commands::suggestions(&self.project)),
             KeyCode::Char('i') => self.show(commands::items(&self.project)),
@@ -321,6 +310,10 @@ impl Dev {
                     (Some(id), Some("reject"), reason) => commands::decide(&self.project, id, false, reason.map(String::from)),
                     _ => Err(anyhow::anyhow!("usage: decide <id> accept | decide <id> reject <reason>")),
                 }
+            }
+            "implement" => {
+                self.run_cycle(commands::implement_options((!rest.is_empty()).then(|| rest.to_string()), None));
+                return;
             }
             "note" => {
                 self.compile(true, Some(rest.to_string()));

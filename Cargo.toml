@@ -1,4 +1,4 @@
 [workspace]
 members = ["wish"]
-exclude = ["examples"]
+exclude = ["examples", "zed"]
 resolver = "3"

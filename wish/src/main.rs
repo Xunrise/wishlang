@@ -8,6 +8,11 @@ mod events;
 mod git;
 mod hook;
 mod items;
+mod journal;
+mod lsp;
+mod pending;
+mod preview;
+mod provenance;
 mod project;
 
 use clap::{Parser, Subcommand};
@@ -67,6 +72,23 @@ enum Cmd {
     Undo,
     /// Verify adopted items, dependency decisions and the build.
     Check,
+    /// Turn the approved prototype into the real implementation (whole project, or one file).
+    Implement {
+        file: Option<String>,
+        /// Only this item, e.g. `Mode::Windowed` or `OpenWindow::background`.
+        #[arg(long)]
+        item: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The journal: every save and every Claude cycle with its reasoning (also on branch wish/<project>/log).
+    Log {
+        /// Show full diffs, not just file stats.
+        #[arg(short, long)]
+        patch: bool,
+    },
+    /// Language server for editors (Zed): blue markers, provenance hints, compile on save.
+    Lsp,
     /// Claude Code PreToolUse hook (internal).
     #[command(hide = true)]
     Hook,
@@ -92,7 +114,7 @@ fn run() -> anyhow::Result<()> {
         Cmd::Compile { json, force, no_run, note } => {
             let mut p = Project::discover()?;
             let mut sink: Box<dyn events::Sink> = if json { Box::new(events::Json) } else { Box::new(events::Human) };
-            let ok = engine::compile(&mut p, sink.as_mut(), &engine::Options { force, note })?;
+            let ok = engine::compile(&mut p, sink.as_mut(), &engine::Options { force, note, mode: engine::Mode::Prototype })?;
             if !ok {
                 std::process::exit(1);
             }
@@ -113,6 +135,25 @@ fn run() -> anyhow::Result<()> {
         Cmd::Suggestions => print(commands::suggestions(&Project::discover()?)),
         Cmd::Accept { id } => print(commands::accept(&mut Project::discover()?, id)),
         Cmd::Reject { id } => print(commands::reject(&Project::discover()?, id)),
+        Cmd::Lsp => lsp::run(),
+        Cmd::Log { patch } => {
+            let p = Project::discover()?;
+            let g = git::Git::open(&p.root)?;
+            let Some(j) = g.journal() else { anyhow::bail!("no journal yet: save once in Zed or run `wish compile`") };
+            let mut c = std::process::Command::new("git");
+            c.current_dir(&p.root).args(["log", "--first-parent", "--color=auto", "--format=%C(yellow)%h%Creset %C(bold)%an%Creset %C(dim)%ar%Creset%n%B", "--relative"]);
+            c.arg(if patch { "-p" } else { "--stat" }).arg(&j).arg("--").arg(".");
+            c.status()?;
+            Ok(())
+        }
+        Cmd::Implement { file, item, json } => {
+            let mut p = Project::discover()?;
+            let mut sink: Box<dyn events::Sink> = if json { Box::new(events::Json) } else { Box::new(events::Human) };
+            if !engine::compile(&mut p, sink.as_mut(), &commands::implement_options(file, item))? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Cmd::Undo => print(commands::undo(&Project::discover()?)),
         Cmd::Check => {
             let (ok, report) = commands::check(&Project::discover()?);

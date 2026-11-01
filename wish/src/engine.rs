@@ -1,48 +1,57 @@
-//! One compile cycle: user code → Claude → verified vocabulary → build.
+//! One compile cycle: your code → Claude → verified vocabulary → build.
+//!
+//! Every cycle is recorded in the git journal (see `git.rs`): first your save
+//! (authored by you), then Claude's result (authored by claude). That record
+//! drives regeneration scope, line provenance, undo and implement history.
 
 use crate::claude;
 use crate::events::{Event, Sink};
-use crate::git::Git;
+use crate::git::{Git, Who};
 use crate::items;
 use crate::project::{Decision, Project, Status, Suggestion, wiring_only};
+use crate::provenance;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
 
+/// Subject of the commit that keeps your reformatted lines yours.
+pub const REFORMAT: &str = "your lines, reformatted";
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mode {
+    /// Shape the vocabulary as a skimmable prototype with mocked details.
+    Prototype,
+    /// Turn the prototype into the real implementation (optionally one file).
+    /// `item` narrows it to one item (and its parts), e.g. `Mode::Windowed`.
+    Implement { file: Option<String>, item: Option<String> },
+}
+
+#[derive(Debug, Clone)]
 pub struct Options {
     /// Run Claude even if the code compiles and nothing changed.
     pub force: bool,
     /// Extra instruction from the user for this cycle only.
     pub note: Option<String>,
+    pub mode: Mode,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { force: false, note: None, mode: Mode::Prototype }
+    }
 }
 
 pub fn cargo_check(project: &Project) -> (bool, String) {
-    let out = Command::new("cargo")
-        .args(["check", "--quiet", "--message-format", "short"])
-        .current_dir(&project.root)
-        .output();
+    let out = Command::new("cargo").args(["check", "--quiet", "--message-format", "short"]).current_dir(&project.root).output();
     match out {
         Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stderr).trim().to_string()),
         Err(e) => (false, e.to_string()),
     }
 }
 
-/// Unified diff of the user's edits since the last green cycle, or None on
-/// the first cycle. `now` is a snapshot of the current working tree.
-pub fn user_diff(p: &Project, git: &Git, now: &str) -> Result<Option<String>> {
-    match git.resolve(&git.ref_name("last")) {
-        None => Ok(None),
-        Some(last) => Ok(Some(git.diff(&last, now, &p.cfg.protected.files)?)),
-    }
-}
-
-/// Item path -> hash for every Claude-owned Rust file at a snapshot.
+/// Item path -> hash for Claude-owned Rust files at a snapshot.
 fn items_at(p: &Project, git: &Git, sha: &str, files: &[String]) -> BTreeMap<String, String> {
-    let srcs: BTreeMap<String, String> = files
-        .iter()
-        .filter(|f| f.ends_with(".rs") && !p.is_protected(f))
-        .filter_map(|f| git.show(sha, f).map(|s| (f.clone(), s)))
-        .collect();
+    let srcs: BTreeMap<String, String> = files.iter().filter(|f| f.ends_with(".rs") && !p.is_protected(f)).filter_map(|f| git.show(sha, f).map(|s| (f.clone(), s))).collect();
     items::hash_map(&srcs)
 }
 
@@ -50,24 +59,170 @@ fn numbered(src: &str) -> String {
     src.lines().enumerate().map(|(i, l)| format!("{:>4} | {l}\n", i + 1)).collect()
 }
 
-fn build_prompt(p: &Project, diff: &Option<String>, check_errors: &str, note: &Option<String>) -> String {
+fn truncate(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let mut i = n;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
+
+/// Make sure a journal exists. A fresh journal starts with your files
+/// (authored by you) followed by everything else (authored by claude).
+pub fn ensure_journal(p: &Project, git: &Git) -> Result<String> {
+    if let Some(j) = git.journal() {
+        return Ok(j);
+    }
+    let mut mine = p.cfg.protected.files.clone();
+    mine.push("wish.toml".into());
+    let human = git.commit(&git.tree(Some(&mine))?, &[], Who::Human, "save: your files")?;
+    let all = git.commit(&git.tree(None)?, &[&human], Who::Claude, "baseline: existing project")?;
+    git.set_ref(&git.ref_name("journal"), &all)?;
+    // Generated code already exists: treat it as the last green state, so the
+    // next cycle regenerates for your edits instead of starting from scratch.
+    if git.last().is_none() && p.rust_files().iter().any(|f| !p.is_protected(f)) {
+        git.set_ref(&git.ref_name("last"), &all)?;
+    }
+    Ok(all)
+}
+
+/// Record the current working tree as a save (authored by you), unless
+/// nothing changed since the journal tip. Returns the new tip.
+pub fn record_save(git: &Git, tip: &str, msg: &str) -> Result<String> {
+    let tree = git.tree(None)?;
+    if git.tree_of(tip).as_deref() == Some(tree.as_str()) {
+        return Ok(tip.to_string());
+    }
+    let files: Vec<String> = git.changed(tip, &tree).unwrap_or_default().into_iter().map(|(_, f)| f).collect();
+    let body = if files.is_empty() { msg.to_string() } else { format!("{msg}\n\nFiles: {}\n", files.join(", ")) };
+    let save = git.commit(&tree, &[tip], Who::Human, &body)?;
+    git.set_ref(&git.ref_name("journal"), &save)?;
+    Ok(save)
+}
+
+/// Your lines inside Claude-owned Rust files at snapshot `sha` (the journal tip).
+fn human_lines_in_owned(p: &Project, git: &Git, sha: &str) -> BTreeMap<String, Vec<String>> {
+    let mut m = BTreeMap::new();
+    for f in p.rust_files().into_iter().filter(|f| !p.is_protected(f)) {
+        let Some(src) = git.show(sha, &f) else { continue };
+        if let Some(whos) = provenance::of(git, &f, &src) {
+            let lines = provenance::human_lines(&whos, &src);
+            if !lines.is_empty() {
+                m.insert(f, lines);
+            }
+        }
+    }
+    m
+}
+
+/// The journal as a readable story, oldest first, capped at `budget` bytes
+/// (older entries are dropped first).
+pub fn history_story(git: &Git, budget: usize) -> String {
+    let Some(tip) = git.journal() else { return String::new() };
+    let mut parts: Vec<String> = Vec::new();
+    for e in git.history(&tip) {
+        let mut s = String::new();
+        for side in &e.side {
+            s.push_str(&format!("- (abandoned: {})\n", git.subject(side)));
+        }
+        match (e.who, &e.parent) {
+            (Who::Human, Some(parent)) => {
+                let d = git.diff(parent, &e.sha, &[]).unwrap_or_default();
+                let d: String = d.lines().filter(|l| !l.starts_with("index ")).collect::<Vec<_>>().join("\n");
+                s.push_str(&format!("### you: {}\n```diff\n{}\n```\n", e.subject, truncate(&d, 3000)));
+            }
+            (Who::Human, None) => s.push_str(&format!("### you: {}\n", e.subject)),
+            (Who::Claude, _) if e.subject.starts_with("undo") => s.push_str(&format!("### you undid Claude's cycle: {}\n", e.subject.trim_start_matches("undo: "))),
+            (Who::Claude, _) => s.push_str(&format!("### claude: {}\n", e.subject)),
+        }
+        parts.push(s);
+    }
+    // newest first from git; keep the newest that fit, then print oldest first
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for p in &parts {
+        if used + p.len() > budget {
+            break;
+        }
+        used += p.len();
+        kept.push(p.as_str());
+    }
+    let dropped = parts.len() - kept.len();
+    kept.reverse();
+    let mut out = String::new();
+    if dropped > 0 {
+        out.push_str(&format!("({dropped} older entries omitted)\n"));
+    }
+    out.push_str(&kept.concat());
+    out
+}
+
+struct PromptInput<'a> {
+    diff: &'a Option<String>,
+    owned_edits: &'a str,
+    human_owned: &'a BTreeMap<String, Vec<String>>,
+    check_errors: &'a str,
+    opts: &'a Options,
+    history: Option<String>,
+}
+
+fn build_prompt(p: &Project, i: &PromptInput) -> String {
     let mut s = String::new();
     s.push_str("# The user's code (protected)\n\n");
     for (f, src) in p.protected_files() {
         s.push_str(&format!("## {f}\n```rust\n{}```\n\n", numbered(&src)));
     }
-    match diff {
+    match i.diff {
         None => s.push_str("# What changed\nFirst cycle: nothing has been generated yet. Build the vocabulary from scratch.\n\n"),
-        Some(d) if d.is_empty() => s.push_str("# What changed\nThe user's code did not change since the last cycle. Only fix what is broken.\n\n"),
-        Some(d) => s.push_str(&format!("# What changed since the last cycle (your regeneration scope)\n```diff\n{d}```\n\n")),
+        Some(d) if d.is_empty() && i.owned_edits.is_empty() => s.push_str("# What changed\nThe user's code did not change since the last cycle. Only fix what is broken.\n\n"),
+        Some(d) => {
+            if !d.is_empty() {
+                s.push_str(&format!("# What the user changed in their files since the last cycle (your regeneration scope)\n```diff\n{d}```\n\n"));
+            }
+        }
     }
-    if let Some(n) = note {
+    if !i.owned_edits.is_empty() {
+        s.push_str(&format!("# What the user changed inside generated files (wishes; fulfil them)\n```diff\n{}```\n\n", truncate(i.owned_edits, 8000)));
+    }
+    if !i.human_owned.is_empty() {
+        s.push_str("# Lines the user wrote inside generated files (keep verbatim, make them true)\n");
+        for (f, lines) in i.human_owned {
+            s.push_str(&format!("## {f}\n"));
+            for l in lines {
+                s.push_str(&format!("    {l}\n"));
+            }
+        }
+        s.push('\n');
+    }
+    if let Some(n) = &i.opts.note {
         s.push_str(&format!("# Note from the user for this cycle\n{n}\n\n"));
     }
+    if let Mode::Implement { file, item } = &i.opts.mode {
+        s.push_str(&format!("# Scope\n{}\n\n", match (item, file) {
+            (Some(it), _) => format!("Implement only `{it}`. Every other prototype item stays mocked, exactly as it is (keep their `# Mocked` sections). Touch other code only where `{it}` needs it."),
+            (None, Some(f)) => format!("Implement only the prototype items in {f}. Leave other files as they are unless {f} needs something from them."),
+            (None, None) => "Implement every prototype (`# Mocked`) item in the project.".into(),
+        }));
+        let mocked: Vec<String> = p
+            .owned_files()
+            .iter()
+            .filter(|(f, _)| f.ends_with(".rs") && file.as_ref().is_none_or(|x| x == *f))
+            .flat_map(|(f, src)| items::parse(src).unwrap_or_default().into_iter().filter_map(move |it| it.mocked().map(|m| format!("- `{}` ({f}): {}", it.path, m.join("; ")))))
+            .collect();
+        if !mocked.is_empty() {
+            s.push_str(&format!("# Prototype items still mocked\n{}\n\n", mocked.join("\n")));
+        }
+        if let Some(h) = &i.history {
+            s.push_str(&format!("# History: how this prototype came about (oldest first)\n{h}\n\n"));
+        }
+    }
     let owned: Vec<_> = p.owned_files().into_keys().collect();
-    s.push_str(&format!("# Files you own\n{}\n\n", if owned.is_empty() { "(none yet)".into() } else { owned.join(", ") }));
-    if !check_errors.is_empty() {
-        s.push_str(&format!("# Current `cargo check` output\n```\n{}\n```\n\n", truncate(check_errors, 6000)));
+    s.push_str(&format!("# Generated files\n{}\n\n", if owned.is_empty() { "(none yet)".into() } else { owned.join(", ") }));
+    if !i.check_errors.is_empty() {
+        s.push_str(&format!("# Current `cargo check` output\n```\n{}\n```\n\n", truncate(i.check_errors, 6000)));
     }
     if !p.cfg.adopted.is_empty() {
         s.push_str("# Adopted items (protected; do not change)\n");
@@ -108,54 +263,70 @@ fn build_prompt(p: &Project, diff: &Option<String>, check_errors: &str, note: &O
     s
 }
 
-fn truncate(s: &str, n: usize) -> &str {
-    if s.len() <= n {
-        return s;
-    }
-    let mut i = n;
-    while !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    &s[..i]
-}
-
 /// Run one cycle. Returns Ok(true) if the project compiles at the end.
 pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<bool> {
     let git = Git::open(&p.root)?;
-    let pre = git.snapshot(None, "wish: before cycle")?;
-    let diff = user_diff(p, &git, &pre)?;
+    let Some(_lock) = git.try_lock() else {
+        sink.emit(Event::Done { ok: false, summary: "another wish process is already running a cycle for this project".into() });
+        return Ok(false);
+    };
+    let tip = ensure_journal(p, &git)?;
+    let pre = record_save(&git, &tip, "save")?;
+    let last = git.last();
+    let implement = matches!(opts.mode, Mode::Implement { .. });
+
+    // What you changed since the last green cycle: in your files, and inside generated files.
+    let diff = match &last {
+        Some(l) => Some(git.diff(l, &pre, &p.cfg.protected.files)?),
+        None => None,
+    };
+    let owned_rs: Vec<String> = p.rust_files().into_iter().filter(|f| !p.is_protected(f)).collect();
+    // Only this save's edits: between the previous journal tip and now, only you edited.
+    let owned_edits = if owned_rs.is_empty() || pre == tip { String::new() } else { git.diff(&tip, &pre, &owned_rs)? };
 
     sink.emit(Event::Status { msg: "checking".into() });
     let (ok, errors) = cargo_check(p);
-    let unchanged = diff.as_deref() == Some("");
-    if ok && diff.is_none() && !opts.force && opts.note.is_none() {
-        // Compiles but has no cycle history yet (e.g. an existing project): take it as the baseline.
-        let sha = git.snapshot(None, "wish cycle: baseline")?;
-        git.set_ref(&git.ref_name("last"), &sha)?;
+    let quiet = !opts.force && opts.note.is_none() && !implement;
+    if ok && last.is_none() && quiet {
+        // Compiles but has no green cycle yet (e.g. an existing project): take it as the baseline.
+        git.set_ref(&git.ref_name("last"), &pre)?;
         sink.emit(Event::Check { ok: true, errors: String::new() });
         sink.emit(Event::Done { ok: true, summary: "project already compiles: recorded it as the baseline".into() });
         return Ok(true);
     }
-    if ok && unchanged && !opts.force && opts.note.is_none() {
+    if ok && quiet && diff.as_deref() == Some("") && owned_edits.is_empty() {
         sink.emit(Event::Check { ok: true, errors: String::new() });
         sink.emit(Event::Done { ok: true, summary: "nothing changed; vocabulary is up to date".into() });
         return Ok(true);
     }
 
-    sink.emit(Event::Status { msg: match &diff {
-        None => "first cycle: asking Claude to build the vocabulary".into(),
-        Some(d) if d.is_empty() => "asking Claude to fix the build".into(),
-        Some(d) => format!("your code changed ({} lines): asking Claude to regenerate", d.lines().filter(|l| (l.starts_with('+') || l.starts_with('-')) && !l.starts_with("+++") && !l.starts_with("---")).count()),
+    let human_owned = human_lines_in_owned(p, &git, &pre);
+    // Your edits in this save: recorded in the cycle commit as what triggered it.
+    let triggered_by = if pre == tip { vec![] } else { crate::journal::trigger_lines(&git.diff(&tip, &pre, &["*.rs".into()]).unwrap_or_default(), 20) };
+    let history = if implement {
+        git.set_ref(&git.ref_name("prototype"), &pre)?;
+        Some(history_story(&git, 20_000))
+    } else {
+        None
+    };
+    sink.emit(Event::Status { msg: match (&opts.mode, &diff) {
+        (Mode::Implement { item: Some(it), .. }, _) => format!("implementing `{it}`"),
+        (Mode::Implement { file: Some(f), .. }, _) => format!("implementing the prototype in {f}"),
+        (Mode::Implement { .. }, _) => "implementing the prototype".into(),
+        (_, None) => "first cycle: asking Claude to build the prototype".into(),
+        (_, Some(d)) if d.is_empty() && owned_edits.is_empty() => "asking Claude to fix the build".into(),
+        _ => "your code changed: asking Claude to regenerate".into(),
     }});
-    let prompt = build_prompt(p, &diff, if ok { "" } else { &errors }, &opts.note);
-    let report = match claude::run(p, &prompt, sink) {
+    let prompt = build_prompt(p, &PromptInput { diff: &diff, owned_edits: &owned_edits, human_owned: &human_owned, check_errors: if ok { "" } else { &errors }, opts, history });
+    let rules = format!("{}\n\n{}", claude::RULES, if implement { claude::IMPLEMENT } else { claude::PROTOTYPE });
+    let report = match claude::run(p, &prompt, &rules, sink) {
         Ok(r) => r,
         Err(e) => {
             sink.emit(Event::Done { ok: false, summary: format!("{e:#}") });
             return Ok(false);
         }
     };
-    let post = git.snapshot(Some(&pre), "wish: after claude")?;
+    let post = git.snapshot(&[&pre], Who::Claude, "attempt")?;
 
     // ---- verify (backstop for the hook) ----
     let mut violations = p.verify_adopted();
@@ -176,11 +347,24 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
             Err(why) => violations.push(format!("{f}: Claude's edit {why}")),
         }
     }
+    for (f, lines) in &human_owned {
+        let new = git.show(&post, f).unwrap_or_default();
+        for l in provenance::missing(lines, &new) {
+            violations.push(format!("{f}: Claude removed or changed your line `{l}`"));
+        }
+    }
+    if implement {
+        violations.extend(contract_changes(p, &git, &pre, &post));
+    }
     if !violations.is_empty() {
         for v in &violations {
             sink.emit(Event::Violation { msg: v.clone() });
         }
         git.restore(&pre, &post)?;
+        // Keep the attempt in the history (second parent) without it affecting provenance.
+        let pre_tree = git.tree_of(&pre).unwrap_or_default();
+        let rev = git.commit(&pre_tree, &[&pre, &post], Who::Claude, &format!("reverted attempt: {}", violations[0]))?;
+        git.set_ref(&git.ref_name("journal"), &rev)?;
         sink.emit(Event::Done { ok: false, summary: "protection violated: all changes from this cycle were reverted".into() });
         return Ok(false);
     }
@@ -198,8 +382,10 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
 
     // ---- record decisions & suggestions ----
     let mut ds = p.decisions();
+    let mut decision_notes = Vec::new();
     for d in report.decisions {
         let id = ds.iter().map(|d| d.id).max().unwrap_or(0) + 1;
+        decision_notes.push(format!("{id} (proposed) {}: {}", d.title, d.choice));
         sink.emit(Event::Decision { id, kind: d.kind.clone(), title: d.title.clone(), choice: d.choice.clone() });
         ds.push(Decision { id, kind: d.kind, title: d.title, choice: d.choice, alternatives: d.alternatives, why: d.why, crates: d.crates, status: Status::Proposed, reason: None });
     }
@@ -215,19 +401,87 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
     for dep in p.undecided_dependencies() {
         sink.emit(Event::Warning { msg: format!("dependency `{dep}` has no decision record") });
     }
+    if implement {
+        for (f, src) in p.owned_files().iter().filter(|(f, _)| f.ends_with(".rs")) {
+            if let Mode::Implement { file: Some(only), .. } = &opts.mode {
+                if only != f {
+                    continue;
+                }
+            }
+            let target = if let Mode::Implement { item: Some(t), .. } = &opts.mode { Some(t.clone()) } else { None };
+            for it in items::parse(src).unwrap_or_default().into_iter().filter(|i| i.mocked().is_some()) {
+                if target.as_ref().is_some_and(|t| &it.path != t && !it.path.starts_with(&format!("{t}::"))) {
+                    continue;
+                }
+                sink.emit(Event::Warning { msg: format!("`{}` ({f}) is still marked `# Mocked`", it.path) });
+            }
+        }
+    }
 
     let (ok, errors) = cargo_check(p);
     sink.emit(Event::Check { ok, errors });
+    let label = match (&opts.mode, ok) {
+        (Mode::Implement { .. }, true) => "implemented",
+        (Mode::Prototype, true) => "cycle ok",
+        (_, false) => "cycle failed",
+    };
+    let message = crate::journal::CycleMessage {
+        label: label.into(),
+        summary: report.summary.clone(),
+        why: report.changes.iter().map(|c| (c.item.clone(), c.why.clone())).collect(),
+        triggered_by,
+        decisions: decision_notes,
+        mode: if implement { "implement".into() } else { "prototype".into() },
+    };
+    // Your lines that Claude reformatted or expanded (`pub enum Color {}` → `{ … }`)
+    // are committed as yours first, so blame keeps them yours and only what
+    // Claude added around them is attributed to Claude.
+    let mut base = pre.clone();
+    let mut reform = Vec::new();
+    for f in human_owned.keys() {
+        let (Some(old), Some(new)) = (git.show(&pre, f), p.read(f)) else { continue };
+        if let Some(whos) = provenance::of(&git, f, &old) {
+            if let Some(mid) = provenance::reformatted(&old, &whos, &new) {
+                reform.push((f.clone(), mid));
+            }
+        }
+    }
+    if !reform.is_empty() {
+        let files: Vec<&str> = reform.iter().map(|(f, _)| f.as_str()).collect();
+        let tree = git.tree_with(&pre, &reform)?;
+        base = git.commit(&tree, &[&pre], Who::Human, &format!("{REFORMAT}\n\nClaude expanded or reformatted lines you wrote; they stay yours.\n\nFiles: {}\n", files.join(", ")))?;
+    }
+    let fin = git.snapshot(&[&base], Who::Claude, &message.render())?;
+    git.set_ref(&git.ref_name("journal"), &fin)?;
     if ok {
-        // The green cycle becomes the new baseline; its parent chain is the cycle history.
-        let last_ref = git.ref_name("last");
-        let last = git.resolve(&last_ref);
-        let msg = format!("wish cycle: {}", report.summary);
-        let sha = git.snapshot(last.as_deref(), &msg)?;
-        git.set_ref(&last_ref, &sha)?;
+        git.set_ref(&git.ref_name("last"), &fin)?;
     }
     sink.emit(Event::Done { ok, summary: report.summary });
     Ok(ok)
+}
+
+/// Public signatures and type definitions that changed between two snapshots.
+fn contract_changes(p: &Project, git: &Git, pre: &str, post: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in p.rust_files().into_iter().filter(|f| !p.is_protected(f)) {
+        let Some(old) = git.show(pre, &f) else { continue };
+        let new = git.show(post, &f).and_then(|s| items::parse(&s).ok()).unwrap_or_default();
+        for it in items::parse(&old).unwrap_or_default() {
+            let Some(sig) = &it.sig_hash else { continue };
+            match new.iter().find(|n| n.path == it.path) {
+                Some(n) if n.sig_hash.as_ref() == Some(sig) => {}
+                Some(_) => out.push(format!("{f}: implementing changed the public contract of `{}`", it.path)),
+                None => {
+                    // moved to another file is fine if the contract survived
+                    let elsewhere = p.rust_files().iter().filter_map(|g| git.show(post, g)).flat_map(|s| items::parse(&s).unwrap_or_default()).any(|n| n.path == it.path && n.sig_hash.as_ref() == Some(sig));
+                    if !elsewhere {
+                        out.push(format!("{f}: implementing removed public `{}`", it.path));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn build(p: &Project) -> (bool, String) {
@@ -241,11 +495,7 @@ pub fn build(p: &Project) -> (bool, String) {
 pub fn spawn_preview(p: &Project, piped: bool) -> std::io::Result<Child> {
     // Run the built binary directly: killing it then really stops the app
     // (killing `cargo run` would orphan it), and cargo's warnings stay out.
-    let name = p
-        .read("Cargo.toml")
-        .and_then(|t| t.parse::<toml::Table>().ok())
-        .and_then(|t| t.get("package")?.get("name")?.as_str().map(String::from))
-        .unwrap_or_else(|| "main".into());
+    let name = p.read("Cargo.toml").and_then(|t| t.parse::<toml::Table>().ok()).and_then(|t| t.get("package")?.get("name")?.as_str().map(String::from)).unwrap_or_else(|| "main".into());
     let target = std::env::var("CARGO_TARGET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| p.root.join("target"));
     let mut c = Command::new(target.join("debug").join(&name));
     c.current_dir(&p.root);

@@ -64,6 +64,19 @@ pub fn evaluate(v: &Value) -> Verdict {
         };
     }
 
+    // Lines you wrote inside a generated file must survive (provenance from the git journal).
+    if let (Some(cur), Ok(git)) = (current.as_deref(), crate::git::Git::open(&project.root)) {
+        if let Some(whos) = crate::provenance::of(&git, &rel, cur) {
+            let missing = crate::provenance::missing(&crate::provenance::human_lines(&whos, cur), &proposed);
+            if let Some(l) = missing.first() {
+                return Verdict::Deny(format!(
+                    "the user wrote the line `{l}` in {rel}; this edit removes or changes it. Keep the user's lines verbatim and \
+                     make the code around them fulfil what they ask. If a line of theirs must change, add an entry to `suggestions`."
+                ));
+            }
+        }
+    }
+
     let adopted: Vec<(&String, &String)> = project.cfg.adopted.iter().filter(|(_, a)| a.file == rel).map(|(p, a)| (p, &a.hash)).collect();
     if adopted.is_empty() {
         return Verdict::Allow;
