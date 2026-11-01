@@ -36,6 +36,8 @@ struct State {
     busy: bool,
     /// A cycle requested while one was running; runs next.
     queued: Option<Options>,
+    /// "branch@HEAD" last checked for journals to merge.
+    checked_head: Option<String>,
     preview: Preview,
     /// Diagnostics from the last `cargo check`, by relative path.
     check: BTreeMap<String, Vec<Value>>,
@@ -81,7 +83,7 @@ pub fn run() -> Result<()> {
     });
     conn.initialize_finish(id, caps)?;
     let server = Server {
-        state: Arc::new(Mutex::new(State { root, docs: BTreeMap::new(), busy: false, queued: None, preview: Preview::default(), check: BTreeMap::new(), published: Default::default(), next_id: 1, pending: HashMap::new() })),
+        state: Arc::new(Mutex::new(State { root, docs: BTreeMap::new(), busy: false, queued: None, checked_head: None, preview: Preview::default(), check: BTreeMap::new(), published: Default::default(), next_id: 1, pending: HashMap::new() })),
         out: crossbeam_sender::Sender(conn.sender.clone()),
     };
     // Start the journal now, before any edits, so provenance is right from the first keystroke.
@@ -227,6 +229,31 @@ impl Server {
         self.publish_all();
     }
 
+    /// Git for the project, on the current branch. After a branch switch the
+    /// branch's journal may not exist yet: fork it now, so colors and hovers
+    /// work before the first save on the new branch.
+    fn git(&self) -> Option<Git> {
+        let p = self.project()?;
+        let g = Git::open(&p.root).ok()?;
+        let tip = match g.journal() {
+            Some(t) => t,
+            None => engine::ensure_journal(&p, &g).ok()?,
+        };
+        // When your code moved (checkout, merge, pull), join in the wish
+        // history of branches you merged, so their lines keep their provenance.
+        let key = format!("{}@{}", g.branch(), g.code_head().unwrap_or_default());
+        let changed = self.state.lock().unwrap().checked_head.as_deref() != Some(key.as_str());
+        if changed {
+            self.state.lock().unwrap().checked_head = Some(key);
+            if !engine::journals_to_merge(&g, &tip).is_empty() {
+                if let Ok(m) = engine::record_save(&g, &tip, "save") {
+                    self.log(&format!("wishlang: {}", g.subject(&m)));
+                }
+            }
+        }
+        Some(g)
+    }
+
     fn rel_of_uri(&self, uri: &str) -> Option<String> {
         let p = self.project()?;
         p.rel(&uri_to_path(uri)?)
@@ -363,8 +390,8 @@ impl Server {
     fn semantic_tokens(&self, params: &Value) -> Value {
         let empty = json!({"data": []});
         let Some(rel) = params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u)) else { return empty };
-        let (Some(text), Some(root)) = (self.text(&rel), self.root()) else { return empty };
-        let Ok(git) = Git::open(&root) else { return empty };
+        let Some(text) = self.text(&rel) else { return empty };
+        let Some(git) = self.git() else { return empty };
         let Some(whos) = provenance::of(&git, &rel, &text) else { return empty };
         let mocked: Vec<(usize, usize)> = items::parse(&text).unwrap_or_default().iter().filter(|i| i.mocked().is_some()).map(|i| (i.line, i.end_line)).collect();
         json!({"data": encode_tokens(&whos, &text, &mocked)})
@@ -374,8 +401,8 @@ impl Server {
     fn hover(&self, params: &Value) -> Value {
         let Some(rel) = params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u)) else { return Value::Null };
         let line = params["position"]["line"].as_u64().unwrap_or(0) as usize;
-        let (Some(text), Some(root)) = (self.text(&rel), self.root()) else { return Value::Null };
-        let Ok(git) = Git::open(&root) else { return Value::Null };
+        let Some(text) = self.text(&rel) else { return Value::Null };
+        let Some(git) = self.git() else { return Value::Null };
         let Some(lines) = git.blame_lines(&rel, &text) else { return Value::Null };
         let Some((who, sha)) = lines.get(line).cloned() else { return Value::Null };
         if text.lines().nth(line).is_none_or(|l| l.trim().is_empty()) {
@@ -389,9 +416,9 @@ impl Server {
     /// and a `◇ prototype` tag after the signature of every still-mocked item.
     fn inlay_hints(&self, params: &Value) -> Value {
         let Some(rel) = params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u)) else { return json!([]) };
-        let (Some(text), Some(root)) = (self.text(&rel), self.root()) else { return json!([]) };
+        let Some(text) = self.text(&rel) else { return json!([]) };
         let mut hints = Vec::new();
-        if let Some(whos) = Git::open(&root).ok().and_then(|g| provenance::of(&g, &rel, &text)) {
+        if let Some(whos) = self.git().and_then(|g| provenance::of(&g, &rel, &text)) {
             // One marker per block of your lines, only where they mix with generated code.
             if whos.contains(&Who::Claude) {
                 let lines: Vec<&str> = text.lines().collect();
@@ -447,7 +474,7 @@ impl Server {
 
     fn blocks(&self, rel: &str) -> Option<Vec<provenance::Block>> {
         let text = self.text(rel)?;
-        let git = Git::open(&self.root()?).ok()?;
+        let git = self.git()?;
         let whos = provenance::of(&git, rel, &text)?;
         Some(provenance::blocks(&whos, &text))
     }

@@ -1,15 +1,24 @@
 //! Git as the source of truth for "what changed" and "who wrote it".
 //!
 //! Snapshots are commits built with a *temporary index*, so the user's
-//! branch, index and HEAD are never touched. Two hidden refs per project:
+//! branch, index and HEAD are never touched. Hidden refs per project, **per
+//! code branch** (wish's history follows the shape of yours):
 //!
-//! - `refs/wish/<prefix>journal`: every save (authored by **you**) and every
-//!   Claude cycle (authored by **claude**). Its first-parent chain is the
-//!   current line of history; reverted attempts and undone cycles hang off as
-//!   second parents, so they stay in the history without affecting blame.
-//!   `git blame --first-parent` on it gives line-level provenance.
-//! - `refs/wish/<prefix>last`: the last green cycle (a journal commit). Your
-//!   edits since then are the regeneration scope.
+//! - `refs/wish/<prefix>journal/<branch>`: every save (authored by **you**)
+//!   and every Claude cycle (authored by **claude**). A new branch's journal
+//!   forks from the journal of the branch it came from; when you merge a
+//!   branch's code, its journal is merged too. `git blame` on it gives
+//!   line-level provenance, through merges.
+//! - `refs/wish/<prefix>last/<branch>`: the last green cycle. Your edits since
+//!   then are the regeneration scope.
+//! - `refs/wish/<prefix>prototype/<branch>`: the prototype frozen by implement.
+//! - `refs/wish/<prefix>attic/<sha>`: reverted attempts, kept out of blame.
+//! - `refs/heads/wish/<prefix>log/<branch>`: a branch mirror of the journal
+//!   for git tooling (Zed's git graph, lazygit).
+//! - `refs/wish-remote/<remote>/…`: journals fetched by `wish sync`.
+//!
+//! Every journal commit carries a `Code-Head: <sha>` trailer: the code commit
+//! it was made on.
 
 use anyhow::{Context, Result, bail};
 use std::io::Write;
@@ -32,6 +41,14 @@ impl Who {
     fn from_mail(mail: &str) -> Who {
         if mail.contains("claude@wishlang") { Who::Claude } else { Who::Human }
     }
+}
+
+/// A journal found in the repository: local, or fetched from a remote.
+#[derive(Debug, Clone)]
+pub struct JournalRef {
+    pub branch: String,
+    pub remote: Option<String>,
+    pub sha: String,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +75,12 @@ pub struct Git {
     /// Project dir relative to the repo root, e.g. "examples/demo/" (or "").
     prefix: String,
     index: PathBuf,
+    /// The checked-out code branch ("detached" without one).
+    branch: String,
 }
+
+/// Wish's per-branch ref kinds.
+const PER_BRANCH: [&str; 3] = ["journal", "last", "prototype"];
 
 impl Git {
     pub fn open(root: &Path) -> Result<Self> {
@@ -70,7 +92,44 @@ impl Git {
         let mut lines = text.lines();
         let prefix = lines.next().unwrap_or("").to_string();
         let index = root.join(lines.next().unwrap_or(".git/wish-index"));
-        Ok(Self { root: root.to_path_buf(), prefix, index })
+        let branch = Command::new("git")
+            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .current_dir(root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "detached".into());
+        let g = Self { root: root.to_path_buf(), prefix, index, branch };
+        g.migrate();
+        Ok(g)
+    }
+
+    /// Journals from before per-branch refs (`refs/wish/<prefix>journal`)
+    /// become the current branch's journal.
+    fn migrate(&self) {
+        for name in PER_BRANCH {
+            let old = format!("refs/wish/{}{name}", self.prefix);
+            if let Ok(sha) = self.git(&["rev-parse", "--verify", "--quiet", &format!("{old}^{{commit}}")]) {
+                let sha = sha.trim().to_string();
+                let _ = self.git(&["update-ref", "-d", &old]);
+                let _ = self.git(&["update-ref", &self.ref_name(name), &sha]);
+            }
+        }
+        let old_log = format!("refs/heads/wish/{}log", self.prefix);
+        if let Ok(sha) = self.git(&["rev-parse", "--verify", "--quiet", &old_log]) {
+            let _ = self.git(&["update-ref", "-d", &old_log]);
+            let _ = self.git(&["update-ref", &self.journal_branch(), sha.trim()]);
+        }
+    }
+
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// The checked-out code commit, if any.
+    pub fn code_head(&self) -> Option<String> {
+        self.resolve("HEAD")
     }
 
     fn run(&self, args: &[&str], temp_index: bool, who: Who, stdin: Option<&str>) -> Result<String> {
@@ -138,7 +197,12 @@ impl Git {
     }
 
     pub fn commit(&self, tree: &str, parents: &[&str], who: Who, msg: &str) -> Result<String> {
-        let mut args = vec!["commit-tree", tree, "-m", msg];
+        // Record which code commit this journal state was made on.
+        let msg = match self.code_head() {
+            Some(head) if !msg.contains("\nCode-Head: ") => format!("{}\n\nCode-Head: {head}\n", msg.trim_end()),
+            _ => msg.to_string(),
+        };
+        let mut args = vec!["commit-tree", tree, "-m", &msg];
         for p in parents {
             args.extend(["-p", p]);
         }
@@ -171,8 +235,97 @@ impl Git {
         Some(CycleLock(path))
     }
 
+    /// Per-branch ref for the current branch: `refs/wish/<prefix><name>/<branch>`.
     pub fn ref_name(&self, name: &str) -> String {
-        format!("refs/wish/{}{name}", self.prefix)
+        self.ref_for(name, &self.branch)
+    }
+
+    pub fn ref_for(&self, name: &str, branch: &str) -> String {
+        format!("refs/wish/{}{name}/{branch}", self.prefix)
+    }
+
+    /// Keep a reverted attempt reachable without putting it in the journal.
+    pub fn to_attic(&self, sha: &str) -> Result<()> {
+        self.git(&["update-ref", &format!("refs/wish/{}attic/{}", self.prefix, &sha[..12.min(sha.len())]), sha]).map(|_| ())
+    }
+
+    /// Subjects of reverted attempts, newest first.
+    pub fn attic(&self) -> Vec<String> {
+        self.git(&["for-each-ref", "--sort=-committerdate", "--format=%(subject)", &format!("refs/wish/{}attic/", self.prefix)])
+            .map(|o| o.lines().map(String::from).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every journal of this project: local ones for each branch, and ones
+    /// fetched from remotes by `wish sync`.
+    pub fn journals(&self) -> Vec<JournalRef> {
+        let mut out = Vec::new();
+        let local = format!("refs/wish/{}journal/", self.prefix);
+        if let Ok(o) = self.git(&["for-each-ref", "--format=%(refname) %(objectname)", &local]) {
+            for l in o.lines() {
+                if let Some((r, sha)) = l.split_once(' ') {
+                    out.push(JournalRef { branch: r.trim_start_matches(&local).to_string(), remote: None, sha: sha.into() });
+                }
+            }
+        }
+        if let Ok(o) = self.git(&["for-each-ref", "--format=%(refname) %(objectname)", "refs/wish-remote/"]) {
+            for l in o.lines() {
+                let Some((r, sha)) = l.split_once(' ') else { continue };
+                let Some(rest) = r.strip_prefix("refs/wish-remote/") else { continue };
+                let Some((remote, path)) = rest.split_once('/') else { continue };
+                let Some(branch) = path.strip_prefix(&format!("{}journal/", self.prefix)) else { continue };
+                out.push(JournalRef { branch: branch.into(), remote: Some(remote.into()), sha: sha.into() });
+            }
+        }
+        out
+    }
+
+    /// The code tip a journal belongs to: the local branch, or the remote-tracking branch.
+    pub fn code_tip(&self, j: &JournalRef) -> Option<String> {
+        match &j.remote {
+            None => self.resolve(&format!("refs/heads/{}", j.branch)),
+            Some(r) => self.resolve(&format!("refs/remotes/{r}/{}", j.branch)),
+        }
+    }
+
+    pub fn is_ancestor(&self, a: &str, b: &str) -> bool {
+        self.git(&["merge-base", "--is-ancestor", a, b]).is_ok()
+    }
+
+    /// Commit time of the merge-base of two commits (0 if none).
+    pub fn merge_base_time(&self, a: &str, b: &str) -> i64 {
+        self.git(&["merge-base", a, b])
+            .ok()
+            .and_then(|mb| self.git(&["log", "-1", "--format=%ct", mb.trim()]).ok())
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Point another branch's journal at `sha` (and its log mirror).
+    pub fn set_branch_journal(&self, branch: &str, sha: &str) -> Result<()> {
+        self.git(&["update-ref", &self.ref_for("journal", branch), sha])?;
+        self.git(&["update-ref", &format!("refs/heads/wish/{}log/{branch}", self.prefix), sha]).map(|_| ())
+    }
+
+    /// Push this project's journals (all branches) to a remote.
+    pub fn push_journals(&self, remote: &str) -> Result<String> {
+        let spec = format!("refs/wish/{}*:refs/wish/{}*", self.prefix, self.prefix);
+        let out = Command::new("git").args(["push", remote, &spec]).current_dir(&self.root).output()?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        if !out.status.success() {
+            bail!("git push failed:\n{}", text.trim());
+        }
+        Ok(text.trim().to_string())
+    }
+
+    /// Fetch a remote's journals into `refs/wish-remote/<remote>/…`.
+    pub fn fetch_journals(&self, remote: &str) -> Result<()> {
+        let spec = format!("+refs/wish/*:refs/wish-remote/{remote}/*");
+        let out = Command::new("git").args(["fetch", remote, &spec]).current_dir(&self.root).output()?;
+        if !out.status.success() {
+            bail!("git fetch failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
     }
 
     pub fn resolve(&self, r: &str) -> Option<String> {
@@ -189,10 +342,10 @@ impl Git {
         Ok(())
     }
 
-    /// `refs/heads/wish/log` (or `refs/heads/wish/<project-path>/log`). Not
-    /// `.../journal`, which would be ambiguous with `refs/wish/.../journal`.
+    /// `refs/heads/wish/<project-path>/log/<branch>`. Not `.../journal`, which
+    /// would be ambiguous with `refs/wish/.../journal`.
     pub fn journal_branch(&self) -> String {
-        format!("refs/heads/wish/{}log", self.prefix)
+        format!("refs/heads/wish/{}log/{}", self.prefix, self.branch)
     }
 
     pub fn journal(&self) -> Option<String> {
@@ -242,7 +395,9 @@ impl Git {
         if self.show(&journal, rel).is_none() {
             return Some(vec![(Who::Human, None); lines]); // a file you created since the last save
         }
-        let out = self.run(&["blame", "--first-parent", "--porcelain", "--contents", "-", &journal, "--", rel], false, Who::Human, Some(contents)).ok()?;
+        let out = self.run(&["blame", "--porcelain", "--contents", "-", &journal, "--", rel], false, Who::Human, Some(contents)).ok()?;
+        // Blame follows lines through journal merges, so a line generated on a
+        // feature branch stays Claude's (with that cycle's reasoning) after merging.
         let mut whos = std::collections::HashMap::new();
         let mut current = String::new();
         let mut result = Vec::with_capacity(lines);

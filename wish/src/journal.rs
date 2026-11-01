@@ -89,6 +89,7 @@ impl CycleMessage {
                 "Triggered-by:" => sec = Sec::Trigger,
                 "Decisions:" => sec = Sec::Decisions,
                 t if t.starts_with("Mode: ") => m.mode = t[6..].to_string(),
+                t if t.starts_with("Code-Head: ") => {}
                 "" if sec != Sec::Summary => {}
                 t => match sec {
                     Sec::Summary => summary.push(t),

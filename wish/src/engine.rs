@@ -76,6 +76,18 @@ pub fn ensure_journal(p: &Project, git: &Git) -> Result<String> {
     if let Some(j) = git.journal() {
         return Ok(j);
     }
+    // A new branch: fork from the journal of the branch it came from.
+    if let Some(src) = fork_source(git) {
+        git.set_ref(&git.ref_name("journal"), &src.sha)?;
+        let last = match &src.remote {
+            None => git.resolve(&git.ref_for("last", &src.branch)),
+            Some(r) => git.resolve(&format!("refs/wish-remote/{r}/{}", git.ref_for("last", &src.branch).trim_start_matches("refs/wish/"))),
+        };
+        if let Some(l) = last {
+            git.set_ref(&git.ref_name("last"), &l)?;
+        }
+        return Ok(src.sha);
+    }
     let mut mine = p.cfg.protected.files.clone();
     mine.push("wish.toml".into());
     let human = git.commit(&git.tree(Some(&mine))?, &[], Who::Human, "save: your files")?;
@@ -89,9 +101,51 @@ pub fn ensure_journal(p: &Project, git: &Git) -> Result<String> {
     Ok(all)
 }
 
+/// The journal a new branch forks from: the one whose code shares the most
+/// recent history with yours (ties go to the same branch name, e.g. a
+/// teammate's `master` journal fetched by `wish sync`).
+fn fork_source(git: &Git) -> Option<crate::git::JournalRef> {
+    let head = git.code_head()?;
+    git.journals()
+        .into_iter()
+        .filter(|j| !(j.remote.is_none() && j.branch == git.branch()))
+        .filter_map(|j| {
+            let tip = git.code_tip(&j)?;
+            let t = git.merge_base_time(&head, &tip);
+            (t > 0).then(|| ((t, (j.branch == git.branch()) as u8), j))
+        })
+        .max_by_key(|(k, _)| *k)
+        .map(|(_, j)| j)
+}
+
+/// Journals whose code you have merged into yours (a feature branch you
+/// merged, or a teammate's pushed work you pulled) but whose wish history
+/// isn't part of this branch's journal yet.
+pub fn journals_to_merge(git: &Git, tip: &str) -> Vec<crate::git::JournalRef> {
+    let Some(head) = git.code_head() else { return vec![] };
+    git.journals()
+        .into_iter()
+        .filter(|j| !(j.remote.is_none() && j.branch == git.branch()))
+        .filter(|j| git.code_tip(j).is_some_and(|t| git.is_ancestor(&t, &head)))
+        .filter(|j| !git.is_ancestor(&j.sha, tip))
+        .collect()
+}
+
 /// Record the current working tree as a save (authored by you), unless
-/// nothing changed since the journal tip. Returns the new tip.
+/// nothing changed since the journal tip. If you merged other branches' code,
+/// their journals are merged in as well. Returns the new tip.
 pub fn record_save(git: &Git, tip: &str, msg: &str) -> Result<String> {
+    let merges = journals_to_merge(git, tip);
+    if !merges.is_empty() {
+        let tree = git.tree(None)?;
+        let names: Vec<String> = merges.iter().map(|j| match &j.remote { Some(r) => format!("{r}/{}", j.branch), None => j.branch.clone() }).collect();
+        let mut parents: Vec<&str> = vec![tip];
+        parents.extend(merges.iter().map(|j| j.sha.as_str()));
+        let body = format!("merge: {}\n\nYour code now contains {}; its wish history joins this branch's.\n", names.join(", "), names.join(", "));
+        let m = git.commit(&tree, &parents, Who::Human, &body)?;
+        git.set_ref(&git.ref_name("journal"), &m)?;
+        return Ok(m);
+    }
     let tree = git.tree(None)?;
     if git.tree_of(tip).as_deref() == Some(tree.as_str()) {
         return Ok(tip.to_string());
@@ -126,7 +180,7 @@ pub fn history_story(git: &Git, budget: usize) -> String {
     for e in git.history(&tip) {
         let mut s = String::new();
         for side in &e.side {
-            s.push_str(&format!("- (abandoned: {})\n", git.subject(side)));
+            s.push_str(&format!("- (merged in another branch's history, last: {})\n", git.subject(side)));
         }
         match (e.who, &e.parent) {
             (Who::Human, Some(parent)) => {
@@ -141,14 +195,14 @@ pub fn history_story(git: &Git, budget: usize) -> String {
         parts.push(s);
     }
     // newest first from git; keep the newest that fit, then print oldest first
-    let mut kept = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
     let mut used = 0;
     for p in &parts {
         if used + p.len() > budget {
             break;
         }
         used += p.len();
-        kept.push(p.as_str());
+        kept.push(p.clone());
     }
     let dropped = parts.len() - kept.len();
     kept.reverse();
@@ -157,6 +211,13 @@ pub fn history_story(git: &Git, budget: usize) -> String {
         out.push_str(&format!("({dropped} older entries omitted)\n"));
     }
     out.push_str(&kept.concat());
+    let attic = git.attic();
+    if !attic.is_empty() {
+        out.push_str("### abandoned attempts (reverted, never kept)\n");
+        for a in attic.iter().take(10) {
+            out.push_str(&format!("- {a}\n"));
+        }
+    }
     out
 }
 
@@ -287,6 +348,15 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
     sink.emit(Event::Status { msg: "checking".into() });
     let (ok, errors) = cargo_check(p);
     let quiet = !opts.force && opts.note.is_none() && !implement;
+    // You merged other branches' code (and with it, their wish history): if it
+    // compiles, the merge is simply the new green state; nothing to regenerate.
+    let merged = pre != tip && git.subject(&pre).starts_with("merge:");
+    if ok && merged && quiet {
+        git.set_ref(&git.ref_name("last"), &pre)?;
+        sink.emit(Event::Check { ok: true, errors: String::new() });
+        sink.emit(Event::Done { ok: true, summary: format!("recorded {}", git.subject(&pre)) });
+        return Ok(true);
+    }
     if ok && last.is_none() && quiet {
         // Compiles but has no green cycle yet (e.g. an existing project): take it as the baseline.
         git.set_ref(&git.ref_name("last"), &pre)?;
@@ -361,10 +431,9 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
             sink.emit(Event::Violation { msg: v.clone() });
         }
         git.restore(&pre, &post)?;
-        // Keep the attempt in the history (second parent) without it affecting provenance.
-        let pre_tree = git.tree_of(&pre).unwrap_or_default();
-        let rev = git.commit(&pre_tree, &[&pre, &post], Who::Claude, &format!("reverted attempt: {}", violations[0]))?;
-        git.set_ref(&git.ref_name("journal"), &rev)?;
+        // Keep the attempt in the attic: reachable for history, out of blame.
+        let attempt = git.commit(&git.tree_of(&post).unwrap_or_default(), &[&pre], Who::Claude, &format!("reverted attempt: {}", violations[0]))?;
+        git.to_attic(&attempt)?;
         sink.emit(Event::Done { ok: false, summary: "protection violated: all changes from this cycle were reverted".into() });
         return Ok(false);
     }

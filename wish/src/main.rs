@@ -87,6 +87,16 @@ enum Cmd {
         #[arg(short, long)]
         patch: bool,
     },
+    /// Push this project's wish journals (all branches) to a remote.
+    Share {
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
+    /// Fetch others' wish journals from a remote.
+    Sync {
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
     /// Language server for editors (Zed): blue markers, provenance hints, compile on save.
     Lsp,
     /// Claude Code PreToolUse hook (internal).
@@ -136,6 +146,8 @@ fn run() -> anyhow::Result<()> {
         Cmd::Accept { id } => print(commands::accept(&mut Project::discover()?, id)),
         Cmd::Reject { id } => print(commands::reject(&Project::discover()?, id)),
         Cmd::Lsp => lsp::run(),
+        Cmd::Share { remote } => print(commands::share(&Project::discover()?, &remote)),
+        Cmd::Sync { remote } => print(commands::sync(&Project::discover()?, &remote)),
         Cmd::Log { patch } => {
             let p = Project::discover()?;
             let g = git::Git::open(&p.root)?;

@@ -279,3 +279,46 @@ pub fn check(p: &Project) -> (bool, String) {
     }
     (ok, s)
 }
+
+/// Push this project's wish journals (every branch) so others can see the
+/// provenance and reasoning behind generated code.
+pub fn share(p: &Project, remote: &str) -> Result<String> {
+    let git = crate::git::Git::open(&p.root)?;
+    let out = git.push_journals(remote)?;
+    Ok(format!("pushed wish journals to {remote}\n{out}\nothers get them with `wish sync`"))
+}
+
+/// Fetch others' wish journals. New branches' journals are adopted, behind
+/// ones fast-forwarded; diverged ones are merged on your next save once your
+/// code contains theirs.
+pub fn sync(p: &Project, remote: &str) -> Result<String> {
+    let git = crate::git::Git::open(&p.root)?;
+    git.fetch_journals(remote)?;
+    let mut lines = Vec::new();
+    for j in git.journals().into_iter().filter(|j| j.remote.as_deref() == Some(remote)) {
+        let local = git.resolve(&git.ref_for("journal", &j.branch));
+        match local {
+            None => {
+                git.set_branch_journal(&j.branch, &j.sha)?;
+                lines.push(format!("  {}: adopted", j.branch));
+            }
+            Some(l) if l == j.sha || git.is_ancestor(&j.sha, &l) => lines.push(format!("  {}: up to date", j.branch)),
+            Some(l) if git.is_ancestor(&l, &j.sha) => {
+                git.set_branch_journal(&j.branch, &j.sha)?;
+                lines.push(format!("  {}: fast-forwarded", j.branch));
+            }
+            Some(_) => lines.push(format!("  {}: diverged; merged on your next save once your code contains theirs", j.branch)),
+        }
+        // Adopt their "last green" for branches you didn't have.
+        let theirs_last = format!("refs/wish-remote/{remote}/{}", git.ref_for("last", &j.branch).trim_start_matches("refs/wish/"));
+        if git.resolve(&git.ref_for("last", &j.branch)).is_none() {
+            if let Some(l) = git.resolve(&theirs_last) {
+                let _ = std::process::Command::new("git").args(["update-ref", &git.ref_for("last", &j.branch), &l]).current_dir(&p.root).status();
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push("  (no journals on the remote for this project)".into());
+    }
+    Ok(format!("synced wish journals from {remote}:\n{}", lines.join("\n")))
+}

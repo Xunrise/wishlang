@@ -105,7 +105,13 @@ Protection is enforced twice:
 
 Snapshots are commits built with a temporary index; your branch, index and HEAD are never touched. wishlang never commits to your branch. Per project:
 
-- `refs/wish/<project>/journal`: every save (authored **you**) and every Claude cycle (authored **claude**). Blame on it gives line provenance. `git log refs/wish/examples/demo/journal` is the full story, and implement mode reads it as history. Cycle commits carry structured messages, and the hover is literally `git blame` followed by `git show`:
+wish's history has the same shape as yours: **one journal per code branch**, merged when your branches merge.
+
+- `refs/wish/<project>/journal/<branch>`: every save (authored **you**) and every Claude cycle (authored **claude**), each with a `Code-Head:` trailer naming the code commit it was made on.
+  - **New branch:** its journal forks from the journal of the branch it came from, so provenance carries over.
+  - **Merge** (`git merge feature`, or pulling a teammate's work): on the next save (or as soon as Zed notices the new HEAD) wish records a journal merge commit joining both histories. If the code compiles, that merge is the new green state; nothing is regenerated.
+  - **Blame** follows lines through merges: a line Claude generated on `feature` stays Claude's, with that cycle's reasoning, after it lands on `master`.
+- Cycle commits carry structured messages, and the hover is literally `git blame` plus `git show`:
   ```
   cycle ok: Added `Gradient::Sunset` and `OpenWindow::background(...)` …
 
@@ -113,18 +119,31 @@ Snapshots are commits built with a temporary index; your branch, index and HEAD 
 
   Why:
   - Gradient: main.rs now uses `Gradient::Sunset` as the argument to `.background(...)` …
-  - Handler::resumed: Prints the gradient's colours when the window opens, because nothing is painted yet …
 
   Triggered-by:
   src/main.rs: +    App::new("Demo")…background(Gradient::Sunset).run()
 
   Mode: prototype
+  Code-Head: 3a4f907…
   ```
-  The same works in a terminal: `git blame refs/wish/examples/demo/journal -- src/window.rs`, then `git show <sha>`.
-- These refs are local: they survive restarts but aren't pushed by default. To share provenance, push `refs/wish/*` explicitly.
-- `refs/wish/<project>/last`: the last green cycle. Your edits since then (`git diff`) are the regeneration scope.
+- `refs/wish/<project>/last/<branch>`: the last green cycle. Your edits since then (`git diff`) are the regeneration scope.
+- `refs/wish/<project>/prototype/<branch>`: the prototype frozen by implement mode.
+- `refs/wish/<project>/attic/…`: reverted attempts. Implement mode still sees them in the history, but they stay out of blame.
+- `refs/heads/wish/<project>/log/<branch>`: a branch mirror for Zed's git graph and lazygit. `wish log` prints the same story.
 - **Undo** reverse-applies exactly the changes Claude made in the last cycle. Your lines and later edits stay, and `last` moves back.
-- **Revert on violation** restores the before-snapshot; the failed attempt stays in the journal as a side parent.
+- **Revert on violation** restores the before-snapshot. The failed attempt goes to the attic.
+- Journals from older wishlang versions (a single `refs/wish/<project>/journal`) migrate to the current branch automatically.
+
+### Sharing
+
+The journals are plain git refs, but `git push` and `git clone` skip custom refs, so:
+
+```sh
+wish share          # push this project's journals (all branches) to origin
+wish sync           # fetch others' journals: new ones adopted, behind ones fast-forwarded
+```
+
+After `wish sync`, a teammate sees exactly what you see: blue generated blocks, yours versus Claude's per line, and hovers with the reasoning. If journals diverge (you both generated on the same branch), they merge on the next save once your code contains theirs.
 
 Adopted items are pinned by token hashes in `wish.toml`, because adoption is per item and must survive `rustfmt`.
 
@@ -142,6 +161,8 @@ Adopted items are pinned by token hashes in `wish.toml`, because adoption is per
 ```
 wish lsp                     language server (Zed launches it via the extension)
 wish log [--patch]           the journal: saves and cycles with Claude's reasoning
+wish share [REMOTE]          push wish journals (default: origin)
+wish sync [REMOTE]           fetch others' wish journals
 wish dev                     terminal loop: c compile · f force · w compile-on-save · r restart · u undo · I implement
                              d decisions · s suggestions · i items · :<command> · q quit
 wish compile [--json] [--force] [--no-run] [--note TEXT]
