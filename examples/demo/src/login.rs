@@ -12,7 +12,17 @@ pub struct SimpleLoginScreen {
     login_button_color: Color,
 }
 
-pub enum Color {}
+named_colors! {
+    /// A colour for an element of the screen, chosen by name (e.g. `"Red"`).
+    ///
+    /// # Decisions
+    /// - The variants are `Grey`, `Red`, `Green` and `Blue`.
+    /// - Converting an unknown name panics with the list of known names.
+    ///
+    /// # Mocked
+    /// - The variants are a small fixed set filled in by `named_colors!`.
+    pub enum Color {}
+}
 
 /// A single-line text input with a label.
 ///
@@ -60,7 +70,7 @@ impl SimpleLoginScreen {
             title: "Hello World".to_string(),
             user_name_field: Field::new("User name"),
             password_field: PasswordField::new("Password"),
-            login_button_color: "Grey".to_string(),
+            login_button_color: Color::Grey,
         }
     }
 
@@ -70,11 +80,11 @@ impl SimpleLoginScreen {
         self
     }
 
-    /// Colours the login button, e.g. `"Red"`.
+    /// Colours the login button, e.g. `"Red"` or `Color::Red`.
     ///
     /// # Mocked
-    /// - The colour is kept as a plain name and only shown in the text description.
-    pub fn withLoginButtonOfColor(mut self, color: impl Into<String>) -> Self {
+    /// - The colour is only shown in the text description.
+    pub fn withLoginButtonOfColor(mut self, color: impl Into<Color>) -> Self {
         self.login_button_color = color.into();
         self
     }
@@ -93,3 +103,51 @@ impl Screen for SimpleLoginScreen {
         )
     }
 }
+
+impl From<&str> for Color {
+    /// Looks up a colour by its name, e.g. `"Red"`.
+    fn from(name: &str) -> Self {
+        Color::ALL
+            .into_iter()
+            .find(|color| color.name() == name)
+            .unwrap_or_else(|| panic!("unknown colour {name:?}, expected one of {:?}", Color::ALL.map(Color::name)))
+    }
+}
+
+impl std::fmt::Display for Color {
+    /// Shows the colour's name, e.g. `Red`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Fills an empty `enum Name {}` with the known colour variants, plus
+/// `ALL` and `name()`.
+macro_rules! named_colors {
+    ($(#[$meta:meta])* $vis:vis enum $name:ident {}) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $vis enum $name {
+            Grey,
+            Red,
+            Green,
+            Blue,
+        }
+
+        impl $name {
+            /// Every known colour.
+            pub const ALL: [$name; 4] = [$name::Grey, $name::Red, $name::Green, $name::Blue];
+
+            /// The colour's name, e.g. `"Red"`.
+            pub fn name(self) -> &'static str {
+                match self {
+                    $name::Grey => "Grey",
+                    $name::Red => "Red",
+                    $name::Green => "Green",
+                    $name::Blue => "Blue",
+                }
+            }
+        }
+    };
+}
+use named_colors;
