@@ -6,8 +6,8 @@ use winit::window::{Window, WindowId};
 /// How a window is shown when it opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// A regular window of default size.
-    Normal,
+    /// A regular, decorated window at the platform's default size; not maximized.
+    Windowed,
     /// Fills the screen's work area but keeps decorations; not exclusive fullscreen.
     Maximized,
 }
