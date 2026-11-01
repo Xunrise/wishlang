@@ -16,11 +16,8 @@ named_colors! {
     /// A colour for an element of the screen, chosen by name (e.g. `"Red"`).
     ///
     /// # Decisions
-    /// - The variants are `Grey`, `Red`, `Green` and `Blue`.
+    /// - A name matches a variant exactly (case-sensitive), e.g. `"Red"`.
     /// - Converting an unknown name panics with the list of known names.
-    ///
-    /// # Mocked
-    /// - The variants are a small fixed set filled in by `named_colors!`.
     pub enum Color { Grey, Red, Green, Blue }
 }
 
@@ -108,9 +105,10 @@ impl From<&str> for Color {
     /// Looks up a colour by its name, e.g. `"Red"`.
     fn from(name: &str) -> Self {
         Color::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .find(|color| color.name() == name)
-            .unwrap_or_else(|| panic!("unknown colour {name:?}, expected one of {:?}", Color::ALL.map(Color::name)))
+            .unwrap_or_else(|| panic!("unknown colour {name:?}, expected one of {:?}", Color::ALL))
     }
 }
 
@@ -121,30 +119,22 @@ impl std::fmt::Display for Color {
     }
 }
 
-/// Fills an empty `enum Name {}` with the known colour variants, plus
-/// `ALL` and `name()`.
+/// Takes an `enum Name { A, B, ... }` of unit variants and adds `ALL`
+/// (every variant, in order) and `name()` (the variant's name as text).
 macro_rules! named_colors {
-    ($(#[$meta:meta])* $vis:vis enum $name:ident {}) => {
+    ($(#[$meta:meta])* $vis:vis enum $name:ident { $($variant:ident),* $(,)? }) => {
         $(#[$meta])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        $vis enum $name {
-            Grey,
-            Red,
-            Green,
-            Blue,
-        }
+        $vis enum $name { $($variant),* }
 
         impl $name {
-            /// Every known colour.
-            pub const ALL: [$name; 4] = [$name::Grey, $name::Red, $name::Green, $name::Blue];
+            /// Every known colour, in declaration order.
+            pub const ALL: &'static [$name] = &[$($name::$variant),*];
 
             /// The colour's name, e.g. `"Red"`.
             pub fn name(self) -> &'static str {
                 match self {
-                    $name::Grey => "Grey",
-                    $name::Red => "Red",
-                    $name::Green => "Green",
-                    $name::Blue => "Blue",
+                    $($name::$variant => stringify!($variant),)*
                 }
             }
         }
