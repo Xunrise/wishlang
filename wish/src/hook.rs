@@ -109,7 +109,7 @@ fn apply_edit(s: &str, e: &Value) -> String {
 }
 
 fn bash(cmd: &str, cwd: &Path) -> Verdict {
-    let re = regex::Regex::new(r"\bwish\s+(adopt|unadopt|accept|reject|decide|init)\b").unwrap();
+    let re = regex::Regex::new(r"\bwish\s+(adopt|unadopt|accept|reject|decide|init|undo)\b").unwrap();
     if re.is_match(cmd) {
         return Verdict::Deny("adopting items, accepting suggestions and deciding are the user's actions. Report them in your final JSON report instead.".into());
     }

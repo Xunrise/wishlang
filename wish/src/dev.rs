@@ -31,7 +31,7 @@ fn out(line: &str) {
     let _ = o.flush();
 }
 
-const HELP: &str = "\x1b[1mkeys\x1b[0m  c compile · f force (re-ask Claude) · w toggle compile-on-save · r restart preview\n      d decisions · s suggestions · i items · : command (adopt X, decide 1 accept, accept 2, note <text>…) · q quit";
+const HELP: &str = "\x1b[1mkeys\x1b[0m  c compile · f force (re-ask Claude) · w toggle compile-on-save · r restart preview · u undo last cycle\n      d decisions · s suggestions · i items · : command (adopt X, decide 1 accept, accept 2, note <text>…) · q quit";
 
 pub fn run(project: Project) -> Result<()> {
     let root = project.root.clone();
@@ -134,7 +134,7 @@ impl Dev {
     fn prompt(&self) {
         let mode = if self.auto { "compile-on-save" } else { "manual" };
         let mut o = std::io::stdout();
-        let _ = write!(o, "\r\x1b[K\x1b[2m[{mode}] c/f/w/r/d/s/i/:/q ›\x1b[0m ");
+        let _ = write!(o, "\r\x1b[K\x1b[2m[{mode}] c/f/w/r/u/d/s/i/:/q ›\x1b[0m ");
         let _ = o.flush();
     }
 
@@ -181,6 +181,36 @@ impl Dev {
             drop(sink);
             let _ = forward.join();
             let _ = tx.send(Msg::Built(ok));
+        });
+    }
+
+    /// Undo the last cycle, then rebuild and relaunch the preview (no Claude).
+    fn undo(&mut self) {
+        if self.busy {
+            out("\x1b[2m(busy; try again when the cycle finishes)\x1b[0m");
+            return;
+        }
+        self.reload();
+        match commands::undo(&self.project) {
+            Ok(msg) => out(&msg),
+            Err(e) => {
+                out(&format!("\x1b[31m{e:#}\x1b[0m"));
+                self.prompt();
+                return;
+            }
+        }
+        self.busy = true;
+        let root = self.project.root.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Ev(Event::Status { msg: "building preview".into() }));
+            let ok = Project::load(&root).map(|p| engine::build(&p)).map(|(ok, errors)| {
+                if !ok {
+                    let _ = tx.send(Msg::Ev(Event::Check { ok: false, errors }));
+                }
+                ok
+            });
+            let _ = tx.send(Msg::Built(ok.unwrap_or(false)));
         });
     }
 
@@ -247,6 +277,7 @@ impl Dev {
                 self.prompt();
             }
             KeyCode::Char('r') => self.restart_preview(),
+            KeyCode::Char('u') => self.undo(),
             KeyCode::Char('d') => self.show(commands::decisions(&self.project)),
             KeyCode::Char('s') => self.show(commands::suggestions(&self.project)),
             KeyCode::Char('i') => self.show(commands::items(&self.project)),
@@ -296,8 +327,12 @@ impl Dev {
                 return;
             }
             "check" => Ok(commands::check(&self.project).1),
+            "undo" => {
+                self.undo();
+                return;
+            }
             "" => return,
-            other => Err(anyhow::anyhow!("unknown command `{other}` (adopt, unadopt, accept, reject, decide, note, check)")),
+            other => Err(anyhow::anyhow!("unknown command `{other}` (adopt, unadopt, accept, reject, decide, note, check, undo)")),
         };
         self.show(r);
     }

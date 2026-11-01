@@ -179,6 +179,41 @@ pub fn reject(p: &Project, id: u32) -> Result<String> {
     Ok(format!("rejected suggestion {id}."))
 }
 
+/// Roll Claude's side of the project back to the previous green cycle.
+///
+/// Restores everything except your protected files and `wish.toml` (your
+/// adoptions and constraints), including decisions and suggestions recorded
+/// by the undone cycle. Moves `refs/wish/…/last` back one step, so if your
+/// lines changed in that cycle the next compile regenerates for them again.
+pub fn undo(p: &Project) -> Result<String> {
+    let git = crate::git::Git::open(&p.root)?;
+    let last_ref = git.ref_name("last");
+    let Some(last) = git.resolve(&last_ref) else { bail!("no cycles yet: nothing to undo") };
+    let Some(prev) = git.resolve(&format!("{last}^")) else { bail!("the last cycle is the baseline: nothing to undo") };
+
+    let now = git.snapshot(None, "wish: before undo")?;
+    let keep = |path: &str| path != "wish.toml" && !p.is_protected(path);
+    let restored = git.restore_where(&prev, &now, keep)?;
+
+    // Never let an undo break something you adopted after that cycle.
+    let broken = p.verify_adopted();
+    if !broken.is_empty() {
+        git.restore_where(&now, &git.snapshot(None, "wish: aborted undo")?, keep)?;
+        bail!("undo would change adopted items, so nothing was changed:\n  {}\n(unadopt them first if you really want to undo)", broken.join("\n  "));
+    }
+    git.set_ref(&last_ref, &prev)?;
+
+    let subject = git.subject(&last);
+    let subject = subject.strip_prefix("wish cycle: ").unwrap_or(&subject);
+    let short: String = subject.chars().take(90).collect();
+    let mut msg = format!("undid cycle: {short}{}", if short.len() < subject.len() { "…" } else { "" });
+    msg.push_str(&if restored.is_empty() { "\n  (no files differed)".to_string() } else { format!("\n  restored: {}", restored.join(", ")) });
+    if !git.diff(&prev, &now, &p.cfg.protected.files)?.is_empty() {
+        msg.push_str("\n  your code changed since that point: edit it, or compile to regenerate for it again");
+    }
+    Ok(msg)
+}
+
 /// Returns (ok, report).
 pub fn check(p: &Project) -> (bool, String) {
     let mut s = String::new();

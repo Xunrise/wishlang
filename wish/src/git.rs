@@ -103,8 +103,20 @@ impl Git {
     /// Put the working tree back to snapshot `to`, undoing everything that
     /// changed since then (as recorded by snapshot `from`).
     pub fn restore(&self, to: &str, from: &str) -> Result<()> {
+        self.restore_where(to, from, |_| true).map(|_| ())
+    }
+
+    /// Like [`restore`](Self::restore), limited to paths where `keep` is true.
+    /// Returns the paths it changed.
+    pub fn restore_where(&self, to: &str, from: &str, keep: impl Fn(&str) -> bool) -> Result<Vec<String>> {
         let mut back = Vec::new();
+        let mut touched = Vec::new();
         for (st, path) in self.changed(to, from)? {
+            // Build output is never restored or deleted, whatever a snapshot contains.
+            if path == "target" || path.starts_with("target/") || !keep(&path) {
+                continue;
+            }
+            touched.push(path.clone());
             if st == 'A' {
                 let _ = std::fs::remove_file(self.root.join(&path));
             } else {
@@ -116,6 +128,11 @@ impl Git {
             args.extend(back);
             self.git(&args.iter().map(String::as_str).collect::<Vec<_>>(), false)?;
         }
-        Ok(())
+        Ok(touched)
+    }
+
+    /// First line of a snapshot's message.
+    pub fn subject(&self, sha: &str) -> String {
+        self.git(&["log", "-1", "--format=%s", sha], false).map(|s| s.trim().to_string()).unwrap_or_default()
     }
 }

@@ -53,6 +53,7 @@ wishlang keeps no copies of your files. Each cycle snapshots the project directo
 - **Item-level change report**: `git diff --name-status` before and after the cycle, then each changed file's old and new versions are parsed with `git show`.
 - **Revert on violation**: `git restore --source=<before> --worktree`, and files Claude added are deleted.
 - A project that already compiles but has no history yet is recorded as the baseline without asking Claude.
+- **Undo** (`wish undo`, or `u` in `wish dev`) restores everything except your protected files and `wish.toml` to the previous cycle, including that cycle's decisions and suggestions, and moves `last` back. If your lines changed in the undone cycle, the next compile regenerates for them. Undo refuses when it would change an item you adopted afterwards.
 
 Committing stays your call: wishlang never commits to your branch. Adopted items are still pinned by token hashes in `wish.toml`, because git tracks whole files while adoption is per item and must survive `rustfmt`.
 
@@ -72,12 +73,13 @@ Committing stays your call: wishlang never commits to your branch. Adopted items
 ## Commands
 
 ```
-wish dev                     dev loop: c compile · f force · w compile-on-save · r restart preview
+wish dev                     dev loop: c compile · f force · w compile-on-save · r restart preview · u undo
                              d decisions · s suggestions · i items · :<command> · q quit
 wish compile [--json] [--force] [--no-run] [--note TEXT]
 wish adopt|unadopt <item>    items: Mode, Window::open, impl Display for Mode  (see `wish items`)
 wish decisions | wish decide <id> accept|reject [reason]
 wish suggestions | wish accept <id> | wish reject <id>
+wish undo                    roll Claude's changes back one cycle (keeps your code and wish.toml)
 wish check                   adopted intact + dependencies decided + cargo check
 wish init                    add wish.toml to an existing cargo project
 ```

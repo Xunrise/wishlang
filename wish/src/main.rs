@@ -63,6 +63,8 @@ enum Cmd {
     Accept { id: u32 },
     /// Discard a suggestion.
     Reject { id: u32 },
+    /// Roll Claude's changes back to the previous cycle (your code is kept).
+    Undo,
     /// Verify adopted items, dependency decisions and the build.
     Check,
     /// Claude Code PreToolUse hook (internal).
@@ -111,6 +113,7 @@ fn run() -> anyhow::Result<()> {
         Cmd::Suggestions => print(commands::suggestions(&Project::discover()?)),
         Cmd::Accept { id } => print(commands::accept(&mut Project::discover()?, id)),
         Cmd::Reject { id } => print(commands::reject(&Project::discover()?, id)),
+        Cmd::Undo => print(commands::undo(&Project::discover()?)),
         Cmd::Check => {
             let (ok, report) = commands::check(&Project::discover()?);
             println!("{report}");
