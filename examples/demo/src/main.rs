@@ -18,9 +18,3 @@ fn main() {
         )
         .run();
 }
-
-struct SimpleLoginScreen{
-    title: String = "Hello World",
-    user_name_field: Field,
-    password_field: PasswordField
-}
