@@ -5,10 +5,9 @@ use window::Mode::*;
 mod app;
 mod window;
 use app::App;
-use window::Mode;
 
 fn main() {
-    let app = App::new("Demo")
+    App::new("Demo")
         .mode(Windowed)
         .size(800, 600)
         .contains(
