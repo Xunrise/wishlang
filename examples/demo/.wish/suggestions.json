@@ -22,5 +22,21 @@
     "replace": "    password_field: PasswordField\n}",
     "with": "    password_field: PasswordField,\n    login_button_color: String,\n}",
     "status": "proposed"
+  },
+  {
+    "id": 4,
+    "file": "src/main.rs",
+    "reason": "`Mode` is no longer used now that you write `Windowed` directly (via `use window::Mode::*;`), so this line causes an unused-import warning.",
+    "replace": "use window::Mode;\n",
+    "with": "",
+    "status": "proposed"
+  },
+  {
+    "id": 5,
+    "file": "src/main.rs",
+    "reason": "`run()` blocks until the window closes and returns nothing, so `app` is never used and causes a warning. Calling the chain directly does the same thing.",
+    "replace": "    let app = App::new(\"Demo\")",
+    "with": "    App::new(\"Demo\")",
+    "status": "proposed"
   }
 ]

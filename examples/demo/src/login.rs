@@ -1,5 +1,16 @@
-use crate::SimpleLoginScreen;
 use crate::screen::Screen;
+
+/// A login screen with a title, a user name field, a password field and a
+/// login button.
+///
+/// # Mocked
+/// - Nothing is drawn; the screen only describes itself as text.
+pub struct SimpleLoginScreen {
+    title: String,
+    user_name_field: Field,
+    password_field: PasswordField,
+    login_button_color: String,
+}
 
 /// A single-line text input with a label.
 ///
@@ -37,11 +48,13 @@ impl SimpleLoginScreen {
     ///
     /// # Decisions
     /// - The fields are labelled "User name" and "Password".
+    /// - The login button starts out "Grey".
     pub fn new() -> Self {
         SimpleLoginScreen {
             title: "Hello World".to_string(),
             user_name_field: Field::new("User name"),
             password_field: PasswordField::new("Password"),
+            login_button_color: "Grey".to_string(),
         }
     }
 
@@ -54,10 +67,9 @@ impl SimpleLoginScreen {
     /// Colours the login button, e.g. `"Red"`.
     ///
     /// # Mocked
-    /// - `SimpleLoginScreen` has no field to keep the colour in, so it is only
-    ///   printed to stdout and then forgotten.
-    pub fn withLoginButtonOfColor(self, color: &str) -> Self {
-        println!("login button colour: {color}");
+    /// - The colour is kept as a plain name and only shown in the text description.
+    pub fn withLoginButtonOfColor(mut self, color: impl Into<String>) -> Self {
+        self.login_button_color = color.into();
         self
     }
 }
@@ -67,8 +79,11 @@ impl Screen for SimpleLoginScreen {
     /// - Describes the screen as text instead of drawing it.
     fn describe(&self) -> String {
         format!(
-            "{}\n  [{}: ____]\n  [{}: ****]\n  [Login]",
-            self.title, self.user_name_field.label, self.password_field.label
+            "{}\n  [{}: ____]\n  [{}: ****]\n  [Login ({})]",
+            self.title,
+            self.user_name_field.label,
+            self.password_field.label,
+            self.login_button_color
         )
     }
 }
