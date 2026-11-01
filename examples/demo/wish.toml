@@ -1,0 +1,10 @@
+# wishlang project file. Edit [protected] and [constraints] freely;
+# [adopted] is maintained by `wish adopt` / `wish unadopt`.
+
+[protected]
+files = ["src/main.rs"]
+
+[adopted]
+
+[constraints]
+rules = []
