@@ -4,5 +4,15 @@ use app::App;
 use window::Mode;
 
 fn main() {
-    App::new("Demo").window().open(Mode::Windowed).run()
+    let app = App::new("Demo").mode(Windowed).size(800, 600).contains(
+        SimpleLoginScreen::new()
+            .withTitle("Please login")
+            .withLoginButtonOfColor("Red"),
+    );
+}
+
+struct SimpleLoginScreen{
+    title: String = "Hello World",
+    user_name_field: Field,
+    password_field: PasswordField
 }

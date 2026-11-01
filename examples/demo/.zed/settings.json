@@ -1,7 +1,8 @@
 {
   "languages": {
     "Rust": {
-      "language_servers": ["rust-analyzer", "wish", "..."]
+      "language_servers": ["rust-analyzer", "wish", "..."],
+      "semantic_tokens": "combined"
     }
   },
   "lsp": {
@@ -22,10 +23,10 @@
       }
     }
   },
-  "inlay_hints": {
-    "enabled": true,
-    "show_type_hints": false,
-    "show_parameter_hints": false,
-    "show_other_hints": true
+  "global_lsp_settings": {
+    "semantic_token_rules": [
+      { "token_type": "generated", "token_modifiers": ["prototype"], "background_color": "#3b82f633", "font_style": "italic" },
+      { "token_type": "generated", "background_color": "#3b82f61f" }
+    ]
   }
 }
