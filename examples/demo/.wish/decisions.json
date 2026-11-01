@@ -39,6 +39,6 @@
     ],
     "why": "Lets you pass your own screen structs to `contains` without the App knowing about them.",
     "crates": [],
-    "status": "proposed"
+    "status": "accepted"
   }
 ]

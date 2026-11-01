@@ -8,11 +8,15 @@ use app::App;
 use window::Mode;
 
 fn main() {
-    let app = App::new("Demo").mode(Windowed).size(800, 600).contains(
-        SimpleLoginScreen::new()
-            .withTitle("Please login")
-            .withLoginButtonOfColor("Red"),
-    );
+    let app = App::new("Demo")
+        .mode(Windowed)
+        .size(800, 600)
+        .contains(
+            SimpleLoginScreen::new()
+                .withTitle("Please login")
+                .withLoginButtonOfColor("Red"),
+        )
+        .run();
 }
 
 struct SimpleLoginScreen{
