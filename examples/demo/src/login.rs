@@ -12,7 +12,16 @@ pub struct SimpleLoginScreen {
     login_button_color: Color,
 }
 
-pub enum Color {}
+/// The colour of a button.
+///
+/// # Decisions
+/// - Only a few named colours for now; `"Red"`-style names are parsed with [`Color::from_name`].
+pub enum Color {
+    Grey,
+    Red,
+    Green,
+    Blue,
+}
 
 /// A single-line text input with a label.
 ///
@@ -60,7 +69,7 @@ impl SimpleLoginScreen {
             title: "Hello World".to_string(),
             user_name_field: Field::new("User name"),
             password_field: PasswordField::new("Password"),
-            login_button_color: "Grey".to_string(),
+            login_button_color: Color::Grey,
         }
     }
 
@@ -70,13 +79,44 @@ impl SimpleLoginScreen {
         self
     }
 
-    /// Colours the login button, e.g. `"Red"`.
+    /// Colours the login button by name, e.g. `"Red"`.
+    ///
+    /// # Decisions
+    /// - Panics on an unknown colour name, so typos show up immediately.
     ///
     /// # Mocked
-    /// - The colour is kept as a plain name and only shown in the text description.
-    pub fn withLoginButtonOfColor(mut self, color: impl Into<String>) -> Self {
-        self.login_button_color = color.into();
+    /// - The colour is only shown in the text description.
+    pub fn withLoginButtonOfColor(mut self, color: &str) -> Self {
+        self.login_button_color = Color::from_name(color);
         self
+    }
+}
+
+impl Color {
+    /// Looks up a colour by its name, ignoring case (`"Red"`, `"red"`).
+    ///
+    /// Panics if the name is not one of the known colours.
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "grey" | "gray" => Color::Grey,
+            "red" => Color::Red,
+            "green" => Color::Green,
+            "blue" => Color::Blue,
+            _ => panic!("unknown colour {name:?}; expected Grey, Red, Green or Blue"),
+        }
+    }
+}
+
+/// Shows the colour's name, e.g. `Red`.
+impl std::fmt::Display for Color {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Color::Grey => "Grey",
+            Color::Red => "Red",
+            Color::Green => "Green",
+            Color::Blue => "Blue",
+        };
+        f.write_str(name)
     }
 }
 
