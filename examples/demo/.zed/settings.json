@@ -1,0 +1,34 @@
+{
+  "code_lens": "on",
+  "inlay_hints": { "enabled": true },
+  "languages": {
+    "Rust": {
+      "language_servers": ["rust-analyzer", "wish", "..."],
+      "semantic_tokens": "combined"
+    }
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "checkOnSave": false,
+        "diagnostics": {
+          "disabled": [
+            "unresolved-method",
+            "unresolved-field",
+            "unresolved-path",
+            "unresolved-import",
+            "unresolved-assoc-item",
+            "unresolved-module",
+            "unresolved-macro-call"
+          ]
+        }
+      }
+    }
+  },
+  "global_lsp_settings": {
+    "semantic_token_rules": [
+      { "token_type": "generated", "token_modifiers": ["prototype"], "background_color": "#3b82f633", "font_style": "italic" },
+      { "token_type": "generated", "background_color": "#3b82f61f" }
+    ]
+  }
+}

@@ -1,8 +1,19 @@
+mod login;
+mod screen;
+use login::*;
+use window::Mode::*;
 mod app;
 mod window;
 use app::App;
-use window::Mode;
 
 fn main() {
-    App::new("Demo").window().open(Mode::Maximized).run()
+    App::new("Demo")
+        .mode(Windowed)
+        .size(800, 600)
+        .contains(
+            SimpleLoginScreen::new()
+                .withTitle("Please login")
+                .withLoginButtonOfColor("Red"),
+        )
+        .run();
 }

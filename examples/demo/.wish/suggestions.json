@@ -1,1 +1,50 @@
-[]
+[
+  {
+    "id": 1,
+    "file": "src/main.rs",
+    "reason": "This is the last compile error. Field default values (`= ...`) only work on nightly Rust, and `\"Hello World\"` is a `&str`, not a `String`. `SimpleLoginScreen::new()` already sets the title to \"Hello World\".",
+    "replace": "    title: String = \"Hello World\",",
+    "with": "    title: String,",
+    "status": "proposed"
+  },
+  {
+    "id": 2,
+    "file": "src/main.rs",
+    "reason": "The app is built but never started, so no window opens. Calling `run()` opens the 800x600 window and prints the login screen.",
+    "replace": "    );\n}",
+    "with": "    );\n    app.run();\n}",
+    "status": "proposed"
+  },
+  {
+    "id": 3,
+    "file": "src/main.rs",
+    "reason": "`withLoginButtonOfColor` has nowhere to keep the colour, so for now it only prints it. Adding a field lets the screen remember it (it's a `String` for now; a colour type can come later).",
+    "replace": "    password_field: PasswordField\n}",
+    "with": "    password_field: PasswordField,\n    login_button_color: String,\n}",
+    "status": "proposed"
+  },
+  {
+    "id": 4,
+    "file": "src/main.rs",
+    "reason": "`Mode` is no longer used now that you write `Windowed` directly (via `use window::Mode::*;`), so this line causes an unused-import warning.",
+    "replace": "use window::Mode;\n",
+    "with": "",
+    "status": "proposed"
+  },
+  {
+    "id": 5,
+    "file": "src/main.rs",
+    "reason": "`run()` blocks until the window closes and returns nothing, so `app` is never used and causes a warning. Calling the chain directly does the same thing.",
+    "replace": "    let app = App::new(\"Demo\")",
+    "with": "    App::new(\"Demo\")",
+    "status": "proposed"
+  },
+  {
+    "id": 6,
+    "file": "src/login.rs",
+    "reason": "An empty `enum Color {}` has no values, so nothing can be stored in `login_button_color`. To get it compiling without changing your line, I wrapped it in a `named_colors!` macro that adds the variants behind the scenes. If you write the variants out yourself, the code says what it means, and I can then remove the macro wrapper.",
+    "replace": "pub enum Color {}",
+    "with": "pub enum Color { Grey, Red, Green, Blue }",
+    "status": "accepted"
+  }
+]

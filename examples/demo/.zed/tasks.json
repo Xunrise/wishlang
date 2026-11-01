@@ -1,0 +1,18 @@
+[
+  {
+    "label": "wish: log",
+    "command": "wish log",
+    "use_new_terminal": false,
+    "reveal": "always"
+  },
+  {
+    "label": "wish: log with diffs",
+    "command": "wish log --patch",
+    "reveal": "always"
+  },
+  {
+    "label": "wish: suggestions",
+    "command": "wish suggestions",
+    "reveal": "always"
+  }
+]
