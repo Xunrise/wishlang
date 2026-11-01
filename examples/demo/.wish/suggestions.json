@@ -45,6 +45,6 @@
     "reason": "An empty `enum Color {}` has no values, so nothing can be stored in `login_button_color`. To get it compiling without changing your line, I wrapped it in a `named_colors!` macro that adds the variants behind the scenes. If you write the variants out yourself, the code says what it means, and I can then remove the macro wrapper.",
     "replace": "pub enum Color {}",
     "with": "pub enum Color { Grey, Red, Green, Blue }",
-    "status": "proposed"
+    "status": "accepted"
   }
 ]

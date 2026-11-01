@@ -21,7 +21,7 @@ named_colors! {
     ///
     /// # Mocked
     /// - The variants are a small fixed set filled in by `named_colors!`.
-    pub enum Color {}
+    pub enum Color { Grey, Red, Green, Blue }
 }
 
 /// A single-line text input with a label.
