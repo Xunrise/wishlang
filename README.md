@@ -18,7 +18,7 @@ cd examples/demo
 wish dev                           # edit src/main.rs in your editor and save
 ```
 
-Requires Claude Code (`claude`) on PATH. Set `WISH_MODEL=sonnet` for faster cycles.
+Requires Claude Code (`claude`) on PATH and a git repository (`wish init` creates one if needed). Set `WISH_MODEL=sonnet` for faster cycles.
 
 ## Ownership
 
@@ -31,18 +31,30 @@ Requires Claude Code (`claude`) on PATH. Set `WISH_MODEL=sonnet` for faster cycl
 
 Protection is enforced twice:
 1. A Claude Code PreToolUse hook (`wish hook`) refuses tool calls whose resulting file content would break the rules. The refusal tells Claude to file a suggestion instead.
-2. Every compile cycle verifies afterwards. On a violation the whole cycle is reverted.
+2. Every compile cycle compares git snapshots taken before and after Claude ran. On a violation the whole cycle is reverted from the snapshot.
 
 ## The loop
 
 1. **Write or change your lines** and save (or press `c` in `wish dev`).
-2. **Claude regenerates** (headless `claude -p`). Its regeneration scope is the diff of your edits since the last green cycle.
+2. **Claude regenerates** (headless `claude -p`). Its regeneration scope is `git diff` of your files since the last green cycle.
 3. **You see what changed, item by item:** `+ Mode::Fullscreen  ~ impl ApplicationHandler for Handler  = 9 untouched`. That tells you whether "only what my change affects" held.
 4. **The preview relaunches.**
 5. **Steer by rewriting your lines**, not Claude's code. Use `:note <text>` for a one-off nudge.
 6. **Adopt what you trust:** `wish adopt Window::open`. From then on it's yours.
 
 When Claude thinks your code or an adopted item should change, it files a **suggestion** (`wish suggestions`, `wish accept N`, `wish reject N`). Accepting re-locks the adopted items it touches.
+
+## Git is the source of truth
+
+wishlang keeps no copies of your files. Each cycle snapshots the project directory into a git commit, built with a temporary index, so your branch, index and HEAD are never touched:
+
+- `refs/wish/<project-path>/last` is the last green cycle. Its parent chain is the cycle history: `git log refs/wish/last` (or `refs/wish/examples/demo/last` for the demo).
+- **Your edits** = `git diff <last> <now> -- src/main.rs`. That diff is what Claude is told to regenerate for.
+- **Item-level change report**: `git diff --name-status` before and after the cycle, then each changed file's old and new versions are parsed with `git show`.
+- **Revert on violation**: `git restore --source=<before> --worktree`, and files Claude added are deleted.
+- A project that already compiles but has no history yet is recorded as the baseline without asking Claude.
+
+Committing stays your call: wishlang never commits to your branch. Adopted items are still pinned by token hashes in `wish.toml`, because git tracks whole files while adoption is per item and must survive `rustfmt`.
 
 ## Decisions
 
@@ -79,6 +91,7 @@ wish init                    add wish.toml to an existing cargo project
 ```
 wish/src/
   engine.rs    one compile cycle: snapshot → claude → verify/revert → item diff → record → check
+  git.rs       snapshots via temporary index, refs/wish/*, diff/show/restore
   claude.rs    headless Claude: rules prompt, tool allowlist, hook wiring, JSON report schema
   hook.rs      PreToolUse guard (computes post-edit content, checks wiring/adoption)
   items.rs     syn item identity + token hashes (rustfmt-proof), `# Decisions` extraction

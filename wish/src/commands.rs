@@ -14,6 +14,10 @@ pub fn init() -> Result<String> {
     if cwd.join("wish.toml").exists() {
         bail!("wish.toml already exists");
     }
+    let in_git = std::process::Command::new("git").args(["rev-parse", "--git-dir"]).current_dir(&cwd).output().is_ok_and(|o| o.status.success());
+    if !in_git {
+        std::process::Command::new("git").arg("init").arg("-q").current_dir(&cwd).status()?;
+    }
     let p = Project { root: cwd, cfg: Default::default() };
     p.save()?;
     Ok("created wish.toml: src/main.rs is protected. Write your wishes there, then run `wish dev`.".into())

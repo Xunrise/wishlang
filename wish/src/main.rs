@@ -5,6 +5,7 @@ mod commands;
 mod dev;
 mod engine;
 mod events;
+mod git;
 mod hook;
 mod items;
 mod project;

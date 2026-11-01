@@ -1,3 +1,0 @@
-{
-  "src/main.rs": "mod app;\nmod window;\nuse app::App;\nuse window::Mode;\n\nfn main() {\n    App::new(\"Demo\").window().open(Mode::Maximized).run()\n}\n"
-}

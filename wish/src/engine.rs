@@ -2,11 +2,11 @@
 
 use crate::claude;
 use crate::events::{Event, Sink};
+use crate::git::Git;
 use crate::items;
 use crate::project::{Decision, Project, Status, Suggestion, wiring_only};
 use anyhow::Result;
 use std::collections::BTreeMap;
-use std::fs;
 use std::process::{Child, Command, Stdio};
 
 pub struct Options {
@@ -27,43 +27,23 @@ pub fn cargo_check(project: &Project) -> (bool, String) {
     }
 }
 
-fn last_path(p: &Project) -> std::path::PathBuf {
-    p.state_dir().join("state/last.json")
-}
-
-/// The user's files as of the last successful cycle.
-fn last_snapshot(p: &Project) -> Option<BTreeMap<String, String>> {
-    fs::read_to_string(last_path(p)).ok().and_then(|s| serde_json::from_str(&s).ok())
-}
-
-fn save_snapshot(p: &Project, files: &BTreeMap<String, String>) -> Result<()> {
-    fs::create_dir_all(last_path(p).parent().unwrap())?;
-    fs::write(last_path(p), serde_json::to_string_pretty(files)?)?;
-    Ok(())
-}
-
-/// Unified diff of the user's edits since the last successful cycle.
-pub fn user_diff(p: &Project) -> Option<String> {
-    let last = last_snapshot(p)?;
-    let mut out = String::new();
-    for (f, now) in p.protected_files() {
-        let before = last.get(&f).cloned().unwrap_or_default();
-        if before != now {
-            out.push_str(&similar::TextDiff::from_lines(&before, &now).unified_diff().header(&f, &f).to_string());
-        }
+/// Unified diff of the user's edits since the last green cycle, or None on
+/// the first cycle. `now` is a snapshot of the current working tree.
+pub fn user_diff(p: &Project, git: &Git, now: &str) -> Result<Option<String>> {
+    match git.resolve(&git.ref_name("last")) {
+        None => Ok(None),
+        Some(last) => Ok(Some(git.diff(&last, now, &p.cfg.protected.files)?)),
     }
-    Some(out)
 }
 
-fn restore(p: &Project, before: &BTreeMap<String, String>) {
-    for (f, s) in before {
-        let _ = fs::write(p.root.join(f), s);
-    }
-    for f in p.rust_files() {
-        if !before.contains_key(&f) {
-            let _ = fs::remove_file(p.root.join(f));
-        }
-    }
+/// Item path -> hash for every Claude-owned Rust file at a snapshot.
+fn items_at(p: &Project, git: &Git, sha: &str, files: &[String]) -> BTreeMap<String, String> {
+    let srcs: BTreeMap<String, String> = files
+        .iter()
+        .filter(|f| f.ends_with(".rs") && !p.is_protected(f))
+        .filter_map(|f| git.show(sha, f).map(|s| (f.clone(), s)))
+        .collect();
+    items::hash_map(&srcs)
 }
 
 fn numbered(src: &str) -> String {
@@ -141,15 +121,21 @@ fn truncate(s: &str, n: usize) -> &str {
 
 /// Run one cycle. Returns Ok(true) if the project compiles at the end.
 pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<bool> {
-    let before_owned = p.owned_files();
-    let before_protected = p.protected_files();
-    let mut before_all = before_owned.clone();
-    before_all.extend(before_protected.clone());
+    let git = Git::open(&p.root)?;
+    let pre = git.snapshot(None, "wish: before cycle")?;
+    let diff = user_diff(p, &git, &pre)?;
 
-    let diff = user_diff(p);
     sink.emit(Event::Status { msg: "checking".into() });
     let (ok, errors) = cargo_check(p);
     let unchanged = diff.as_deref() == Some("");
+    if ok && diff.is_none() && !opts.force && opts.note.is_none() {
+        // Compiles but has no cycle history yet (e.g. an existing project): take it as the baseline.
+        let sha = git.snapshot(None, "wish cycle: baseline")?;
+        git.set_ref(&git.ref_name("last"), &sha)?;
+        sink.emit(Event::Check { ok: true, errors: String::new() });
+        sink.emit(Event::Done { ok: true, summary: "project already compiles: recorded it as the baseline".into() });
+        return Ok(true);
+    }
     if ok && unchanged && !opts.force && opts.note.is_none() {
         sink.emit(Event::Check { ok: true, errors: String::new() });
         sink.emit(Event::Done { ok: true, summary: "nothing changed; vocabulary is up to date".into() });
@@ -169,12 +155,14 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
             return Ok(false);
         }
     };
+    let post = git.snapshot(Some(&pre), "wish: after claude")?;
 
     // ---- verify (backstop for the hook) ----
     let mut violations = p.verify_adopted();
-    for (f, old) in &before_protected {
-        let new = p.read(f).unwrap_or_default();
-        match wiring_only(old, &new) {
+    for f in &p.cfg.protected.files {
+        let old = git.show(&pre, f).unwrap_or_default();
+        let new = git.show(&post, f).unwrap_or_default();
+        match wiring_only(&old, &new) {
             Ok(()) => {
                 let added: Vec<String> = similar::TextDiff::from_lines(old.as_str(), new.as_str())
                     .iter_all_changes()
@@ -192,19 +180,20 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
         for v in &violations {
             sink.emit(Event::Violation { msg: v.clone() });
         }
-        restore(p, &before_all);
+        git.restore(&pre, &post)?;
         sink.emit(Event::Done { ok: false, summary: "protection violated: all changes from this cycle were reverted".into() });
         return Ok(false);
     }
 
-    // ---- item-level change report ----
-    let rs = |m: &BTreeMap<String, String>| m.iter().filter(|(k, _)| k.ends_with(".rs")).map(|(k, v)| (k.clone(), v.clone())).collect::<BTreeMap<_, _>>();
-    let a = items::hash_map(&rs(&before_owned));
-    let b = items::hash_map(&rs(&p.owned_files()));
+    // ---- item-level change report (from git: only files that changed) ----
+    let touched: Vec<String> = git.changed(&pre, &post)?.into_iter().map(|(_, f)| f).collect();
+    let a = items_at(p, &git, &pre, &touched);
+    let b = items_at(p, &git, &post, &touched);
     let added: Vec<String> = b.keys().filter(|k| !a.contains_key(*k)).cloned().collect();
     let removed: Vec<String> = a.keys().filter(|k| !b.contains_key(*k)).cloned().collect();
     let changed: Vec<String> = b.iter().filter(|(k, h)| a.get(*k).is_some_and(|x| x != *h)).map(|(k, _)| k.clone()).collect();
-    let untouched = b.iter().filter(|(k, h)| a.get(*k) == Some(*h)).count();
+    let total = items::hash_map(&p.owned_files().into_iter().filter(|(k, _)| k.ends_with(".rs")).collect::<BTreeMap<_, _>>()).len();
+    let untouched = total.saturating_sub(added.len() + changed.len());
     sink.emit(Event::Changes { added, changed, removed, untouched });
 
     // ---- record decisions & suggestions ----
@@ -230,7 +219,12 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
     let (ok, errors) = cargo_check(p);
     sink.emit(Event::Check { ok, errors });
     if ok {
-        save_snapshot(p, &p.protected_files())?;
+        // The green cycle becomes the new baseline; its parent chain is the cycle history.
+        let last_ref = git.ref_name("last");
+        let last = git.resolve(&last_ref);
+        let msg = format!("wish cycle: {}", report.summary);
+        let sha = git.snapshot(last.as_deref(), &msg)?;
+        git.set_ref(&last_ref, &sha)?;
     }
     sink.emit(Event::Done { ok, summary: report.summary });
     Ok(ok)
