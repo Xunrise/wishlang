@@ -18,18 +18,19 @@ cargo install --path wish        # puts `wish` on PATH (Zed looks for it there, 
 
 Then, in Zed, open the command palette, run **zed: install dev extension**, and pick the `zed/` folder of this repo.
 
-The blue comes from two semantic token rules in your Zed **user** settings (Zed only reads `global_lsp_settings` there):
+The colors come from three semantic token rules in your Zed **user** settings (Zed only reads `global_lsp_settings` there):
 
 ```json
 "global_lsp_settings": {
   "semantic_token_rules": [
+    { "token_type": "generated", "token_modifiers": ["untraced"], "background_color": "#dc26262e" },
     { "token_type": "generated", "token_modifiers": ["prototype"], "background_color": "#3b82f633", "font_style": "italic" },
     { "token_type": "generated", "background_color": "#3b82f61f" }
   ]
 }
 ```
 
-They only match the token type `generated`, which only `wish lsp` emits. The project's `.zed/settings.json` turns on `"semantic_tokens": "combined"` for Rust. After changing settings, run `editor: restart language server` once.
+Zed applies the first rule that matches, so the more specific ones come first (untraced beats prototype). They only match the token type `generated`, which only `wish lsp` emits. The project's `.zed/settings.json` turns on `"semantic_tokens": "combined"` for Rust. After changing settings, run `editor: restart language server` once.
 
 Requires Claude Code (`claude`) on PATH and a git repository (`wish init` creates one). Set `WISH_MODEL=sonnet` for faster cycles.
 
@@ -45,6 +46,8 @@ Open `examples/demo` (or any project after `wish init`) in Zed.
 | **blue** `◇ prototype …` | this item's behaviour is still mocked (its doc has a `# Mocked` section) |
 | **blue background** | Claude generated this code, persistently, every time you open the project |
 | **stronger blue, italic** | generated *and* still mocked (prototype) |
+| **red background** | generated in a ticket cycle but serves none of the ticket's problems (also a warning `serves no problem of KEY`) |
+| `◆ P1 · P3` above an item | the ticket problems this item serves; click to open `problems.json` at the first one |
 | no background, `✎` at line start | you wrote it (always visible in files that also contain generated code) |
 | `◇ prototype · mocked: …` after a signature | that item is still mocked |
 | `▶ Implement …` above an item | click to make just that item real (or all items in the file, from the top-of-file lens) |

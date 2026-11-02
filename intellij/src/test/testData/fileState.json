@@ -167,6 +167,14 @@
       "command": "wish.implement",
       "line": 4,
       "title": "▶ Implement `App.create`"
+    },
+    {
+      "arguments": [
+        "P1"
+      ],
+      "command": "wish.ticket.open",
+      "line": 4,
+      "title": "◆ P1 · P2"
     }
   ],
   "pending": [],
