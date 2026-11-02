@@ -8,6 +8,7 @@
 
   <extensions defaultExtensionNs="com.intellij">
     <postStartupActivity implementation="wish.WishStartup"/>
+    <toolWindow id="Wish" anchor="bottom" icon="AllIcons.Vcs.History" factoryClass="wish.WishToolWindowFactory"/>
     <annotator language="JAVA" implementationClass="wish.WishAnnotator"/>
     <daemon.highlightInfoFilter implementation="wish.WishInfoFilter"/>
     <codeInsight.lineMarkerProvider language="JAVA" implementationClass="wish.WishLenses"/>
