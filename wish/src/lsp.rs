@@ -18,8 +18,9 @@
 use crate::commands;
 use crate::engine::{self, Mode, Options};
 use crate::events::{Event, Sink};
-use crate::git::{Git, Who};
+use crate::git::{FileStat, Git, Who};
 use crate::items::{self, Item};
+use crate::journal::CycleMessage;
 use crate::pending::{self, Pending};
 use crate::preview::Preview;
 use crate::project::{Lang, Project, Status};
@@ -122,6 +123,54 @@ struct WireFileState {
     pending: Vec<WirePending>,
     lenses: Vec<Lens>,
     blocks: Vec<WireBlock>,
+}
+
+#[derive(Serialize)]
+struct WireWhy {
+    item: String,
+    why: String,
+    problems: Vec<String>,
+    file: Option<String>,
+    line: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireEntry {
+    sha: String,
+    author: &'static str,
+    when: String,
+    label: String,
+    summary: String,
+    ticket: Option<String>,
+    why: Vec<WireWhy>,
+    triggered_by: Vec<String>,
+    decisions: Vec<String>,
+    mode: String,
+    files: Vec<FileStat>,
+}
+
+#[derive(Serialize)]
+struct WireDecision {
+    id: u32,
+    title: String,
+    choice: String,
+    why: String,
+    status: Status,
+}
+
+#[derive(Serialize)]
+struct WireProblem {
+    id: String,
+    text: String,
+}
+
+/// `wish/log`: the journal (newest first), every decision with its live status, and the ticket's problems.
+#[derive(Serialize)]
+struct WireLog {
+    entries: Vec<WireEntry>,
+    decisions: Vec<WireDecision>,
+    problems: Vec<WireProblem>,
 }
 
 /// Lets worker threads talk to the client.
@@ -465,6 +514,44 @@ impl Server {
         }))
     }
 
+    /// Where each item currently lives: item path -> (file, 1-based line).
+    fn item_locations(&self, p: &Project) -> HashMap<String, (String, usize)> {
+        let mut locs = HashMap::new();
+        for f in p.src_files() {
+            let Some(text) = self.text(&f) else { continue };
+            for it in self.items_of(p.lang, &f, &text) {
+                locs.entry(it.path).or_insert((f.clone(), it.line));
+            }
+        }
+        locs
+    }
+
+    /// `wish/log`: what wish did, for a history view.
+    fn journal_log(&self) -> Result<Value> {
+        let p = self.project().context("no wishlang project")?;
+        let git = self.git().context("no wishlang project")?;
+        let journal = git.journal().context("no journal yet")?;
+        let locs = self.item_locations(&p);
+        let entries = git
+            .history(&journal)
+            .into_iter()
+            .map(|e| {
+                let m = CycleMessage::parse(&format!("{}\n\n{}", e.subject, e.body));
+                let why = m
+                    .why
+                    .into_iter()
+                    .map(|w| {
+                        let at = locs.get(&w.item);
+                        WireWhy { file: at.map(|a| a.0.clone()), line: at.map(|a| a.1), item: w.item, why: w.why, problems: w.problems }
+                    })
+                    .collect();
+                WireEntry { sha: e.sha, author: e.who.name(), when: e.age, label: m.label, summary: m.summary, ticket: None, why, triggered_by: m.triggered_by, decisions: m.decisions, mode: m.mode, files: e.files }
+            })
+            .collect();
+        let decisions = p.decisions().into_iter().map(|d| WireDecision { id: d.id, title: d.title, choice: d.choice, why: d.why, status: d.status }).collect();
+        Ok(serde_json::to_value(WireLog { entries, decisions, problems: vec![] })?)
+    }
+
     // ---- diagnostics ----
 
     fn diagnostics(&self, rel: &str) -> Vec<Value> {
@@ -534,6 +621,7 @@ impl Server {
             "textDocument/codeLens" => Ok(self.code_lenses(&req.params)),
             "textDocument/codeAction" => Ok(self.code_actions(&req.params)),
             "wish/fileState" => Ok(self.wire_file_state(&req.params)),
+            "wish/log" => self.journal_log(),
             "wish/show" => self.show_file(&req.params),
             "workspace/executeCommand" => {
                 self.execute(&req.params);
@@ -923,7 +1011,6 @@ fn lenses(p: &Project, rel: &str, text: &str, items: &[Item]) -> Vec<Lens> {
 
 /// Hover text for one line: who wrote it, when, and why (from the journal commit).
 fn hover_markdown(fs: &FileState, lang: Lang, line: usize) -> String {
-    use crate::journal::CycleMessage;
     let (Some(git), Some(&who), Some(sha)) = (&fs.git, fs.whos.get(line), fs.shas.get(line)) else { return String::new() };
     let Some(sha) = sha.as_deref() else { return "✎ **yours**, not saved yet".into() };
     let Some((msg, age)) = git.message(sha) else { return String::new() };
@@ -950,7 +1037,7 @@ fn hover_markdown(fs: &FileState, lang: Lang, line: usize) -> String {
         let lines: Vec<&str> = fs.text.lines().collect();
         let start = item.map(|i| i.line.saturating_sub(1)).unwrap_or(0);
         let name = (start..=line.min(lines.len().saturating_sub(1))).rev().find_map(|l| re.captures(lines[l]).map(|c| c[1].to_string()))?;
-        m.why.iter().find(|(i, _)| i.split('(').next().and_then(|p| p.rsplit([':', '.']).next()) == Some(name.as_str())).map(|(i, w)| (i.clone(), w.clone()))
+        m.why.iter().find(|w| w.item.split('(').next().and_then(|p| p.rsplit([':', '.']).next()) == Some(name.as_str())).map(|w| (w.item.clone(), w.why.clone()))
     });
     match why {
         Some((path, w)) => s.push_str(&format!("\n\n**`{path}`**: {w}")),
@@ -1042,6 +1129,7 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::Why;
 
     #[test]
     fn uris_roundtrip() {
@@ -1185,6 +1273,12 @@ mod tests {
     #[test]
     fn serves_file_state_over_lsp() {
         let dir = temp_project();
+        // A Claude cycle on top of the baseline, as the engine would record it.
+        let (project, git) = (Project::load(&dir).unwrap(), Git::open(&dir).unwrap());
+        let base = engine::ensure_journal(&project, &git).unwrap();
+        let cycle = CycleMessage { label: "cycle ok".into(), summary: "Added App.".into(), why: vec![Why::new("App.create", "Main calls App.create.")], mode: "prototype".into(), ..Default::default() };
+        let cycle = git.snapshot(&[&base], Who::Claude, &cycle.render()).unwrap();
+        git.set_ref(&git.ref_name("journal"), &cycle).unwrap();
         let (mut c, handle) = start(&dir);
         let uri = |f: &str| path_to_uri(&dir.join("src/main/java/demo").join(f));
         let app_uri = uri("App.java");
@@ -1214,8 +1308,20 @@ mod tests {
         let hover = c.ok("textDocument/hover", json!({"textDocument": {"uri": app_uri}, "position": {"line": 13, "character": 4}}));
         assert!(hover["contents"]["value"].as_str().unwrap().contains("generated"));
 
+        // wish/log: newest first, with each reason located in the code, files with line counts and no problems yet.
+        let log = c.ok("wish/log", Value::Null);
+        let entries = log["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!((entries[0]["sha"].as_str(), entries[0]["label"].as_str(), entries[0]["author"].as_str()), (Some(cycle.as_str()), Some("cycle ok"), Some("claude")));
+        assert_eq!(entries[0]["why"][0], json!({"item": "App.create", "why": "Main calls App.create.", "problems": [], "file": "src/main/java/demo/App.java", "line": 11}));
+        assert_eq!(entries[0]["summary"], "Added App.");
+        assert_eq!(entries[2]["author"], "you");
+        let app_stat = entries[1]["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/main/java/demo/App.java").unwrap();
+        assert_eq!(app_stat["added"], APP.lines().count());
+        assert_eq!((log["decisions"].as_array().unwrap().len(), log["problems"].as_array().unwrap().len()), (0, 0));
+
         // wish/show: the file before and after a journal commit, with validated arguments.
-        let tip = Git::open(&dir).unwrap().journal().unwrap();
+        let tip = entries[1]["sha"].as_str().unwrap().to_string();
         let shown = c.ok("wish/show", json!({"sha": tip, "path": "src/main/java/demo/App.java"}));
         assert_eq!((shown["before"].as_str(), shown["after"].as_str()), (Some(""), Some(APP)));
         for bad in [json!({"sha": "--output=x", "path": "pom.xml"}), json!({"sha": tip, "path": "../x"}), json!({"sha": tip, "path": "/etc/passwd"}), json!({"sha": tip, "path": "pom.xml", "base": "HEAD"}), json!({"sha": "deadbeefdead", "path": "pom.xml"})] {

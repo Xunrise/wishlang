@@ -20,13 +20,27 @@
 //! Mode: prototype
 //! ```
 
+/// The reason for one item of a cycle.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Why {
+    pub item: String,
+    pub why: String,
+    /// Ticket problems the item serves (empty outside ticket mode).
+    pub problems: Vec<String>,
+}
+
+impl Why {
+    pub fn new(item: &str, why: &str) -> Self {
+        Self { item: item.into(), why: why.into(), problems: vec![] }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CycleMessage {
     /// "cycle ok", "implemented", "cycle failed", "save", "undo", ...
     pub label: String,
     pub summary: String,
-    /// (item path, why)
-    pub why: Vec<(String, String)>,
+    pub why: Vec<Why>,
     /// Your diff lines that triggered the cycle, as "file: +line".
     pub triggered_by: Vec<String>,
     pub decisions: Vec<String>,
@@ -46,8 +60,8 @@ impl CycleMessage {
         }
         if !self.why.is_empty() {
             s.push_str("\nWhy:\n");
-            for (item, why) in &self.why {
-                s.push_str(&format!("- {item}: {}\n", why.replace('\n', " ")));
+            for w in &self.why {
+                s.push_str(&format!("- {}: {}\n", w.item, w.why.replace('\n', " ")));
             }
         }
         if !self.triggered_by.is_empty() {
@@ -95,7 +109,7 @@ impl CycleMessage {
                     Sec::Summary => summary.push(t),
                     Sec::Why => {
                         if let Some((item, why)) = t.strip_prefix("- ").and_then(|x| x.split_once(": ")) {
-                            m.why.push((item.to_string(), why.to_string()));
+                            m.why.push(Why::new(item, why));
                         }
                     }
                     Sec::Trigger => m.triggered_by.push(t.to_string()),
@@ -111,7 +125,7 @@ impl CycleMessage {
     /// is an overload (`Window.open(int, int)` falls back to `Window.open`) and
     /// then its parents (`Mode::Windowed` falls back to `Mode`).
     pub fn why_for(&self, item: &str) -> Option<&str> {
-        let find = |p: &str| self.why.iter().find(|(i, _)| i == p).map(|(_, w)| w.as_str());
+        let find = |p: &str| self.why.iter().find(|w| w.item == p).map(|w| w.why.as_str());
         let mut path = item;
         loop {
             if let Some(w) = find(path) {
@@ -160,7 +174,7 @@ mod tests {
         let m = CycleMessage {
             label: "cycle ok".into(),
             summary: "Added `Mode::Windowed`.\nSecond line.".into(),
-            why: vec![("Mode::Windowed".into(), "main.rs now calls Mode::Windowed(800, 600).".into()), ("impl ApplicationHandler for Handler".into(), "applies the size".into())],
+            why: vec![Why::new("Mode::Windowed", "main.rs now calls Mode::Windowed(800, 600)."), Why::new("impl ApplicationHandler for Handler", "applies the size")],
             triggered_by: vec!["src/main.rs: +    open(Mode::Windowed(800, 600))".into()],
             decisions: vec!["3 (proposed) softbuffer".into()],
             mode: "prototype".into(),
@@ -172,14 +186,14 @@ mod tests {
 
     #[test]
     fn why_falls_back_to_parent() {
-        let m = CycleMessage { why: vec![("Mode".into(), "because".into())], ..Default::default() };
+        let m = CycleMessage { why: vec![Why::new("Mode", "because")], ..Default::default() };
         assert_eq!(m.why_for("Mode::Windowed"), Some("because"));
         assert_eq!(m.why_for("App::new"), None);
     }
 
     #[test]
     fn why_falls_back_for_overloads() {
-        let m = CycleMessage { why: vec![("Window.open".into(), "bare".into()), ("Window.open(int)".into(), "exact".into()), ("Mode".into(), "parent".into())], ..Default::default() };
+        let m = CycleMessage { why: vec![Why::new("Window.open", "bare"), Why::new("Window.open(int)", "exact"), Why::new("Mode", "parent")], ..Default::default() };
         assert_eq!(m.why_for("Window.open(int)"), Some("exact"));
         assert_eq!(m.why_for("Window.open(int, int)"), Some("bare"));
         assert_eq!(m.why_for("Mode.WINDOWED"), Some("parent"));

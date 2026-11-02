@@ -534,7 +534,7 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
     let message = crate::journal::CycleMessage {
         label: label.into(),
         summary: report.summary.clone(),
-        why: report.changes.iter().map(|c| (c.item.clone(), c.why.clone())).collect(),
+        why: report.changes.iter().map(|c| crate::journal::Why::new(&c.item, &c.why)).collect(),
         triggered_by,
         decisions: decision_notes,
         mode: if implement { "implement".into() } else { "prototype".into() },
