@@ -1,0 +1,16 @@
+<idea-plugin>
+  <id>io.wishlang.intellij</id>
+  <name>Wish</name>
+  <vendor>wishlang</vendor>
+  <description>Shows what wish generated, and why, next to your Java code.</description>
+  <depends>com.intellij.modules.platform</depends>
+  <depends>com.intellij.java</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <postStartupActivity implementation="wish.WishStartup"/>
+    <annotator language="JAVA" implementationClass="wish.WishAnnotator"/>
+    <daemon.highlightInfoFilter implementation="wish.WishInfoFilter"/>
+    <codeInsight.lineMarkerProvider language="JAVA" implementationClass="wish.WishLenses"/>
+    <notificationGroup id="Wish" displayType="BALLOON"/>
+  </extensions>
+</idea-plugin>
