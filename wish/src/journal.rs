@@ -142,11 +142,29 @@ impl CycleMessage {
         m
     }
 
-    /// The reason for an item, trying the item itself, its bare name when it
-    /// is an overload (`Window.open(int, int)` falls back to `Window.open`) and
-    /// then its parents (`Mode::Windowed` falls back to `Mode`).
+    /// The reason for an item, trying the item itself (exactly, then up to
+    /// its parameter list, see `same_item`) and then its parents (`Mode::Windowed`
+    /// falls back to `Mode`).
     pub fn why_for(&self, item: &str) -> Option<&str> {
-        item_chain(item).into_iter().find_map(|p| self.why.iter().find(|w| w.item == p).map(|w| w.why.as_str()))
+        item_chain(item).into_iter().find_map(|p| self.why.iter().find(|w| w.item == p).or_else(|| self.why.iter().find(|w| same_item(&w.item, p))).map(|w| w.why.as_str()))
+    }
+}
+
+/// Whether a journal item path names a parsed item: the same path, or the same
+/// path up to the parameter list when either side has none (a journal
+/// `App.create(String)` for the item `App.create`, a journal `Window.open` for
+/// the overloads `Window.open(int, int)`). Whitespace inside the parentheses
+/// does not matter.
+pub fn same_item(journal: &str, item: &str) -> bool {
+    let (a, b) = (compact(journal), compact(item));
+    a == b || ((!a.contains('(') || !b.contains('(')) && a.split('(').next() == b.split('(').next())
+}
+
+/// The path with the whitespace inside its parameter list removed.
+fn compact(path: &str) -> String {
+    match path.split_once('(') {
+        Some((head, params)) => format!("{head}({}", params.split_whitespace().collect::<String>()),
+        None => path.to_string(),
     }
 }
 
@@ -260,6 +278,17 @@ mod tests {
         let t = CycleMessage::parse("cycle ok: x\n\nWhy:\n- Mode []: why\n\nTicket: DEMO-1\n");
         assert_eq!((t.why[0].problems.is_empty(), t.ticket.as_deref()), (true, Some("DEMO-1")));
         assert_eq!(t.why[0].item, "Mode");
+    }
+
+    #[test]
+    fn items_match_up_to_their_parameter_list() {
+        assert!(same_item("App.create(String)", "App.create"));
+        assert!(same_item("Window.open", "Window.open(Mode)"));
+        assert!(same_item("Window.open(int,int)", "Window.open(int, int)"));
+        assert!(!same_item("Window.open(int)", "Window.open(int, int)"));
+        assert!(!same_item("Window.open", "Window.openAll"));
+        let m = CycleMessage { why: vec![Why { item: "App.create(String)".into(), why: "journal".into(), problems: vec![] }], ..Default::default() };
+        assert_eq!(m.why_for("App.create"), Some("journal"));
     }
 
     #[test]

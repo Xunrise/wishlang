@@ -9,7 +9,7 @@
 
 use crate::events::{Event, Sink};
 use crate::git::{FileStat, Git};
-use crate::journal::{CycleMessage, item_chain};
+use crate::journal::{CycleMessage, same_item};
 use crate::project::Project;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -256,9 +256,11 @@ pub fn union(cycles: &[CycleMessage]) -> Problems {
     out
 }
 
-/// The problems recorded for an item: its own entry, or its bare name when it is an overload.
-pub fn problems_of<'a>(u: &'a Problems, item: &str) -> Option<&'a BTreeSet<String>> {
-    item_chain(item).into_iter().take(2).find_map(|i| u.get(i))
+/// The problems recorded for an item, over every journal path that names it (see `same_item`).
+pub fn problems_of(u: &Problems, item: &str) -> Option<BTreeSet<String>> {
+    let mut hits = u.iter().filter(|(name, _)| same_item(name, item)).peekable();
+    hits.peek()?;
+    Some(hits.flat_map(|(_, served)| served.iter().cloned()).collect())
 }
 
 /// The ticket of the current branch, traced through the journal.
@@ -279,13 +281,19 @@ pub fn trace(p: &Project, git: &Git) -> Result<Trace> {
     let messages: Vec<CycleMessage> = cycles.iter().rev().map(|c| c.2.clone()).collect();
     let union = union(&messages);
     let locations = p.item_locations();
-    let item = |name: &str, only: Option<&str>| {
-        let (file, line) = locations.get(name)?;
-        let reasons = cycles
+    // The items serving a problem (or, with None, serving none), each once.
+    let items = |only: Option<&str>| {
+        locations
             .iter()
-            .flat_map(|(sha, when, m)| m.why.iter().filter(|w| w.item == name && only.is_none_or(|id| w.problems.iter().any(|x| x == id))).map(move |w| Reason { sha: sha.clone(), when: when.clone(), why: w.why.clone() }))
-            .collect();
-        Some(TraceItem { item: name.to_string(), file: file.clone(), line: *line, reasons })
+            .filter(|(path, _)| problems_of(&union, path).is_some_and(|served| only.map_or(served.is_empty(), |id| served.contains(id))))
+            .map(|(path, (file, line))| {
+                let reasons = cycles
+                    .iter()
+                    .flat_map(|(sha, when, m)| m.why.iter().filter(|w| same_item(&w.item, path) && only.is_none_or(|id| w.problems.iter().any(|x| x == id))).map(move |w| Reason { sha: sha.clone(), when: when.clone(), why: w.why.clone() }))
+                    .collect();
+                TraceItem { item: path.clone(), file: file.clone(), line: *line, reasons }
+            })
+            .collect::<Vec<_>>()
     };
     let sorted = |mut items: Vec<TraceItem>| {
         items.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
@@ -297,10 +305,10 @@ pub fn trace(p: &Project, git: &Git) -> Result<Trace> {
             id: pr.id.clone(),
             text: pr.text.clone(),
             scenarios: pr.scenarios.clone(),
-            items: sorted(union.iter().filter(|(_, served)| served.contains(&pr.id)).filter_map(|(name, _)| item(name, Some(&pr.id))).collect()),
+            items: sorted(items(Some(&pr.id))),
         })
         .collect();
-    let untraced = sorted(union.iter().filter(|(_, served)| served.is_empty()).filter_map(|(name, _)| item(name, None)).collect());
+    let untraced = sorted(items(None));
     let (head, base) = match (cycles.first(), cycles.last()) {
         (Some(newest), Some(oldest)) => (Some(newest.0.clone()), Some(format!("{}^", oldest.0))),
         _ => (None, None),
@@ -385,6 +393,12 @@ mod tests {
         // Only items that appear in a ticket cycle are listed; an item with an empty union serves nothing.
         let u = union(&[cycle(&[("A", &["P1"]), ("B", &[])])]);
         assert_eq!(problems_of(&u, "A").map(|s| s.is_empty()), Some(false));
+        // A journal path with a parameter list names the item without one, and the reverse.
+        let u = union(&[cycle(&[("App.create(String)", &["P1"]), ("Window.open", &["P2"]), ("Window.open(Mode)", &["P3"])])]);
+        assert_eq!(problems_of(&u, "App.create"), Some(BTreeSet::from(["P1".to_string()])));
+        assert_eq!(problems_of(&u, "Window.open(int, int)"), Some(BTreeSet::from(["P2".to_string()])));
+        assert_eq!(problems_of(&u, "Window.open(Mode)"), Some(BTreeSet::from(["P2".to_string(), "P3".to_string()])));
+        let u = union(&[cycle(&[("A", &["P1"]), ("B", &[])])]);
         assert_eq!(problems_of(&u, "B").map(|s| s.is_empty()), Some(true));
         assert!(problems_of(&u, "Generated.beforeTheTicket").is_none());
         // An overload falls back to its bare name.

@@ -322,6 +322,12 @@ impl Project {
 /// single-line `mod x;` / `use …;` declarations (Java: `import …;`). This is
 /// the one change Claude may make to a protected file: wiring it up to the
 /// generated code.
+/// Where a journal item path is: its exact item, else the first (by file and
+/// line) item it names up to the parameter list.
+pub fn locate<'a>(locations: &'a std::collections::HashMap<String, (String, usize)>, name: &str) -> Option<&'a (String, usize)> {
+    locations.get(name).or_else(|| locations.iter().filter(|(path, _)| crate::journal::same_item(name, path)).map(|(_, at)| at).min())
+}
+
 pub fn wiring_only(lang: Lang, old: &str, new: &str) -> Result<(), String> {
     let what = match lang {
         Lang::Rust => "`mod`/`use`",
@@ -409,6 +415,16 @@ fn normalize(p: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn locate_resolves_parameter_lists() {
+        let at = |line| ("App.java".to_string(), line);
+        let locs = std::collections::HashMap::from([("App.create".to_string(), at(3)), ("Window.open(Mode)".to_string(), at(9)), ("Window.open(int, int)".to_string(), at(7))]);
+        assert_eq!(super::locate(&locs, "App.create(String)"), Some(&at(3)));
+        assert_eq!(super::locate(&locs, "Window.open"), Some(&at(7)));
+        assert_eq!(super::locate(&locs, "Window.open(Mode)"), Some(&at(9)));
+        assert_eq!(super::locate(&locs, "Window.close"), None);
+    }
+
     use super::{Lang, wiring_only};
 
     #[test]

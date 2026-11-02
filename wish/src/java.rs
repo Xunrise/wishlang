@@ -92,6 +92,7 @@ fn is_public(n: Node) -> bool {
 }
 
 fn walk(nodes: Vec<Node>, prefix: &str, in_interface: bool, src: &str, out: &mut Vec<Item>) {
+    let first = out.len();
     // Names declared more than once in this type are overloads.
     let mut count: HashMap<String, usize> = HashMap::new();
     for n in &nodes {
@@ -140,6 +141,12 @@ fn walk(nodes: Vec<Node>, prefix: &str, in_interface: bool, src: &str, out: &mut
                 walk(members(b), &format!("{path}."), n.kind() == "interface_declaration", src, out);
             }
         }
+    }
+    // A field sharing its path with a method, constructor or type (`private String subtitle;` and
+    // `AppWindow subtitle(String)`) gets `#field`, so the path keeps meaning the callable.
+    let taken: Vec<String> = out[first..].iter().filter(|i| i.kind != "field").map(|i| i.path.clone()).collect();
+    for i in out[first..].iter_mut().filter(|i| i.kind == "field" && taken.contains(&i.path)) {
+        i.path.push_str("#field");
     }
 }
 
@@ -357,6 +364,13 @@ public class App {
         assert_eq!(get(&a, "App.window").sig_hash, get(&c, "App.window").sig_hash);
         let d = parse(&SRC.replace("public Win window()", "public Win window(int x)")).unwrap();
         assert_ne!(get(&a, "App.window").sig_hash, get(&d, "App.window").sig_hash);
+    }
+
+    #[test]
+    fn a_field_sharing_a_methods_path_is_set_apart() {
+        let items = parse("class AppWindow { private String subtitle; private int size; AppWindow subtitle(String s) { return this; } }").unwrap();
+        let paths: Vec<_> = items.iter().map(|i| (i.path.as_str(), i.kind)).collect();
+        assert_eq!(paths, [("AppWindow", "class"), ("AppWindow.subtitle#field", "field"), ("AppWindow.size", "field"), ("AppWindow.subtitle", "method")]);
     }
 
     #[test]

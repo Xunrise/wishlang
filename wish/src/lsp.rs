@@ -23,7 +23,7 @@ use crate::items::{self, Item};
 use crate::journal::CycleMessage;
 use crate::pending::{self, Pending};
 use crate::preview::Preview;
-use crate::project::{Lang, Project, Status};
+use crate::project::{Lang, Project, Status, locate};
 use crate::provenance;
 use crate::ticket::{self, Problem, Trace};
 use anyhow::{Context, Result, bail};
@@ -597,7 +597,7 @@ impl Server {
                     .why
                     .into_iter()
                     .map(|w| {
-                        let at = locs.get(&w.item);
+                        let at = locate(&locs, &w.item);
                         WireWhy { file: at.map(|a| a.0.clone()), line: at.map(|a| a.1), item: w.item, why: w.why, problems: w.problems }
                     })
                     .collect();
@@ -1116,7 +1116,7 @@ fn hover_markdown(fs: &FileState, lang: Lang, line: usize) -> String {
     if let Some(t) = &fs.ticket {
         let path = why.as_ref().map(|(path, _)| path).or(item.map(|i| &i.path));
         for id in path.and_then(|path| ticket::problems_of(&t.union, path)).into_iter().flatten() {
-            let text = t.problems.iter().find(|p| p.id == *id).map(|p| p.text.as_str()).unwrap_or("");
+            let text = t.problems.iter().find(|p| p.id == id).map(|p| p.text.as_str()).unwrap_or("");
             s.push_str(&format!("\n\n**Solves {id}**: {text}"));
         }
     }
