@@ -23,6 +23,15 @@ pub struct Known {
     paths: BTreeSet<String>,
     /// Last path segments of everything (variants, methods, types, fns).
     names: BTreeSet<String>,
+    /// Last path segment -> the declared types of the members by that name (Java fields and methods).
+    types: std::collections::BTreeMap<String, BTreeSet<String>>,
+    /// Every path's trailing segments (`Rejection.BLANK` of `Validator.Rejection.BLANK`): how a nested
+    /// type is referred to inside its outer type.
+    tails: BTreeSet<String>,
+    /// Simple names of the types (Java classes, interfaces, enums, records; Rust types), nested ones too.
+    type_names: BTreeSet<String>,
+    /// Path (and each multi-segment tail of it) -> declared types, for `Codes.VALUES`-style lookups.
+    path_types: std::collections::BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Known {
@@ -34,14 +43,64 @@ impl Known {
 
     pub fn add<'a>(&mut self, items: impl IntoIterator<Item = &'a Item>) {
         for i in items {
-            // An overload (`Window.open(int)`) also defines the bare `Window.open`.
-            let bare = i.path.split('(').next().unwrap_or(&i.path);
-            self.paths.insert(i.path.clone());
-            self.paths.insert(bare.to_string());
-            if let Some(last) = bare.rsplit([':', '.']).next() {
-                self.names.insert(last.to_string());
+            self.add_member(&i.path, i.ty.as_deref());
+            if matches!(i.kind, "class" | "interface" | "enum" | "record" | "struct" | "trait" | "type") {
+                if let Some(last) = i.path.rsplit([':', '.']).next() {
+                    self.type_names.insert(last.to_string());
+                }
             }
         }
+    }
+
+    /// A member that is not an item of its own, e.g. a Java record's accessor or an enum's `values()`.
+    pub fn add_member(&mut self, path: &str, ty: Option<&str>) {
+        // An overload (`Window.open(int)`) also defines the bare `Window.open`.
+        let bare = path.split('(').next().unwrap_or(path);
+        self.paths.insert(path.to_string());
+        self.paths.insert(bare.to_string());
+        if let Some(t) = ty {
+            self.path_types.entry(bare.to_string()).or_default().insert(t.to_string());
+        }
+        let mut rest = bare;
+        while let Some((_, tail)) = rest.split_once('.') {
+            if tail.contains('.') {
+                self.tails.insert(tail.to_string());
+                if let Some(t) = ty {
+                    self.path_types.entry(tail.to_string()).or_default().insert(t.to_string());
+                }
+            }
+            rest = tail;
+        }
+        if let Some(last) = bare.rsplit([':', '.']).next() {
+            self.names.insert(last.to_string());
+            if let Some(t) = ty {
+                self.types.entry(last.to_string()).or_default().insert(t.to_string());
+            }
+        }
+    }
+
+    /// Everything `other` knows, added to this.
+    pub fn merge(&mut self, other: &Known) {
+        self.paths.extend(other.paths.iter().cloned());
+        self.names.extend(other.names.iter().cloned());
+        self.tails.extend(other.tails.iter().cloned());
+        self.type_names.extend(other.type_names.iter().cloned());
+        for (k, v) in &other.types {
+            self.types.entry(k.clone()).or_default().extend(v.iter().cloned());
+        }
+        for (k, v) in &other.path_types {
+            self.path_types.entry(k.clone()).or_default().extend(v.iter().cloned());
+        }
+    }
+
+    /// A path, or the trailing segments of one (a nested type named from inside its outer type).
+    pub fn has_path_or_tail(&self, p: &str) -> bool {
+        self.paths.contains(p) || self.tails.contains(p) || self.type_names.contains(p)
+    }
+
+    /// Is `n` the simple name of a type?
+    pub fn is_type(&self, n: &str) -> bool {
+        self.type_names.contains(n)
     }
 
     pub fn has_path(&self, p: &str) -> bool {
@@ -50,6 +109,16 @@ impl Known {
 
     pub fn has_name(&self, n: &str) -> bool {
         self.names.contains(n)
+    }
+
+    /// The declared types of the member at `path` (`Codes.VALUES`, or a nested `Inner.f`), if known.
+    pub fn types_at(&self, path: &str) -> Option<&BTreeSet<String>> {
+        self.path_types.get(path)
+    }
+
+    /// The declared types of the members named `n`, if any are known.
+    pub fn types_of(&self, n: &str) -> Option<&BTreeSet<String>> {
+        self.types.get(n)
     }
 }
 

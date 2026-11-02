@@ -23,6 +23,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::io::Write;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -233,6 +234,40 @@ impl Git {
         self.commit(&tree, parents, who, msg)
     }
 
+    /// Tree of commit `rev` limited to the project (its directory, at its place in the repository),
+    /// the shape of a journal snapshot.
+    pub fn tree_at(&self, rev: &str) -> Result<String> {
+        if self.prefix.is_empty() {
+            return self.tree_of(rev).with_context(|| format!("{rev} has no tree"));
+        }
+        let _ = std::fs::remove_file(&self.index);
+        self.run(&["read-tree", "--empty"], true, Who::Human, None)?;
+        let sub = format!("{rev}:{}", self.prefix.trim_end_matches('/'));
+        if self.resolve(&sub).is_some() {
+            self.run(&["read-tree", &format!("--prefix={}", self.prefix), &sub], true, Who::Human, None)?;
+        }
+        let tree = self.run(&["write-tree"], true, Who::Human, None)?;
+        let _ = std::fs::remove_file(&self.index);
+        Ok(tree.trim().to_string())
+    }
+
+    /// The code commits after `base` up to HEAD, oldest first, along the first parent.
+    pub fn first_parent_commits(&self, base: &str) -> Result<Vec<String>> {
+        Ok(self.git(&["rev-list", "--reverse", "--first-parent", &format!("{base}..HEAD")])?.lines().map(String::from).collect())
+    }
+
+    /// A commit's subject and body.
+    pub fn subject_body(&self, sha: &str) -> Result<(String, String)> {
+        let out = self.git(&["log", "-1", "--format=%s%x1f%b", sha])?;
+        let (s, b) = out.split_once('\x1f').unwrap_or((out.as_str(), ""));
+        Ok((s.trim().to_string(), b.trim().to_string()))
+    }
+
+    /// A file of wish's own in the git directory (never in a snapshot), per project.
+    pub fn private_file(&self, name: &str) -> PathBuf {
+        self.index.with_file_name(format!("wish-{}{name}", self.prefix.replace('/', "_")))
+    }
+
     pub fn tree_of(&self, sha: &str) -> Option<String> {
         self.resolve(&format!("{sha}^{{tree}}"))
     }
@@ -276,6 +311,26 @@ impl Git {
 
     /// Every journal of this project: local ones for each branch, and ones
     /// fetched from remotes by `wish sync`.
+    /// Branch -> the directory of the worktree that has it checked out (this checkout included).
+    pub fn worktrees(&self) -> BTreeMap<String, PathBuf> {
+        let mut out = BTreeMap::new();
+        let Ok(o) = self.git(&["worktree", "list", "--porcelain"]) else { return out };
+        let mut dir = None;
+        for l in o.lines() {
+            if let Some(d) = l.strip_prefix("worktree ") {
+                dir = Some(PathBuf::from(d));
+            } else if let (Some(b), Some(d)) = (l.strip_prefix("branch refs/heads/"), &dir) {
+                out.insert(b.to_string(), d.clone());
+            }
+        }
+        out
+    }
+
+    /// The project directory inside another checkout of the repository (the same `prefix` below it).
+    pub fn project_in(&self, checkout: &Path) -> PathBuf {
+        checkout.join(self.prefix.trim_end_matches('/'))
+    }
+
     pub fn journals(&self) -> Vec<JournalRef> {
         let mut out = Vec::new();
         let local = format!("refs/wish/{}journal/", self.prefix);

@@ -232,6 +232,7 @@ pub fn run(project: &Project, prompt: &str, rules: &str, ticket: bool, sink: &mu
 
     let mut cmd = Command::new(std::env::var("WISH_CLAUDE").unwrap_or_else(|_| "claude".into()));
     cmd.current_dir(&project.root)
+        .env(crate::session::IN_CYCLE, "1")
         .arg("-p")
         .args(["--output-format", "stream-json", "--verbose"])
         .args(["--json-schema", &report_schema(ticket).to_string()])

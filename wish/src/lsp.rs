@@ -209,7 +209,7 @@ fn run_with(conn: Connection) -> Result<()> {
             "inlayHintProvider": true,
             "codeLensProvider": {"resolveProvider": false},
             "semanticTokensProvider": {"legend": {"tokenTypes": ["generated"], "tokenModifiers": ["prototype", "untraced"]}, "full": true},
-            "executeCommandProvider": {"commands": ["wish.adopt", "wish.unadopt", "wish.accept", "wish.reject", "wish.decide", "wish.undo", "wish.implement", "wish.regenerate", "wish.nextBlock", "wish.ticket.edit", "wish.ticket.open"]}
+            "executeCommandProvider": {"commands": ["wish.adopt", "wish.unadopt", "wish.accept", "wish.reject", "wish.decide", "wish.undo", "wish.implement", "wish.cycle", "wish.regenerate", "wish.nextBlock", "wish.ticket.edit", "wish.ticket.open"]}
         },
         "serverInfo": {"name": "wishlang", "version": env!("CARGO_PKG_VERSION")}
     });
@@ -261,6 +261,13 @@ fn run_with(conn: Connection) -> Result<()> {
 fn root_from_init(params: &Value) -> Option<PathBuf> {
     let uri = params["workspaceFolders"][0]["uri"].as_str().or(params["rootUri"].as_str())?;
     uri_to_path(uri)
+}
+
+/// Adds `root`, the project's URI: the files in a response are relative to it, which need not be the
+/// editor's workspace (a project in `backend/` of a repository opened at its root).
+fn with_root(mut v: Value, p: &Project) -> Value {
+    v["root"] = json!(path_to_uri(&p.root));
+    v
 }
 
 // ---- URIs ------------------------------------------------------------------
@@ -455,19 +462,27 @@ impl Server {
         let text = self.text(rel)?;
         let git = self.git();
         let (whos, shas): (Vec<Who>, Vec<Option<String>>) = git.as_ref().and_then(|g| g.blame_lines(rel, &text)).unwrap_or_default().into_iter().unzip();
-        let src = p.lang.is_src(rel);
+        let src = p.lang.is_src(rel) && !p.is_build_output(rel);
         let items = if src { self.items_of(p.lang, rel, &text) } else { vec![] };
         let mocked: Vec<(usize, usize)> = items.iter().filter(|i| i.mocked().is_some()).map(|i| (i.line, i.end_line)).collect();
         let (generated, prototype) = paint_lines(&whos, &text, &mocked);
         let pending = if src {
             // Everything the rest of the project defines, using open buffers where they exist.
             let mut all = Vec::new();
+            let mut implicit = Vec::new();
             for f in p.src_files().iter().filter(|f| f.as_str() != rel) {
                 if let Some(src) = self.text(f) {
                     all.extend(self.items_of(p.lang, f, &src));
+                    if p.lang == Lang::Java {
+                        implicit.extend(crate::java::implicit_members(&src));
+                    }
                 }
             }
-            pending::find(p.lang, &text, &pending::Known::from_items(&all)).unwrap_or_default()
+            let mut known = pending::Known::from_items(&all);
+            for (path, ty) in &implicit {
+                known.add_member(path, ty.as_deref());
+            }
+            pending::find(p.lang, &text, &known).unwrap_or_default()
         } else {
             vec![]
         };
@@ -554,19 +569,36 @@ impl Server {
     }
 
     /// `wish/ticket`: the ticket of the current branch with the items that serve each problem.
-    fn ticket_request(&self) -> Result<Value> {
+    /// `wish/ticket {branch?}`: the trace of this branch's ticket, or of another ticket branch.
+    fn ticket_request(&self, branch: Option<&str>) -> Result<Value> {
         let p = self.project().context("no wishlang project")?;
         let git = self.git().context("no wishlang project")?;
+        if let Some(b) = branch.filter(|b| *b != git.branch()) {
+            let t = ticket::trace_branch(&p, &git, b)?;
+            // Files are relative to the checkout that has the branch; without one there is no root to open them from.
+            let root = t.checkout.as_deref().map(path_to_uri);
+            let mut v = serde_json::to_value(t)?;
+            v["root"] = json!(root);
+            return Ok(v);
+        }
         let t = ticket::trace(&p, &git)?;
         self.state.lock().unwrap().trace = Some((format!("{}@{}", git.branch(), git.journal().unwrap_or_default()), Some(Arc::new(t.clone()))));
-        Ok(serde_json::to_value(t)?)
+        Ok(with_root(serde_json::to_value(t)?, &p))
     }
 
-    /// `wish.ticket.edit [problems]`: replace the ticket's `problems.json`.
-    fn edit_problems(&self, p: &Project, arg: Option<&Value>) -> Result<String> {
+    /// `wish/tickets`: every ticket branch with a journal, the current one first.
+    fn tickets_request(&self) -> Result<Value> {
+        let p = self.project().context("no wishlang project")?;
+        let git = self.git().context("no wishlang project")?;
+        Ok(serde_json::to_value(ticket::tickets(&p, &git))?)
+    }
+
+    /// `wish.ticket.edit [problems, branch?]`: replace the `problems.json` of this branch's ticket (or `branch`'s).
+    fn edit_problems(&self, p: &Project, arg: Option<&Value>, branch: Option<&str>) -> Result<String> {
         let ps: Vec<Problem> = serde_json::from_value(arg.cloned().unwrap_or_default()).context("expected a list of problems [{id, text, scenarios}]")?;
         let git = Git::open(&p.root)?;
-        let key = ticket::key(git.branch()).with_context(|| format!("branch {} has no ticket", git.branch()))?;
+        let branch = branch.filter(|b| !b.is_empty()).unwrap_or(git.branch());
+        let key = ticket::key(branch).with_context(|| format!("branch {branch} has no ticket"))?;
         let dir = ticket::notes_dir(&p.root, &key).with_context(|| format!("no .work/{key} in the main checkout"))?;
         ticket::save_problems(&dir, &ps)?;
         self.state.lock().unwrap().trace = None;
@@ -606,7 +638,7 @@ impl Server {
             .collect();
         let decisions = p.decisions().into_iter().map(|d| WireDecision { id: d.id, title: d.title, choice: d.choice, why: d.why, status: d.status }).collect();
         let problems = self.ticket_trace(&p, &git).map(|t| t.problems.iter().map(|x| WireProblem { id: x.id.clone(), text: x.text.clone() }).collect()).unwrap_or_default();
-        Ok(serde_json::to_value(WireLog { entries, decisions, problems })?)
+        Ok(with_root(serde_json::to_value(WireLog { entries, decisions, problems })?, &p))
     }
 
     // ---- diagnostics ----
@@ -688,7 +720,8 @@ impl Server {
             "textDocument/codeAction" => Ok(self.code_actions(&req.params)),
             "wish/fileState" => Ok(self.wire_file_state(&req.params)),
             "wish/log" => self.journal_log(),
-            "wish/ticket" => self.ticket_request(),
+            "wish/ticket" => self.ticket_request(req.params["branch"].as_str()),
+            "wish/tickets" => self.tickets_request(),
             "wish/show" => self.show_file(&req.params),
             "workspace/executeCommand" => {
                 self.execute(&req.params);
@@ -843,11 +876,16 @@ impl Server {
                 self.cycle(commands::implement_options(file, item));
                 return;
             }
+            // What a save does: a cycle for your edits since the last one (nothing to do: no Claude call).
+            "wish.cycle" => {
+                self.cycle(Options::default());
+                return;
+            }
             "wish.regenerate" => {
                 self.cycle(Options { force: true, ..Options::default() });
                 return;
             }
-            "wish.ticket.edit" => self.edit_problems(&p, args.first()),
+            "wish.ticket.edit" => self.edit_problems(&p, args.first(), args.get(1).and_then(|v| v.as_str())),
             "wish.ticket.open" => {
                 self.open_problem(&p, &s(0));
                 return;
@@ -1482,6 +1520,7 @@ mod tests {
         assert_eq!(t["untraced"].as_array().unwrap().iter().map(|i| i["item"].clone()).collect::<Vec<_>>(), [json!("App.run")]);
         assert_eq!(t["files"], two_files);
         assert!(t["notesDir"].as_str().unwrap().ends_with(".work/DEMO-1"));
+        assert!(t["root"].as_str().unwrap().starts_with("file:///"));
 
         // Editing the problems validates, saves and refreshes; a bad edit shows a message and changes nothing.
         let edit = |c: &mut Client, ps: Value| c.ok("workspace/executeCommand", json!({"command": "wish.ticket.edit", "arguments": [ps]}));

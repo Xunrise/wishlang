@@ -6,7 +6,7 @@ use crate::project::{Adopted, Lang, Project, Status};
 use anyhow::{Result, anyhow, bail};
 use std::fmt::Write;
 
-pub fn init() -> Result<String> {
+pub fn init(protect_existing: bool) -> Result<String> {
     let cwd = std::env::current_dir()?;
     let lang = Lang::detect(&cwd);
     if !cwd.join(lang.manifest()).is_file() {
@@ -16,8 +16,17 @@ pub fn init() -> Result<String> {
         bail!("wish.toml already exists");
     }
     let mut p = Project { root: cwd, cfg: Default::default(), lang };
-    if lang == Lang::Java {
+    if protect_existing {
+        p.cfg.protected.files = p.src_files();
+        if p.cfg.protected.files.is_empty() {
+            bail!("no source files under {} to protect", p.lang.src_dir());
+        }
+    } else if lang == Lang::Java {
         p.cfg.protected.files = vec![java_entry_point(&p)?];
+    }
+    if lang == Lang::Java && p.modules().len() > 1 {
+        // `java -cp target/classes` can't start a module of a reactor build (no dependency classpath).
+        p.cfg.java = Some(crate::project::JavaCfg { main_class: None, preview: Some(false) });
     }
     let in_git = std::process::Command::new("git").args(["rev-parse", "--git-dir"]).current_dir(&p.root).output().is_ok_and(|o| o.status.success());
     if !in_git {
@@ -26,8 +35,12 @@ pub fn init() -> Result<String> {
     p.save()?;
     crate::engine::ensure_journal(&p, &crate::git::Git::open(&p.root)?)?;
     let entry = &p.cfg.protected.files[0];
+    let n = p.cfg.protected.files.len();
+    let entry = if n > 1 { format!("{n} existing source files are") } else { format!("{entry} is") };
     if lang == Lang::Java {
-        return Ok(format!("created wish.toml: {entry} is protected. Write your wishes there, then run `wish dev`."));
+        let modules = p.modules().len();
+        let modules = if modules > 1 { format!(" ({modules} Maven modules; the app is not run after cycles)") } else { String::new() };
+        return Ok(format!("created wish.toml{modules}: {entry} protected. Write your wishes there, then run `wish dev`."));
     }
     let zed = p.root.join(".zed/settings.json");
     if !zed.exists() {
@@ -39,7 +52,7 @@ pub fn init() -> Result<String> {
     if !has_rule {
         println!("note: to see generated code in blue, add wishlang's `semantic_token_rules` (see README) to your Zed user settings");
     }
-    Ok(format!("created wish.toml and .zed/settings.json: {entry} is protected. Write your wishes there, then run `wish dev`."))
+    Ok(format!("created wish.toml and .zed/settings.json: {entry} protected. Write your wishes there, then run `wish dev`."))
 }
 
 /// The first Java file with a `main` method: the user's own, protected file.
@@ -265,7 +278,7 @@ pub fn undo(p: &Project) -> Result<String> {
 }
 
 fn is_green(subject: &str) -> bool {
-    subject.starts_with("cycle ok") || subject.starts_with("implemented") || subject.starts_with("baseline")
+    ["cycle ok", "implemented", "baseline", "session", "imported"].iter().any(|l| subject.starts_with(l))
 }
 
 /// Implement the prototype (whole project, or one file).

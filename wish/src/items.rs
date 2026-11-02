@@ -32,6 +32,11 @@ pub struct Item {
     /// Hash of the public contract: fn signature, or the type definition
     /// without doc attributes. None for impls and private items.
     pub sig_hash: Option<String>,
+    /// Java only: the head of a method's return type or a field's type (`List` for `List<Code>`,
+    /// `[]` for arrays), so a call chain can tell when it leaves the project's own types. A head the
+    /// declaring file imports, or takes from java.lang, is `import:Head`: only the project's
+    /// own types can make that one of ours, because only that file knew where it came from.
+    pub ty: Option<String>,
 }
 
 impl Item {
@@ -109,7 +114,7 @@ struct Push<'a> {
 impl Push<'_> {
     #[allow(clippy::too_many_arguments)]
     fn item(&mut self, path: String, kind: &'static str, hash: String, docs: String, line: usize, public: bool, sig_hash: Option<String>) {
-        self.out.push(Item { path: format!("{}{path}", self.prefix), kind, hash, docs, line, end_line: self.end.max(line), sig_hash: if public { sig_hash } else { None } });
+        self.out.push(Item { path: format!("{}{path}", self.prefix), kind, hash, docs, line, end_line: self.end.max(line), sig_hash: if public { sig_hash } else { None }, ty: None });
     }
 }
 

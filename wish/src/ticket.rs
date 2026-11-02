@@ -168,7 +168,7 @@ fn extraction_schema() -> Value {
 /// One structured Claude call; returns the CLI's JSON result.
 fn claude_json(root: &Path, prompt: &str) -> Result<Value> {
     let mut cmd = Command::new(std::env::var("WISH_CLAUDE").unwrap_or_else(|_| "claude".into()));
-    cmd.current_dir(root).args(["-p", "--output-format", "json"]).args(["--json-schema", &extraction_schema().to_string()]);
+    cmd.current_dir(root).env(crate::session::IN_CYCLE, "1").args(["-p", "--output-format", "json"]).args(["--json-schema", &extraction_schema().to_string()]);
     if let Ok(model) = std::env::var("WISH_MODEL") {
         cmd.args(["--model", &model]);
     }
@@ -243,6 +243,10 @@ pub struct Trace {
     pub files: Vec<FileStat>,
     #[serde(skip)]
     pub union: Problems,
+    pub branch: String,
+    /// The project directory of the checkout that has the branch, if any (files open from there).
+    #[serde(skip)]
+    pub checkout: Option<PathBuf>,
 }
 
 /// Unite the problems each item served over cycles (a later cycle adds problems, never removes them).
@@ -265,10 +269,51 @@ pub fn problems_of(u: &Problems, item: &str) -> Option<BTreeSet<String>> {
 
 /// The ticket of the current branch, traced through the journal.
 pub fn trace(p: &Project, git: &Git) -> Result<Trace> {
-    let key = key(git.branch()).with_context(|| format!("branch {} has no ticket key (feature|fix|chore/KEY-… or proto/KEY)", git.branch()))?;
+    trace_branch(p, git, git.branch())
+}
+
+/// A ticket branch that has a journal, for picking a ticket to look at.
+#[derive(Debug, Clone, Serialize)]
+pub struct TicketRef {
+    pub key: String,
+    pub branch: String,
+    pub title: Option<String>,
+    /// The branch checked out here.
+    pub current: bool,
+    /// The worktree that has the branch checked out, if any.
+    pub checkout: Option<String>,
+}
+
+/// Every local ticket branch with a journal, the current one first, then by key.
+pub fn tickets(p: &Project, git: &Git) -> Vec<TicketRef> {
+    let trees = git.worktrees();
+    let mut out: Vec<TicketRef> = git
+        .journals()
+        .into_iter()
+        .filter(|j| j.remote.is_none())
+        .filter_map(|j| {
+            let key = key(&j.branch)?;
+            Some(TicketRef {
+                title: notes_dir(&p.root, &key).and_then(|d| title(&d, &key)),
+                current: j.branch == git.branch(),
+                checkout: trees.get(&j.branch).map(|d| d.display().to_string()),
+                key,
+                branch: j.branch,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| (!a.current, &a.key, &a.branch).cmp(&(!b.current, &b.key, &b.branch)));
+    out
+}
+
+/// The trace of the ticket on `branch`, which need not be checked out here: its items are then
+/// located in the branch's journal (its latest snapshot), not on disk.
+pub fn trace_branch(p: &Project, git: &Git, branch: &str) -> Result<Trace> {
+    let key = key(branch).with_context(|| format!("branch {branch} has no ticket key (feature|fix|chore/KEY-… or proto/KEY)"))?;
     let dir = notes_dir(&p.root, &key);
     let ps = dir.as_deref().map(problems).transpose()?.unwrap_or_default();
-    let journal = git.journal().context("no journal yet")?;
+    let here = branch == git.branch();
+    let journal = git.resolve(&git.ref_for("journal", branch)).with_context(|| format!("{branch} has no journal yet"))?;
     // The ticket's cycles, newest first.
     let cycles: Vec<_> = git
         .history(&journal)
@@ -280,7 +325,15 @@ pub fn trace(p: &Project, git: &Git) -> Result<Trace> {
         .collect();
     let messages: Vec<CycleMessage> = cycles.iter().rev().map(|c| c.2.clone()).collect();
     let union = union(&messages);
-    let locations = p.item_locations();
+    let (head, base) = match (cycles.first(), cycles.last()) {
+        (Some(newest), Some(oldest)) => (Some(newest.0.clone()), Some(format!("{}^", oldest.0))),
+        _ => (None, None),
+    };
+    let files = match (&head, &base) {
+        (Some(h), Some(b)) => git.numstat(b, h).unwrap_or_default(),
+        _ => vec![],
+    };
+    let locations = if here { p.item_locations() } else { snapshot_locations(p, git, &journal, &files) };
     // The items serving a problem (or, with None, serving none), each once.
     let items = |only: Option<&str>| {
         locations
@@ -309,14 +362,7 @@ pub fn trace(p: &Project, git: &Git) -> Result<Trace> {
         })
         .collect();
     let untraced = sorted(items(None));
-    let (head, base) = match (cycles.first(), cycles.last()) {
-        (Some(newest), Some(oldest)) => (Some(newest.0.clone()), Some(format!("{}^", oldest.0))),
-        _ => (None, None),
-    };
-    let files = match (&head, &base) {
-        (Some(h), Some(b)) => git.numstat(b, h).unwrap_or_default(),
-        _ => vec![],
-    };
+    let checkout = if here { Some(p.root.clone()) } else { git.worktrees().get(branch).map(|d| git.project_in(d)) };
     let body = dir.as_deref().map(|d| notes(d).into_iter().map(|(_, t)| t).collect::<Vec<_>>().join("\n\n---\n\n")).unwrap_or_default();
     Ok(Trace {
         title: dir.as_deref().and_then(|d| title(d, &key)),
@@ -330,7 +376,21 @@ pub fn trace(p: &Project, git: &Git) -> Result<Trace> {
         base,
         files,
         union,
+        branch: branch.to_string(),
+        checkout,
     })
+}
+
+/// Where each item of the ticket's files is in snapshot `sha`: item path -> (file, 1-based line).
+fn snapshot_locations(p: &Project, git: &Git, sha: &str, files: &[FileStat]) -> std::collections::HashMap<String, (String, usize)> {
+    let mut out = std::collections::HashMap::new();
+    for f in files.iter().filter(|f| p.lang.is_src(&f.path)) {
+        let Some(src) = git.show(sha, &f.path) else { continue };
+        for it in crate::items::parse(p.lang, &src).unwrap_or_default() {
+            out.entry(it.path).or_insert((f.path.clone(), it.line));
+        }
+    }
+    out
 }
 
 /// The ticket as a terminal tree: problems with the `file:line` of each item that serves them.
@@ -454,6 +514,8 @@ mod tests {
             base: None,
             files: vec![],
             union: Problems::new(),
+            branch: "feature/DEMO-1".into(),
+            checkout: None,
         };
         let text = render(&t);
         assert!(text.starts_with("DEMO-1 Open the window\nproblems: /repo/.work/DEMO-1/problems.json\n2 cycle(s), 0 file(s) changed\n"));

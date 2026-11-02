@@ -14,6 +14,7 @@ mod lsp;
 mod pending;
 mod preview;
 mod provenance;
+mod session;
 mod project;
 mod ticket;
 
@@ -29,10 +30,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Add wish.toml to the current cargo project (protects src/main.rs).
-    Init,
+    /// Add wish.toml to the current cargo or Maven project (protects src/main.rs, or the Java entry point).
+    Init {
+        /// Protect every source file that exists now: Claude may only add imports to them and
+        /// writes what you wish into new files. For adopting wish in an existing codebase.
+        #[arg(long)]
+        protect_existing: bool,
+    },
     /// Dev loop: compile on save, live preview, decisions and suggestions.
     Dev,
+    /// Claude Code hook (UserPromptSubmit and Stop) that records ordinary Claude sessions in the journal.
+    Session,
+    /// Explain a Claude Code turn to the session hook (JSON on stdin; asked for by the hook).
+    Explain {
+        #[arg(long)]
+        session: String,
+    },
+    /// Rebuild this branch's journal from the commits since <since>, recording them as Claude's.
+    Import {
+        since: String,
+        /// Per-commit reasons and ticket problems: {"<sha>": {"summary", "changes": [{"item", "why", "problems"}], "problems"}}.
+        #[arg(long)]
+        report: Option<std::path::PathBuf>,
+    },
     /// Run one compile cycle, then launch the app.
     Compile {
         /// Emit NDJSON events (for editor plugins); implies --no-run.
@@ -127,8 +147,11 @@ fn run() -> anyhow::Result<()> {
     };
     match cli.cmd {
         Cmd::Hook => hook::run(),
-        Cmd::Init => print(commands::init()),
+        Cmd::Init { protect_existing } => print(commands::init(protect_existing)),
         Cmd::Dev => dev::run(Project::discover()?),
+        Cmd::Session => session::hook(),
+        Cmd::Explain { session } => print(session::explain(&session)),
+        Cmd::Import { since, report } => print(session::import(&Project::discover()?, &since, report.as_deref())),
         Cmd::Compile { json, force, no_run, note } => {
             let mut p = Project::discover()?;
             let mut sink: Box<dyn events::Sink> = if json { Box::new(events::Json) } else { Box::new(events::Human) };

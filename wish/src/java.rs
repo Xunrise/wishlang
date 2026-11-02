@@ -52,7 +52,13 @@ pub fn parse(src: &str) -> Result<Vec<Item>> {
     let Some(tree) = parse_tree(src) else { bail!("parsing Java source") };
     let root = tree.root_node();
     let mut out = Vec::new();
+    let imported = declared_names(root, src);
     walk(members(root), "", false, src, &mut out);
+    for i in &mut out {
+        if let Some(t) = i.ty.as_mut().filter(|t| imported.contains(t.as_str()) || JAVA_LANG.contains(&t.as_str())) {
+            *t = format!("import:{t}");
+        }
+    }
     Ok(out)
 }
 
@@ -119,6 +125,7 @@ fn walk(nodes: Vec<Node>, prefix: &str, in_interface: bool, src: &str, out: &mut
         let head = &src[n.start_byte()..body.map_or(n.end_byte(), |b| b.start_byte())];
         let full = hash(&format!("{}\u{0}{docs}", text(n, src)));
         let sig = (public && matches!(kind, "class" | "interface" | "enum" | "record" | "method" | "constructor")).then(|| hash(head));
+        let ty = matches!(kind, "method" | "field").then(|| n.child_by_field_name("type")).flatten().map(|t| type_head(t, src));
         // One item per name: a field declaration may declare several.
         let names: Vec<(String, Node)> = match kind {
             "field" => n.children_by_field_name("declarator", &mut n.walk()).filter_map(|d| d.child_by_field_name("name")).map(|nm| (text(nm, src).to_string(), nm)).collect(),
@@ -136,6 +143,7 @@ fn walk(nodes: Vec<Node>, prefix: &str, in_interface: bool, src: &str, out: &mut
                 line: name_node.start_position().row + 1,
                 end_line: n.end_position().row + 1,
                 sig_hash: sig.clone(),
+                ty: ty.clone(),
             });
             if let (true, Some(b)) = (is_type, body) {
                 walk(members(b), &format!("{path}."), n.kind() == "interface_declaration", src, out);
@@ -147,6 +155,16 @@ fn walk(nodes: Vec<Node>, prefix: &str, in_interface: bool, src: &str, out: &mut
     let taken: Vec<String> = out[first..].iter().filter(|i| i.kind != "field").map(|i| i.path.clone()).collect();
     for i in out[first..].iter_mut().filter(|i| i.kind == "field" && taken.contains(&i.path)) {
         i.path.push_str("#field");
+    }
+}
+
+/// The outermost type name of a type node: `List` for `List<Code>`, `Entry` for `Map.Entry`, `[]` for arrays.
+fn type_head(n: Node, src: &str) -> String {
+    match n.kind() {
+        "generic_type" => n.named_child(0).map_or_else(String::new, |t| type_head(t, src)),
+        "scoped_type_identifier" => n.named_child(n.named_child_count().saturating_sub(1)).map_or_else(String::new, |t| text(t, src).to_string()),
+        "array_type" => "[]".into(),
+        _ => text(n, src).to_string(),
     }
 }
 
@@ -202,6 +220,8 @@ struct V<'a> {
     src: &'a str,
     lines: Vec<&'a str>,
     known: &'a Known,
+    /// What this buffer itself declares: its own fields win over same-named ones elsewhere.
+    own: Known,
     declared: BTreeSet<String>,
     out: Vec<Pending>,
 }
@@ -224,14 +244,41 @@ impl V<'_> {
 
     /// A capitalised name that is neither external nor already defined: a
     /// type that will be generated.
+    /// A known field or method name that is not a type, like `LOGGER` or `ALL`: a value, whatever its case.
+    fn value(&self, t: &str) -> bool {
+        !self.known.is_type(t) && self.known.types_of(t).is_some()
+    }
+
     fn wished_type(&self, t: &str) -> bool {
         upper(t) && !self.external(t) && !self.known.has_path(t) && !self.known.has_name(t)
     }
 
-    /// Does this expression chain start at one of our (existing or pending) types?
+    /// Is `t` one of our types, existing or wished (not java.lang, not imported from a library)?
+    fn ours(&self, t: &str) -> bool {
+        match t.strip_prefix("import:") {
+            Some(head) => self.known.has_path_or_tail(head),
+            None => self.known.has_path_or_tail(t) || (upper(t) && !self.external(t)),
+        }
+    }
+
+    /// Does the member `name` (on `object`, if given) yield one of our types? Its declared type is looked up
+    /// by exact path (`Codes.VALUES`), else among this file's own members, else by name anywhere. Unknown
+    /// members (still to be generated) do; a known one only if some declaration has one of our types. So
+    /// `Codes.ALL.stream()` stops at `ALL`'s `List`, while `App.create().window()` stays on our types.
+    fn yields_ours(&self, name: Node, object: Option<Node>) -> bool {
+        let m = self.text(name);
+        let at = object.filter(|o| o.kind() == "identifier").and_then(|o| self.known.types_at(&format!("{}.{m}", self.text(o))));
+        at.or_else(|| self.own.types_of(m)).or_else(|| self.known.types_of(m)).is_none_or(|ts| ts.iter().any(|t| self.ours(t)))
+    }
+
+    /// Does this expression chain start at one of our (existing or pending) types, and stay on them?
     fn rooted(&self, n: Node) -> bool {
         match n.kind() {
-            "method_invocation" | "field_access" => n.child_by_field_name("object").is_some_and(|o| self.rooted(o)),
+            "method_invocation" | "field_access" => {
+                let object = n.child_by_field_name("object");
+                let member = n.child_by_field_name(if n.kind() == "field_access" { "field" } else { "name" });
+                object.is_some_and(|o| self.rooted(o)) && member.is_some_and(|m| self.yields_ours(m, object))
+            }
             "parenthesized_expression" => n.named_child(0).is_some_and(|c| self.rooted(c)),
             "object_creation_expression" => n.child_by_field_name("type").is_some_and(|t| {
                 let name = self.text(t);
@@ -239,15 +286,23 @@ impl V<'_> {
             }),
             "identifier" => {
                 let t = self.text(n);
-                self.known.has_path(t) || (upper(t) && !self.external(t))
+                if (upper(t) && self.value(t)) || self.own.types_of(t).is_some() {
+                    // a constant like `LOGGER`, or a field this file declares (`stagingPort`); other
+                    // lowercase names are locals and parameters, which we can't type
+                    self.yields_ours(n, None)
+                } else {
+                    self.known.has_path_or_tail(t) || (upper(t) && !self.external(t))
+                }
             }
             _ => false,
         }
     }
 
     /// `X` in `X.y`: a capitalised identifier that is not external.
+    /// A project type stays ours when imported from another package.
     fn type_ref(&self, n: Node) -> bool {
-        n.kind() == "identifier" && upper(self.text(n)) && !self.external(self.text(n))
+        let t = self.text(n);
+        n.kind() == "identifier" && upper(t) && (self.known.is_type(t) || !self.external(t)) && !self.value(t)
     }
 
     fn visit(&mut self, n: Node) {
@@ -266,7 +321,7 @@ impl V<'_> {
                     match n.child_by_field_name("object") {
                         Some(o) if self.type_ref(o) => {
                             let full = format!("{}.{}", self.text(o), self.text(name));
-                            if !self.known.has_path(&full) {
+                            if !self.known.has_path_or_tail(&full) {
                                 self.push(full, o, name);
                             }
                         }
@@ -283,7 +338,7 @@ impl V<'_> {
             "field_access" => {
                 if let (Some(o), Some(f)) = (n.child_by_field_name("object"), n.child_by_field_name("field")) {
                     let full = format!("{}.{}", self.text(o), self.text(f));
-                    if self.type_ref(o) && !self.known.has_path(&full) {
+                    if self.type_ref(o) && !self.known.has_path_or_tail(&full) {
                         self.push(full, o, f);
                     }
                 }
@@ -297,14 +352,61 @@ impl V<'_> {
     }
 }
 
+/// Members Java declares without an item of their own: a record's component accessors and an
+/// enum's `values()` / `valueOf(String)`, as (path, declared type).
+pub fn implicit_members(src: &str) -> Vec<(String, Option<String>)> {
+    fn go(n: Node, prefix: &str, src: &str, out: &mut Vec<(String, Option<String>)>) {
+        let mut cur = n.walk();
+        for c in n.named_children(&mut cur) {
+            let kind = c.kind();
+            if !matches!(kind, "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration") {
+                continue;
+            }
+            let Some(name) = c.child_by_field_name("name").map(|nm| text(nm, src).to_string()) else { continue };
+            let path = format!("{prefix}{name}");
+            if kind == "enum_declaration" {
+                out.push((format!("{path}.values"), Some("[]".into())));
+                out.push((format!("{path}.valueOf"), Some(name.clone())));
+            }
+            if let (true, Some(params)) = (kind == "record_declaration", c.child_by_field_name("parameters")) {
+                let mut pc = params.walk();
+                for p in params.named_children(&mut pc).filter(|p| p.kind() == "formal_parameter") {
+                    if let (Some(nm), Some(t)) = (p.child_by_field_name("name"), p.child_by_field_name("type")) {
+                        out.push((format!("{path}.{}", text(nm, src)), Some(type_head(t, src))));
+                    }
+                }
+            }
+            if let Some(b) = c.child_by_field_name("body") {
+                go(b, &format!("{path}."), src, out);
+                if let Some(decls) = (0..b.named_child_count()).filter_map(|i| b.named_child(i)).find(|d| d.kind() == "enum_body_declarations") {
+                    go(decls, &format!("{path}."), src, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(tree) = parse_tree(src) {
+        go(tree.root_node(), "", src, &mut out);
+        let imported = declared_names(tree.root_node(), src);
+        for t in out.iter_mut().filter_map(|(_, t)| t.as_mut()).filter(|t| imported.contains(t.as_str()) || JAVA_LANG.contains(&t.as_str())) {
+            *t = format!("import:{t}");
+        }
+    }
+    out
+}
+
 /// Find references in `src` that `known` doesn't define. None if `src` doesn't parse.
 pub fn find_pending(src: &str, known: &Known) -> Option<Vec<Pending>> {
     let tree = parse_tree(src)?;
     let root = tree.root_node();
     // Items defined in this very buffer count as known too.
+    let mut own = Known::from_items(&parse(src).unwrap_or_default());
+    for (path, ty) in implicit_members(src) {
+        own.add_member(&path, ty.as_deref());
+    }
     let mut k = known.clone();
-    k.add(&parse(src).unwrap_or_default());
-    let mut v = V { src, lines: src.lines().collect(), known: &k, declared: declared_names(root, src), out: Vec::new() };
+    k.merge(&own);
+    let mut v = V { src, lines: src.lines().collect(), known: &k, own, declared: declared_names(root, src), out: Vec::new() };
     v.visit(root);
     v.out.sort_by_key(|p| p.start);
     let mut seen = BTreeSet::new();
@@ -403,8 +505,56 @@ public class App {
     }
 
     #[test]
+    fn a_chain_stops_at_a_library_type() {
+        let vocab = "class Codes { static final List<Code> ALL = null; static Optional<Code> find(String c) { return null; } static Code[] arr() { return null; } static Code first() { return null; } } record Code(String code) {}";
+        let n = |src: &str| find_pending(src, &known(vocab)).unwrap().into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert!(n("class M { void f() { Codes.ALL.stream().filter(c -> true).findFirst().orElseThrow(); } }").is_empty());
+        assert!(n("class M { void f() { Codes.find(\"x\").map(c -> c).isPresent(); Codes.arr().clone(); } }").is_empty());
+        // our own types keep the chain going, so wished members on them are still found
+        assert_eq!(n("class M { void f() { Codes.first().label(); Codes.make().fade(); } }"), [".label()", "Codes.make", ".fade()"]);
+    }
+
+    #[test]
     fn skips_imports_and_well_known_names() {
         assert!(names("package demo; import java.awt.Color; import static java.lang.Math.max; class M { void f() { Color c = Color.RED; String s = String.valueOf(1); List<String> l = new ArrayList<>(); System.out.println(Math.max(1, 2)); Map.Entry<String, String> e = null; java.awt.Frame fr = null; } <T> T g(T t) { return t; } }").is_empty());
+    }
+
+    #[test]
+    fn constants_nested_types_and_implicit_members_are_known() {
+        let vocab = "import org.slf4j.Logger; import java.util.regex.Pattern; class Svc { private static final Logger LOGGER = null; static final Pattern ID = null; \
+            enum Rejection { BLANK, WILDCARD } static final class Json { static Json fromRaw(String s) { return null; } } } \
+            record Code(String code, Code parent) {} enum Kind { A }";
+        let mut k = known(vocab);
+        for (path, ty) in implicit_members(vocab) {
+            k.add_member(&path, ty.as_deref());
+        }
+        let n = |src: &str| find_pending(src, &k).unwrap().into_iter().map(|p| p.name).collect::<Vec<_>>();
+        // a constant is a value of its declared (library) type, not a type of its own
+        assert_eq!(n("class M { void f() { LOGGER.warn(\"x\"); ID.matcher(\"y\").matches(); } }"), Vec::<String>::new());
+        // a nested type is named from inside its outer type by its simple name
+        assert!(n("class M { void f() { Object r = Rejection.BLANK; Json.fromRaw(\"{}\"); } }").is_empty());
+        // record accessors and enum values() exist without being written
+        assert!(n("class M { void f(Code c) { new Code(\"a\", null).code().isBlank(); Kind.values(); Kind.valueOf(\"A\"); } }").is_empty());
+        // ... and wished members are still found past them
+        assert_eq!(n("class M { void f() { new Code(\"a\", null).parent().label(); Rejection.EMPTY.x(); } }"), [".label()", "Rejection.EMPTY", ".x()"]);
+    }
+
+    #[test]
+    fn same_named_members_are_told_apart() {
+        let vocab = "import java.util.List; import java.util.regex.Pattern; class Tz { static final List<String> VALUES = null; } \
+            class Pay { static final Values VALUES = null; static final Field ID = null; } class Values { Values extendedWith(int x) { return this; } } class Field {}";
+        let k = known(vocab);
+        let n = |src: &str| find_pending(src, &k).unwrap().into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert!(n("class M { void f() { Tz.VALUES.stream().toList(); Pay.VALUES.extendedWith(1); } }").is_empty());
+        assert_eq!(n("class M { void f() { Pay.VALUES.shrink(); } }"), [".shrink()"]);
+        // this file's own ID (a Pattern) wins over Pay.ID (one of ours)
+        assert!(n("import java.util.regex.Pattern; class Svc { static final Pattern ID = null; boolean ok(String s) { return ID.matcher(s).matches(); } }").is_empty());
+        // a project type imported from another package is still ours
+        assert_eq!(n("import a.Pay; import java.awt.Color; class M { void f() { Pay.EMPTY.x(); Color.RED.darker(); } }"), ["Pay.EMPTY", ".x()"]);
+        // a field of this file is typed by its declaration
+        assert_eq!(n("import a.Pay; class Svc { private final Pay pay; private final String name; void f() { pay.archive(); pay.VALUES.extendedWith(1); name.trim(); } }"), [".archive()"]);
+        // locals and parameters are not typed: nothing is guessed about them
+        assert!(n("class M { String f(String value) { return value.trim(); } }").is_empty());
     }
 
     #[test]

@@ -313,6 +313,16 @@ fn build_prompt(p: &Project, i: &PromptInput) -> String {
             s.push_str(&format!("# History: how this prototype came about (oldest first)\n{h}\n\n"));
         }
     }
+    let dirs = p.src_dirs();
+    if dirs.len() > 1 {
+        s.push_str(&format!(
+            "# Maven modules\nThis is a multi-module build; `{}` runs at the root and compiles every module. Source roots: {}.\n\
+             Put each new type in the module and package where it belongs by the project's own architecture rules (see its CLAUDE.md and docs), \
+             next to the types it works with. A module can only use the modules its pom.xml depends on.\n\n",
+            p.lang.check_cmd(),
+            dirs.join(", ")
+        ));
+    }
     let owned: Vec<_> = p.owned_files().into_keys().collect();
     s.push_str(&format!("# Generated files\n{}\n\n", if owned.is_empty() { "(none yet)".into() } else { owned.join(", ") }));
     if !i.check_errors.is_empty() {

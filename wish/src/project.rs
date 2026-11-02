@@ -32,6 +32,10 @@ pub struct JavaCfg {
     /// The class `wish dev` launches, e.g. `demo.Main`.
     #[serde(default)]
     pub main_class: Option<String>,
+    /// `false`: don't launch the app after a cycle (e.g. a multi-module service that needs its
+    /// database and dependency classpath); the compile still checks every cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,13 +204,18 @@ impl Project {
     pub fn main_class(&self) -> String {
         let from_pom = || {
             let re = regex::Regex::new(r"<mainClass>\s*([^<\s]+)\s*</mainClass>").unwrap();
-            re.captures(&self.read("pom.xml")?).map(|c| c[1].to_string())
+            self.manifests().iter().find_map(|f| re.captures(&self.read(f)?).map(|c| c[1].to_string()))
         };
         self.cfg.java.as_ref().and_then(|j| j.main_class.clone()).or_else(from_pom).unwrap_or_else(|| "Main".into())
     }
 
     pub fn is_protected(&self, rel: &str) -> bool {
         self.cfg.protected.files.iter().any(|f| f == rel)
+    }
+
+    /// Inside a build output directory (`target/`, `core/target/…`): generated, not the project's source.
+    pub fn is_build_output(&self, rel: &str) -> bool {
+        rel.split('/').any(|s| s == "target")
     }
 
     pub fn is_tool_owned(&self, rel: &str) -> bool {
@@ -217,10 +226,39 @@ impl Project {
         fs::read_to_string(self.root.join(rel)).ok()
     }
 
+    /// The build's modules as directories relative to the root, the root itself (`""`) first.
+    /// Java: the root pom's `<modules>`, recursively. Rust: just the root.
+    pub fn modules(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.lang == Lang::Java {
+            collect_modules(&self.root, "", &mut out);
+        } else {
+            out.push(String::new());
+        }
+        out
+    }
+
+    /// Source roots, one per module that has one (`core/src/main/java`, …).
+    pub fn src_dirs(&self) -> Vec<String> {
+        self.modules().iter().map(|m| join_rel(m, self.lang.src_dir())).filter(|d| self.root.join(d).is_dir()).collect()
+    }
+
+    /// Build manifests, one per module (`pom.xml`, `core/pom.xml`, …).
+    pub fn manifests(&self) -> Vec<String> {
+        self.modules().iter().map(|m| join_rel(m, self.lang.manifest())).filter(|f| self.root.join(f).is_file()).collect()
+    }
+
+    /// Should the app run after each cycle? Only `[java] preview = false` turns it off.
+    pub fn preview_enabled(&self) -> bool {
+        self.cfg.java.as_ref().and_then(|j| j.preview) != Some(false)
+    }
+
     /// All source files of the project's language (relative paths), sorted.
     pub fn src_files(&self) -> Vec<String> {
         let mut out = Vec::new();
-        walk(&self.root.join(self.lang.src_dir()), self.lang.ext(), &mut out);
+        for d in self.src_dirs() {
+            walk(&self.root.join(d), self.lang.ext(), &mut out);
+        }
         let mut rels: Vec<String> = out.iter().filter_map(|p| self.rel(p)).collect();
         rels.sort();
         rels
@@ -236,9 +274,10 @@ impl Project {
                 }
             }
         }
-        let manifest = self.lang.manifest();
-        if let Some(s) = self.read(manifest) {
-            m.insert(manifest.into(), s);
+        for manifest in self.manifests().into_iter().filter(|f| !self.is_protected(f)) {
+            if let Some(s) = self.read(&manifest) {
+                m.insert(manifest, s);
+            }
         }
         m
     }
@@ -387,6 +426,24 @@ fn save_json<T: Serialize + ?Sized>(p: &Path, v: &T) -> Result<()> {
     Ok(())
 }
 
+/// `dir` and the modules its pom lists, recursively; each module once.
+fn collect_modules(root: &Path, dir: &str, out: &mut Vec<String>) {
+    out.push(dir.to_string());
+    let Ok(pom) = fs::read_to_string(root.join(dir).join("pom.xml")) else { return };
+    let re = regex::Regex::new(r"<module>\s*([^<\s]+?)/?\s*</module>").unwrap();
+    for c in re.captures_iter(&pom) {
+        let m = join_rel(dir, &c[1]);
+        if !out.contains(&m) && root.join(&m).join("pom.xml").is_file() {
+            collect_modules(root, &m, out);
+        }
+    }
+}
+
+/// `a/b` from a relative directory (`""` is the root) and a relative path.
+fn join_rel(dir: &str, rel: &str) -> String {
+    if dir.is_empty() { rel.to_string() } else { format!("{dir}/{rel}") }
+}
+
 fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
@@ -471,6 +528,38 @@ mod tests {
         assert_eq!(p.main_class(), "demo.Pom");
         std::fs::write(p.root.join("pom.xml"), "<project/>").unwrap();
         assert_eq!(p.main_class(), "Main");
+        let _ = std::fs::remove_dir_all(&p.root);
+    }
+
+    #[test]
+    fn a_reactor_build_spans_its_modules() {
+        let p = java_project("modules", "[protected]\nfiles = [\"core/src/main/java/a/Kept.java\"]\n", "<project><modules><module>core</module><module>apps</module><module>gone</module></modules></project>");
+        let w = |rel: &str, text: &str| {
+            let f = p.root.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, text).unwrap();
+        };
+        w("core/pom.xml", "<project/>");
+        w("apps/pom.xml", "<project><modules>\n  <module> web/ </module>\n</modules></project>");
+        w("apps/web/pom.xml", "<project><build><mainClass>a.WebApp</mainClass></build></project>");
+        w("core/src/main/java/a/Kept.java", "class Kept {}");
+        w("core/src/main/java/a/Gen.java", "class Gen {}");
+        w("apps/web/src/main/java/a/WebApp.java", "class WebApp {}");
+        w("core/src/test/java/a/GenTest.java", "class GenTest {}");
+        assert_eq!(p.modules(), ["", "core", "apps", "apps/web"]);
+        assert_eq!(p.src_dirs(), ["core/src/main/java", "apps/web/src/main/java"]);
+        assert_eq!(p.src_files(), ["apps/web/src/main/java/a/WebApp.java", "core/src/main/java/a/Gen.java", "core/src/main/java/a/Kept.java"]);
+        let owned: Vec<String> = p.owned_files().into_keys().collect();
+        assert_eq!(owned, ["apps/pom.xml", "apps/web/pom.xml", "apps/web/src/main/java/a/WebApp.java", "core/pom.xml", "core/src/main/java/a/Gen.java", "pom.xml"]);
+        assert_eq!(p.main_class(), "a.WebApp");
+        assert!(p.preview_enabled());
+        let _ = std::fs::remove_dir_all(&p.root);
+    }
+
+    #[test]
+    fn preview_can_be_turned_off() {
+        let p = java_project("preview", "[java]\npreview = false\n", "<project/>");
+        assert!(!p.preview_enabled());
         let _ = std::fs::remove_dir_all(&p.root);
     }
 
