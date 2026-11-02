@@ -1,0 +1,77 @@
+{
+  "base": "<sha>^",
+  "body": "# DEMO-1 — Open the demo window\n\nThe demo should open a window.\n",
+  "cycles": 2,
+  "files": [
+    {
+      "added": 15,
+      "path": "src/main/java/demo/App.java",
+      "removed": 0
+    },
+    {
+      "added": 4,
+      "path": "src/main/java/demo/Quit.java",
+      "removed": 0
+    }
+  ],
+  "head": "<sha>",
+  "key": "DEMO-1",
+  "notesDir": "<root>/.work/DEMO-1",
+  "problems": [
+    {
+      "id": "P1",
+      "items": [
+        {
+          "file": "src/main/java/demo/App.java",
+          "item": "App.create",
+          "line": 11,
+          "reasons": [
+            {
+              "sha": "<sha>",
+              "when": "<age>",
+              "why": "Main calls App.create."
+            }
+          ]
+        }
+      ],
+      "scenarios": [
+        "Open the window"
+      ],
+      "text": "The demo window does not open"
+    },
+    {
+      "id": "P2",
+      "items": [
+        {
+          "file": "src/main/java/demo/App.java",
+          "item": "App.create",
+          "line": 11,
+          "reasons": [
+            {
+              "sha": "<sha>",
+              "when": "<age>",
+              "why": "Main calls App.create."
+            }
+          ]
+        }
+      ],
+      "scenarios": [],
+      "text": "Closing the window leaves the app running"
+    }
+  ],
+  "title": "Open the demo window",
+  "untraced": [
+    {
+      "file": "src/main/java/demo/App.java",
+      "item": "App.run",
+      "line": 14,
+      "reasons": [
+        {
+          "sha": "<sha>",
+          "when": "<age>",
+          "why": "Main calls App.run."
+        }
+      ]
+    }
+  ]
+}

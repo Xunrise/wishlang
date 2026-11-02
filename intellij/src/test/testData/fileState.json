@@ -1,0 +1,193 @@
+{
+  "blocks": [
+    {
+      "end": 0,
+      "hover": "⚙ **generated** · cycle ok · <age> · prototype\n\nAdded App.\n\n`git show <sha>` for the full cycle",
+      "item": null,
+      "problems": [],
+      "start": 0,
+      "untraced": false
+    },
+    {
+      "end": 3,
+      "hover": "⚙ **generated** · cycle ok · <age> · prototype\n\nAdded App.\n\n`git show <sha>` for the full cycle",
+      "item": "App",
+      "problems": [],
+      "start": 2,
+      "untraced": false
+    },
+    {
+      "end": 10,
+      "hover": "⚙ **generated** · cycle ok · <age> · prototype\n\n**Solves P1**: The demo window does not open\n\n**Solves P2**: Closing the window leaves the app running\n\n**`App.create`**: Main calls App.create.\n\n`git show <sha>` for the full cycle",
+      "item": "App.create",
+      "problems": [
+        "P1",
+        "P2"
+      ],
+      "start": 4,
+      "untraced": false
+    },
+    {
+      "end": 14,
+      "hover": "⚙ **generated** · cycle ok · <age> · prototype\n\n**`App.run`**: Main calls App.run.\n\n`git show <sha>` for the full cycle",
+      "item": "App.run",
+      "problems": [],
+      "start": 12,
+      "untraced": true
+    }
+  ],
+  "generated": [
+    {
+      "end": {
+        "character": 13,
+        "line": 0
+      },
+      "start": {
+        "character": 0,
+        "line": 0
+      }
+    },
+    {
+      "end": {
+        "character": 15,
+        "line": 2
+      },
+      "start": {
+        "character": 0,
+        "line": 2
+      }
+    },
+    {
+      "end": {
+        "character": 18,
+        "line": 3
+      },
+      "start": {
+        "character": 0,
+        "line": 3
+      }
+    },
+    {
+      "end": {
+        "character": 7,
+        "line": 4
+      },
+      "start": {
+        "character": 0,
+        "line": 4
+      }
+    },
+    {
+      "end": {
+        "character": 17,
+        "line": 5
+      },
+      "start": {
+        "character": 0,
+        "line": 5
+      }
+    },
+    {
+      "end": {
+        "character": 22,
+        "line": 6
+      },
+      "start": {
+        "character": 0,
+        "line": 6
+      }
+    },
+    {
+      "end": {
+        "character": 21,
+        "line": 7
+      },
+      "start": {
+        "character": 0,
+        "line": 7
+      }
+    },
+    {
+      "end": {
+        "character": 7,
+        "line": 8
+      },
+      "start": {
+        "character": 0,
+        "line": 8
+      }
+    },
+    {
+      "end": {
+        "character": 15,
+        "line": 9
+      },
+      "start": {
+        "character": 0,
+        "line": 9
+      }
+    },
+    {
+      "end": {
+        "character": 19,
+        "line": 12
+      },
+      "start": {
+        "character": 0,
+        "line": 12
+      }
+    },
+    {
+      "end": {
+        "character": 24,
+        "line": 13
+      },
+      "start": {
+        "character": 0,
+        "line": 13
+      }
+    },
+    {
+      "end": {
+        "character": 1,
+        "line": 14
+      },
+      "start": {
+        "character": 0,
+        "line": 14
+      }
+    }
+  ],
+  "lenses": [
+    {
+      "arguments": [
+        "src/main/java/demo/App.java",
+        "App.create"
+      ],
+      "command": "wish.implement",
+      "line": 4,
+      "title": "▶ Implement `App.create`"
+    },
+    {
+      "arguments": [
+        "P1"
+      ],
+      "command": "wish.ticket.open",
+      "line": 4,
+      "title": "◆ P1 · P2"
+    }
+  ],
+  "pending": [],
+  "prototype": [
+    {
+      "end": {
+        "character": 63,
+        "line": 10
+      },
+      "start": {
+        "character": 0,
+        "line": 10
+      }
+    }
+  ]
+}

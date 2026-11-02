@@ -55,7 +55,7 @@ pub fn evaluate(v: &Value) -> Verdict {
 
     if project.is_protected(&rel) {
         let old = current.unwrap_or_default();
-        return match wiring_only(&old, &proposed) {
+        return match wiring_only(project.lang, &old, &proposed) {
             Ok(()) => Verdict::Allow,
             Err(why) => Verdict::Deny(format!(
                 "{rel} is the user's code and is protected; this edit {why}. Do not change the user's lines. \
@@ -82,7 +82,7 @@ pub fn evaluate(v: &Value) -> Verdict {
         return Verdict::Allow;
     }
     let names = adopted.iter().map(|(p, _)| format!("`{p}`")).collect::<Vec<_>>().join(", ");
-    let Ok(new_items) = items::parse(&proposed) else {
+    let Ok(new_items) = items::parse(project.lang, &proposed) else {
         return Verdict::Deny(format!("this edit would leave {rel} unparseable, and it contains adopted items ({names}). Make the edit in one complete step."));
     };
     for (path, hash) in adopted {
@@ -142,6 +142,7 @@ fn bash(cmd: &str, cwd: &Path) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::Lang;
     use std::fs;
 
     fn setup() -> std::path::PathBuf {
@@ -151,7 +152,7 @@ mod tests {
         fs::write(dir.join("src/main.rs"), "fn main() {\n    App::new(\"Demo\").run()\n}\n").unwrap();
         let lib = "pub struct App;\nimpl App {\n    /// New.\n    pub fn new(_: &str) -> Self { App }\n    pub fn run(self) {}\n}\n";
         fs::write(dir.join("src/app.rs"), lib).unwrap();
-        let hash = items::parse(lib).unwrap().into_iter().find(|i| i.path == "App::new").unwrap().hash;
+        let hash = items::parse(Lang::Rust, lib).unwrap().into_iter().find(|i| i.path == "App::new").unwrap().hash;
         fs::write(dir.join("wish.toml"), format!("[protected]\nfiles = [\"src/main.rs\"]\n\n[adopted]\n\"App::new\" = {{ file = \"src/app.rs\", hash = \"{hash}\" }}\n")).unwrap();
         dir
     }
@@ -184,6 +185,38 @@ mod tests {
         assert!(denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "wish adopt App::run"}})));
         assert!(denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "sed -i s/run/go/ src/main.rs"}})));
         assert!(!denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "cargo check"}})));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    fn setup_java() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wish-hook-java-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src/main/java/demo")).unwrap();
+        fs::write(dir.join("pom.xml"), "<project/>").unwrap();
+        fs::write(dir.join("src/main/java/demo/Main.java"), "package demo;\n\npublic class Main {\n    public static void main(String[] args) {\n        App.create(\"Demo\").run();\n    }\n}\n").unwrap();
+        let app = "package demo;\n\npublic class App {\n    /** Makes one. */\n    public static App create(String n) { return new App(); }\n    public void run() {}\n}\n";
+        fs::write(dir.join("src/main/java/demo/App.java"), app).unwrap();
+        let hash = items::parse(Lang::Java, app).unwrap().into_iter().find(|i| i.path == "App.create").unwrap().hash;
+        fs::write(dir.join("wish.toml"), format!("[protected]\nfiles = [\"src/main/java/demo/Main.java\"]\n\n[adopted]\n\"App.create\" = {{ file = \"src/main/java/demo/App.java\", hash = \"{hash}\" }}\n")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn guards_java() {
+        let d = setup_java();
+        let main = "src/main/java/demo/Main.java";
+        let app = "src/main/java/demo/App.java";
+        // user's line: deny; imports: allow
+        assert!(denied(&edit(&d, main, "run()", "runForever()")));
+        assert!(!denied(&edit(&d, main, "public class Main", "import java.util.List;\n\npublic class Main")));
+        assert!(denied(&edit(&d, main, "public class Main", "import java.util.List; int x;\n\npublic class Main")));
+        // adopted method: deny (code and Javadoc); unadopted one in the same file: allow
+        assert!(denied(&edit(&d, app, "new App()", "null")));
+        assert!(denied(&edit(&d, app, "Makes one.", "Builds one.")));
+        assert!(!denied(&edit(&d, app, "public void run() {}", "public void run() { System.out.println(1); }")));
+        // new file and a build: allow
+        assert!(!denied(&json!({"tool_name": "Write", "cwd": d, "tool_input": {"file_path": d.join("src/main/java/demo/Window.java"), "content": "package demo;\nclass Window {}"}})));
+        assert!(!denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "mvn -q compile"}})));
         let _ = fs::remove_dir_all(&d);
     }
 }

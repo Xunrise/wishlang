@@ -27,6 +27,7 @@
   },
   "global_lsp_settings": {
     "semantic_token_rules": [
+      { "token_type": "generated", "token_modifiers": ["untraced"], "background_color": "#dc26262e" },
       { "token_type": "generated", "token_modifiers": ["prototype"], "background_color": "#3b82f633", "font_style": "italic" },
       { "token_type": "generated", "background_color": "#3b82f61f" }
     ]

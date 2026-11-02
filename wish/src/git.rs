@@ -21,6 +21,7 @@
 //! it was made on.
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -38,6 +39,9 @@ impl Who {
             Who::Claude => ("claude", "claude@wishlang"),
         }
     }
+    pub fn name(self) -> &'static str {
+        self.ident().0
+    }
     fn from_mail(mail: &str) -> Who {
         if mail.contains("claude@wishlang") { Who::Claude } else { Who::Human }
     }
@@ -51,11 +55,25 @@ pub struct JournalRef {
     pub sha: String,
 }
 
+/// Lines added and removed in one file (`git diff --numstat`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FileStat {
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub sha: String,
     pub who: Who,
     pub subject: String,
+    /// The rest of the commit message.
+    pub body: String,
+    /// "5 minutes ago".
+    pub age: String,
+    /// Files changed against the first parent.
+    pub files: Vec<FileStat>,
     pub parent: Option<String>,
     /// Parents beyond the first: reverted attempts / undone cycles.
     pub side: Vec<String>,
@@ -368,6 +386,11 @@ impl Git {
         self.git(&["show", &format!("{sha}:./{rel}")]).ok()
     }
 
+    /// Lines added and removed per file between two snapshots.
+    pub fn numstat(&self, a: &str, b: &str) -> Result<Vec<FileStat>> {
+        Ok(parse_numstat(&self.git(&["diff", "--relative", "--numstat", "--no-renames", a, b])?))
+    }
+
     /// (status, path) for files that differ between two snapshots.
     pub fn changed(&self, a: &str, b: &str) -> Result<Vec<(char, String)>> {
         let out = self.git(&["diff", "--relative", "--name-status", "--no-renames", a, b])?;
@@ -424,14 +447,22 @@ impl Git {
 
     /// The journal's first-parent history, newest first.
     pub fn history(&self, rev: &str) -> Vec<Entry> {
-        let Ok(out) = self.git(&["log", "--first-parent", "--format=%H%x1f%P%x1f%ae%x1f%s%x1f%b%x1e", rev]) else { return vec![] };
+        let Ok(out) = self.git(&["log", "--first-parent", "--relative", "--numstat", "--format=%x1e%H%x1f%P%x1f%ae%x1f%ar%x1f%s%x1f%b%x1f", rev]) else { return vec![] };
         out.split('\x1e')
             .filter_map(|rec| {
-                let f: Vec<&str> = rec.trim_start_matches('\n').split('\x1f').collect();
-                if f.len() < 5 {
-                    return None;
-                }
-                Some(Entry { sha: f[0].into(), parent: f[1].split_whitespace().next().map(String::from), side: f[1].split_whitespace().skip(1).map(String::from).collect(), who: Who::from_mail(f[2]), subject: f[3].into() })
+                let f: Vec<&str> = rec.trim_start_matches('\n').splitn(7, '\x1f').collect();
+                let [sha, parents, mail, age, subject, body, stat] = f[..] else { return None };
+                let mut parents = parents.split_whitespace();
+                Some(Entry {
+                    sha: sha.into(),
+                    parent: parents.next().map(String::from),
+                    side: parents.map(String::from).collect(),
+                    who: Who::from_mail(mail),
+                    subject: subject.into(),
+                    body: body.trim().into(),
+                    age: age.into(),
+                    files: parse_numstat(stat),
+                })
             })
             .collect()
     }
@@ -488,4 +519,15 @@ impl Git {
     pub fn subject(&self, sha: &str) -> String {
         self.git(&["log", "-1", "--format=%s", sha]).map(|s| s.trim().to_string()).unwrap_or_default()
     }
+}
+
+/// Parse `git diff --numstat` lines (`added<TAB>removed<TAB>path`; binary files count as 0).
+pub fn parse_numstat(text: &str) -> Vec<FileStat> {
+    text.lines()
+        .filter_map(|l| {
+            let mut it = l.splitn(3, '\t');
+            let (added, removed, path) = (it.next()?, it.next()?, it.next()?);
+            Some(FileStat { path: path.into(), added: added.parse().unwrap_or(0), removed: removed.parse().unwrap_or(0) })
+        })
+        .collect()
 }

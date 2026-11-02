@@ -1,3 +1,8 @@
 /target
 **/target
 zed/extension.wasm
+
+intellij/build
+intellij/.gradle
+intellij/.intellijPlatform
+intellij/.kotlin

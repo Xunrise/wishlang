@@ -86,9 +86,9 @@ pub fn render(e: &Event) -> Vec<String> {
         Event::Suggestion { id, file, reason } => vec![format!("{CYAN}  ✎ suggestion {id} for {file}: {reason}{R}"), format!("{DIM}    review with `wish suggestions`, then `wish accept {id}` / `wish reject {id}`{R}")],
         Event::Warning { msg } => vec![format!("{YELLOW}  ! {msg}{R}")],
         Event::Violation { msg } => vec![format!("{RED}  ✗ {msg}{R}")],
-        Event::Check { ok: true, .. } => vec![format!("{GREEN}  ✓ cargo check passed{R}")],
+        Event::Check { ok: true, .. } => vec![format!("{GREEN}  ✓ check passed{R}")],
         Event::Check { ok: false, errors } => {
-            let mut v = vec![format!("{RED}  ✗ cargo check failed{R}")];
+            let mut v = vec![format!("{RED}  ✗ check failed{R}")];
             v.extend(errors.lines().take(20).map(|l| format!("{DIM}    {l}{R}")));
             v
         }
