@@ -1,6 +1,7 @@
 package wish
 
 import com.intellij.codeInsight.daemon.DaemonCodeAnalyzer
+import com.intellij.ide.util.PropertiesComponent
 import com.intellij.notification.Notification
 import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationGroupManager
@@ -68,7 +69,8 @@ fun interface WishListener {
     fun changed()
 }
 
-fun uriOf(file: VirtualFile): String = File(file.path).toPath().toUri().toString()
+/** The URI `wish lsp` knows [file] by (a Linux path when the project lives in WSL, see [Bridge]). */
+fun uriOf(file: VirtualFile): String = serverUri(file.path)
 
 /**
  * The `wish` binary: `$WISH_BIN`, else `~/.cargo/bin/wish`. PATH is deliberately not searched,
@@ -84,23 +86,48 @@ class WishService(private val project: Project) : Disposable {
     val states = ConcurrentHashMap<String, FileState>()
 
     private val versions = ConcurrentHashMap<String, Int>()
+    private val bridge = Bridge.of(project.basePath)
+
+    /** The wish project's directory (IDE path): `wish.toml` may sit below the IDE project, e.g. in `backend/`. */
+    @Volatile private var root: String? = null
+
+    /** The IDE path of a file wish names relative to its project. */
+    fun pathOf(rel: String): String = "${(root ?: project.basePath ?: ".").trimEnd('/')}/$rel"
+
+    private fun remember(uri: String?) {
+        uri?.let { root = bridge.path(it).trimEnd('/') }
+    }
+
+    /** Start a cycle on every save (the default), or only through [fulfil]. Kept per project. */
+    var buildOnSave: Boolean
+        get() = PropertiesComponent.getInstance(project).getBoolean(BUILD_ON_SAVE, true)
+        set(value) = PropertiesComponent.getInstance(project).setValue(BUILD_ON_SAVE, value, true)
+
+    /** Run a cycle for your edits now, as a save would. */
+    fun fulfil(): CompletableFuture<Any?> = execute("wish.cycle")
     private var process: Process? = null
     @Volatile private var server: WishServer? = null
 
     private val refetchQueue = MergingUpdateQueue("wish refetch", 200, true, null, this)
 
     suspend fun start() {
-        val bin = wishBinary()
+        val root = project.basePath ?: "."
+        val bin = bridge.command(root).joinToString(" ")
         try {
-            val s = withContext(Dispatchers.IO) { launch(bin) }
+            val s = withContext(Dispatchers.IO) { launch(root) }
             server = s
             s.initialized(InitializedParams())
         } catch (e: Exception) {
             thisLogger().warn("wish lsp failed to start ($bin)", e)
             notify(
                 MessageType.Error,
-                "Could not start `$bin lsp`: ${e.message}. Set \$WISH_BIN or install wish to ~/.cargo/bin/wish; " +
-                    "PATH is not searched because /usr/bin/wish is the Tk shell.",
+                if (bridge is Bridge.Wsl) {
+                    "Could not start wish in WSL (${bridge.distro}): ${e.message}. Install it there with " +
+                        "`cargo install --path wish` (~/.cargo/bin/wish), or set \$WISH_BIN in its ~/.bashrc."
+                } else {
+                    "Could not start `$bin`: ${e.message}. Set \$WISH_BIN or install wish to ~/.cargo/bin/wish; " +
+                        "PATH is not searched because /usr/bin/wish is the Tk shell."
+                },
             )
             return
         }
@@ -109,18 +136,21 @@ class WishService(private val project: Project) : Disposable {
         publishChanged()
     }
 
-    private suspend fun launch(bin: File): WishServer {
-        val dir = File(project.basePath ?: ".")
-        val p = ProcessBuilder(bin.path, "lsp").directory(dir).redirectError(ProcessBuilder.Redirect.DISCARD).start()
+    private suspend fun launch(root: String): WishServer {
+        val p = ProcessBuilder(bridge.command(root)).directory(bridge.directory(root))
+            .redirectError(ProcessBuilder.Redirect.DISCARD).start()
         process = p
         val launcher = Launcher.createLauncher(Client(), WishServer::class.java, p.inputStream, p.outputStream)
         launcher.startListening()
         val params = InitializeParams().apply {
-            rootUri = dir.toPath().toUri().toString().trimEnd('/')
+            rootUri = bridge.uri(root).trimEnd('/')
             processId = ProcessHandle.current().pid().toInt()
             capabilities = ClientCapabilities()
         }
-        launcher.remoteProxy.initialize(params).await()
+        // Through wsl.exe a missing binary is not a start failure but an early exit (127: not found).
+        val init = launcher.remoteProxy.initialize(params)
+        p.onExit().thenRun { init.completeExceptionally(IllegalStateException("wish lsp exited with code ${p.exitValue()}")) }
+        init.await()
         return launcher.remoteProxy
     }
 
@@ -140,7 +170,8 @@ class WishService(private val project: Project) : Disposable {
                 events.filterIsInstance<VFileContentChangeEvent>().filter { it.isFromSave }.forEach {
                     val uri = uriOf(it.file)
                     if (versions.containsKey(uri)) {
-                        server?.textDocumentService?.didSave(DidSaveTextDocumentParams(TextDocumentIdentifier(uri)))
+                        // A save is what starts a cycle; with build on save off, only Fulfil Wishes does.
+                        if (buildOnSave) server?.textDocumentService?.didSave(DidSaveTextDocumentParams(TextDocumentIdentifier(uri)))
                         refetch()
                     }
                 }
@@ -154,7 +185,10 @@ class WishService(private val project: Project) : Disposable {
 
     private fun open(file: VirtualFile) {
         if (!isJava(file)) return
-        val document = FileDocumentManager.getInstance().getDocument(file) ?: return
+        // start() calls this from a background coroutine, where model reads need a read action.
+        val document = ReadAction.compute<Document?, RuntimeException> {
+            FileDocumentManager.getInstance().getDocument(file)
+        } ?: return
         val uri = uriOf(file)
         versions[uri] = 1
         server?.textDocumentService?.didOpen(DidOpenTextDocumentParams(TextDocumentItem(uri, "java", 1, textOf(document))))
@@ -179,7 +213,7 @@ class WishService(private val project: Project) : Disposable {
 
     /** Repaint the bars of the file's editors and re-run highlighting for that file only. */
     private fun refresh(uri: String, state: FileState) {
-        val file = LocalFileSystem.getInstance().findFileByPath(File(java.net.URI(uri)).path) ?: return
+        val file = LocalFileSystem.getInstance().findFileByPath(bridge.path(uri)) ?: return
         paintBars(project, file, state)
         PsiManager.getInstance(project).findFile(file)?.let { DaemonCodeAnalyzer.getInstance(project).restart(it) }
     }
@@ -196,9 +230,16 @@ class WishService(private val project: Project) : Disposable {
     private fun <T> request(call: (WishServer) -> CompletableFuture<T>): CompletableFuture<T> =
         server?.let(call) ?: CompletableFuture.failedFuture(IllegalStateException("wish lsp is not running"))
 
-    fun log(): CompletableFuture<LogResult> = request { it.log() }
+    fun log(): CompletableFuture<LogResult> = request { it.log() }.thenApply { r -> remember(r.root); r }
 
-    fun ticket(): CompletableFuture<TicketResult> = request { it.ticket() }
+    /** The ticket of this branch, or of another ticket [branch] (which leaves this project's root alone). */
+    fun ticket(branch: String? = null): CompletableFuture<TicketResult> =
+        request { it.ticket(TicketParams(branch)) }.thenApply { r -> if (branch == null) remember(r.root); r }
+
+    fun tickets(): CompletableFuture<List<TicketRef>> = request { it.tickets() }
+
+    /** The IDE path of a server URI (a Linux path mapped to `\\wsl.localhost\…` when the project is in WSL). */
+    fun localPath(uri: String): String = bridge.path(uri).trimEnd('/')
 
     fun show(sha: String, path: String, base: String? = null): CompletableFuture<ShowResult> =
         request { it.show(ShowParams(sha, path, base)) }
@@ -244,7 +285,7 @@ class WishService(private val project: Project) : Disposable {
         }
 
         override fun showDocument(p: ShowDocumentParams): CompletableFuture<ShowDocumentResult> {
-            val path = File(java.net.URI(p.uri)).path
+            val path = bridge.path(p.uri)
             ApplicationManager.getApplication().invokeLater({
                 LocalFileSystem.getInstance().refreshAndFindFileByPath(path)?.let {
                     val at = p.selection?.start
@@ -276,6 +317,8 @@ class WishService(private val project: Project) : Disposable {
     companion object {
         @JvmField
         val CHANGED: Topic<WishListener> = Topic.create("Wish changed", WishListener::class.java)
+
+        private const val BUILD_ON_SAVE = "wish.buildOnSave"
     }
 }
 

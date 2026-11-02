@@ -4,6 +4,11 @@ import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.DataContext
+import com.intellij.openapi.actionSystem.ex.ComboBoxAction
+import com.intellij.openapi.project.DumbAware
+import com.intellij.openapi.project.DumbAwareAction
+import javax.swing.JComponent
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
@@ -76,6 +81,9 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
     private val svc = project.service<WishService>()
 
     private var ticket: TicketResult? = null
+    /** The ticket branch shown; null: this checkout's branch. */
+    private var shownBranch: String? = null
+    private var tickets: List<TicketRef> = emptyList()
     private var changed: List<Change> = emptyList()
     private var changesHead: String? = null
     private var byProblem = true
@@ -91,8 +99,8 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         tree.addTreeSelectionListener { showDetails(selectedNode()) }
         tree.onDoubleClick { node ->
             when (node) {
-                is FileNode -> diff(node.path)
-                is TItem -> openItem(project, node)
+                is FileNode -> open(node.path)
+                is TItem -> open(node.file, node.line)
                 is ProblemNode -> problem(node.id)?.let(::editProblem)
             }
         }
@@ -100,8 +108,9 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
             if (e.eventType != HyperlinkEvent.EventType.ACTIVATED) return@addHyperlinkListener
             val target = e.description
             when {
-                target.startsWith("item:") -> shownItems.getOrNull(target.removePrefix("item:").toInt())?.let { openItem(project, it) }
-                target.startsWith("file:") -> diff(target.removePrefix("file:"))
+                target.startsWith("item:") -> shownItems.getOrNull(target.removePrefix("item:").toInt())?.let { open(it.file, it.line) }
+                target.startsWith("file:") -> open(target.removePrefix("file:"))
+                target.startsWith("diff:") -> diff(target.removePrefix("diff:"))
                 target.startsWith("problem:") -> selectProblem(target.removePrefix("problem:"))
             }
         }
@@ -129,7 +138,11 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
     }
 
     private fun actions() = DefaultActionGroup(
+        TicketPicker(), Separator(),
         GroupByProblem(), Separator(),
+        simple("Open File", AllIcons.Actions.EditSource, needs = { selectedFile() != null }) { openSelected() },
+        simple("Show Diff", AllIcons.Actions.Diff, needs = { selectedFile()?.let { changeFor(changed, it) } != null }) { selectedFile()?.let(::diff) },
+        Separator(),
         simple("Expand All", AllIcons.Actions.Expandall) { (0 until tree.rowCount).forEach { tree.expandRow(it) } },
         simple("Collapse to Files", AllIcons.Actions.Collapseall) { collapseToFiles() },
         Separator(),
@@ -138,10 +151,10 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         simple("Remove Problem", AllIcons.General.Remove, needsProblem = true) { selectedProblem()?.let { p -> save(problems().filter { it.id != p.id }) } },
     )
 
-    private fun simple(name: String, icon: Icon, needsProblem: Boolean = false, run: () -> Unit) = object : AnAction(name, null, icon) {
+    private fun simple(name: String, icon: Icon, needsProblem: Boolean = false, needs: (() -> Boolean)? = null, run: () -> Unit) = object : AnAction(name, null, icon) {
         override fun actionPerformed(e: AnActionEvent) = run()
         override fun update(e: AnActionEvent) {
-            e.presentation.isEnabled = !needsProblem || (byProblem && selectedProblem() != null)
+            e.presentation.isEnabled = (!needsProblem || (byProblem && selectedProblem() != null)) && needs?.invoke() != false
         }
 
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
@@ -161,6 +174,20 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
     private fun problems() = ticket?.problems.orEmpty()
     private fun problem(id: String) = problems().firstOrNull { it.id == id }
     private fun selectedNode() = tree.lastSelectedPathComponent as? DefaultMutableTreeNode
+
+    /** The file of the selected file or item in the problem tree. */
+    private fun selectedFile(): String? = if (!byProblem) null else when (val o = selectedNode()?.userObject) {
+        is FileNode -> o.path
+        is TItem -> o.file
+        else -> null
+    }
+
+    /** An item opens at its line, a file at its top. */
+    private fun openSelected() = when (val o = selectedNode()?.userObject) {
+        is TItem -> open(o.file, o.line)
+        is FileNode -> open(o.path)
+        else -> {}
+    }
     private fun root() = tree.model.root as DefaultMutableTreeNode
 
     /** The problem the selection sits in: the problem node itself, or a file or item below it. */
@@ -174,7 +201,19 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
     }
 
     private fun reload() {
-        svc.ticket().onEdt(project, failed = { (cards.layout as CardLayout).show(cards, EMPTY) }) { r ->
+        svc.tickets().onEdt(project) { list ->
+            tickets = list
+            if (shownBranch != null && list.none { it.branch == shownBranch }) shownBranch = null
+            load()
+        }
+    }
+
+    private fun load() {
+        svc.ticket(shownBranch).onEdt(project, failed = {
+            // No ticket on this branch: show another one if there is any.
+            val other = tickets.firstOrNull { !it.current }
+            if (shownBranch == null && other != null) show(other.branch) else (cards.layout as CardLayout).show(cards, EMPTY)
+        }) { r ->
             ticket = r
             (cards.layout as CardLayout).show(cards, BODY)
             val keep = selectedNode()?.let(::selectionKey)
@@ -182,6 +221,53 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
             collapseToFiles()
             if (keep == null || !select { selectionKey(it) == keep }) tree.setSelectionRow(0)
             if (r.head != changesHead) loadChanges(r)
+        }
+    }
+
+    /** Look at the ticket of [branch] (null or the current branch: this checkout's own). */
+    private fun show(branch: String?) {
+        shownBranch = branch?.takeUnless { b -> tickets.any { it.current && it.branch == b } }
+        changesHead = null
+        load()
+    }
+
+    /** The checkout the shown ticket's files open from (IDE path); null when no checkout has its branch. */
+    private fun ticketRoot(): String? = ticket?.root?.let(svc::localPath)
+
+    private fun open(rel: String, line: Int = 1) {
+        val t = ticket ?: return
+        when {
+            shownBranch == null -> openFile(project, rel, line)
+            ticketRoot() != null -> openFile(project, rel, line, ticketRoot())
+            else -> t.head?.let { openSnapshot(project, it, rel, line, t.key) }
+        }
+    }
+
+    /** Picks the ticket to look at: this branch's, or any other ticket branch with a journal. */
+    private inner class TicketPicker : ComboBoxAction(), DumbAware {
+        override fun createPopupActionGroup(button: JComponent, context: DataContext) = DefaultActionGroup(
+            tickets.map { t ->
+                object : DumbAwareAction(label(t), where(t), if (t.current) AllIcons.Vcs.Branch else null) {
+                    override fun actionPerformed(e: AnActionEvent) = show(t.branch)
+                }
+            },
+        )
+
+        override fun update(e: AnActionEvent) {
+            val t = ticket
+            e.presentation.text = if (t == null) "Ticket" else t.key + (if (shownBranch == null) "" else " · ${t.branch}")
+            e.presentation.description = "The ticket shown: this branch's, or another ticket branch's"
+            e.presentation.isEnabled = tickets.size > 1 || (tickets.isNotEmpty() && shownBranch != null)
+        }
+
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
+        private fun label(t: TicketRef) = t.key + (t.title?.let { " — ${it.take(60)}" } ?: "")
+
+        private fun where(t: TicketRef) = when {
+            t.current -> "${t.branch} (this checkout)"
+            t.checkout != null -> "${t.branch} (checked out in ${t.checkout})"
+            else -> "${t.branch} (not checked out: files open read-only from its journal)"
         }
     }
 
@@ -247,7 +333,7 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
             is FileNode -> {
                 val under = (node.parent as? DefaultMutableTreeNode)?.userObject as? ProblemNode
                 sb.append("<h3>${esc(o.path.substringAfterLast('/'))}</h3>")
-                sb.append("<a href='file:${esc(o.path)}'>Show the ticket's diff of ${esc(o.path)}</a><br>")
+                sb.append("<a href='file:${esc(o.path)}'>Open ${esc(o.path)}</a> &nbsp;·&nbsp; <a href='diff:${esc(o.path)}'>Show the ticket's diff</a><br>")
                 val others = problems().filter { p -> p.id != under?.id && p.items.any { it.file == o.path } }
                 if (others.isNotEmpty()) sb.append("<font color='gray'>Also serves ${others.joinToString(", ") { link("problem:${it.id}", it.id) }}</font><br>")
                 sb.append("<br>")
@@ -309,7 +395,7 @@ class TicketPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
 
     private fun save(all: List<Problem>) {
         val arg = all.map { mapOf("id" to it.id, "text" to it.text, "scenarios" to it.scenarios) }
-        svc.execute("wish.ticket.edit", listOf(arg)).thenRun { reload() }
+        svc.execute("wish.ticket.edit", listOfNotNull(arg, shownBranch)).thenRun { reload() }
     }
 
     override fun dispose() {}

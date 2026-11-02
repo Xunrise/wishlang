@@ -46,7 +46,7 @@ class ProblemText(val id: String = "", val text: String = "")
 
 class LogResult(
     val entries: List<Entry> = emptyList(), val decisions: List<Decision> = emptyList(),
-    val problems: List<ProblemText> = emptyList(),
+    val problems: List<ProblemText> = emptyList(), val root: String? = null,
 )
 
 class Reason(val sha: String = "", val `when`: String = "", val why: String = "")
@@ -61,7 +61,17 @@ class TicketResult(
     val key: String = "", val title: String? = null, val body: String = "", val notesDir: String? = null,
     val problems: List<Problem> = emptyList(), val untraced: List<TItem> = emptyList(), val cycles: Int = 0,
     val head: String? = null, val base: String? = null, val files: List<FileStat> = emptyList(),
+    /** URI of the wish project in the checkout that has the branch, which every `file` is relative to; none when no checkout has it. */
+    val root: String? = null,
+    val branch: String = "",
 )
+
+/** A ticket branch with a journal: one entry of the ticket picker. */
+class TicketRef(
+    val key: String = "", val branch: String = "", val title: String? = null, val current: Boolean = false, val checkout: String? = null,
+)
+
+class TicketParams(val branch: String? = null)
 
 class ShowResult(val before: String = "", val after: String = "")
 
@@ -78,7 +88,11 @@ interface WishServer : LanguageServer {
 
     /** Fails when the branch has no ticket key. */
     @JsonRequest("wish/ticket")
-    fun ticket(): CompletableFuture<TicketResult>
+    fun ticket(params: TicketParams): CompletableFuture<TicketResult>
+
+    /** Every ticket branch with a journal, the current one first. */
+    @JsonRequest("wish/tickets")
+    fun tickets(): CompletableFuture<List<TicketRef>>
 
     @JsonRequest("wish/show")
     fun show(params: ShowParams): CompletableFuture<ShowResult>

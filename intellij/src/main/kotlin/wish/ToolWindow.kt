@@ -1,5 +1,10 @@
 package wish
 
+import com.intellij.icons.AllIcons
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.project.DumbAwareAction
+import com.intellij.openapi.project.DumbAwareToggleAction
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
@@ -13,6 +18,7 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vcs.changes.Change
 import com.intellij.openapi.vcs.changes.SimpleContentRevision
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.testFramework.LightVirtualFile
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
 import com.intellij.ui.DoubleClickListener
@@ -37,7 +43,24 @@ class WishToolWindowFactory : ToolWindowFactory, DumbAware {
         val ticket = TicketPanel(project)
         Disposer.register(toolWindow.disposable, ticket)
         toolWindow.contentManager.addContent(contents.createContent(ticket, "Ticket", false))
+        toolWindow.setTitleActions(listOf(FulfilWishes(), BuildOnSave()))
     }
+}
+
+/** Runs a cycle now: the manual trigger, for when build on save is off (or to retry). */
+class FulfilWishes : DumbAwareAction("Fulfil Wishes", "Generate what your edits wish for now, as a save would", AllIcons.Actions.Execute) {
+    override fun actionPerformed(e: AnActionEvent) {
+        e.project?.service<WishService>()?.fulfil()
+    }
+}
+
+/** Whether saving a file starts a cycle. */
+class BuildOnSave : DumbAwareToggleAction("Build on Save", "Start a cycle whenever you save; off: only Fulfil Wishes does", AllIcons.Actions.BuildAutoReloadChanges) {
+    override fun isSelected(e: AnActionEvent) = e.project?.service<WishService>()?.buildOnSave ?: true
+    override fun setSelected(e: AnActionEvent, state: Boolean) {
+        e.project?.service<WishService>()?.buildOnSave = state
+    }
+    override fun getActionUpdateThread() = ActionUpdateThread.BGT
 }
 
 /** Runs [ok] on the EDT with the response; a failed request (no server, no ticket) goes to [failed]. */
@@ -56,10 +79,9 @@ internal fun visibleFiles(files: List<FileStat>) = files.filterNot { isWishFile(
 internal fun fetchChanges(
     project: Project, files: List<FileStat>, sha: String, base: String?, beforeLabel: String, afterLabel: String,
 ): CompletableFuture<List<Change>> {
-    val root = project.basePath ?: return CompletableFuture.completedFuture(emptyList())
     val svc = project.service<WishService>()
     val changes = files.map { f ->
-        val path = VcsUtil.getFilePath(File(root, f.path), false)
+        val path = VcsUtil.getFilePath(File(svc.pathOf(f.path)), false)
         svc.show(sha, f.path, base)
             .thenApply<Change?> { r ->
                 val before = r.before.takeIf { it.isNotEmpty() }?.let { SimpleContentRevision(it, path, beforeLabel) }
@@ -88,9 +110,22 @@ internal fun showDiff(project: Project, change: Change, title: String, beforeTit
     )
 }
 
-internal fun openItem(project: Project, item: TItem) {
-    val file = LocalFileSystem.getInstance().refreshAndFindFileByPath("${project.basePath}/${item.file}") ?: return
-    OpenFileDescriptor(project, file, (item.line - 1).coerceAtLeast(0), 0).navigate(true)
+internal fun openItem(project: Project, item: TItem) = openFile(project, item.file, item.line)
+
+/** Open a file wish names (relative to its project, or to [root]) in the editor, at a 1-based line. */
+internal fun openFile(project: Project, rel: String, line: Int = 1, root: String? = null) {
+    val path = root?.let { "${it.trimEnd('/')}/$rel" } ?: project.service<WishService>().pathOf(rel)
+    val file = LocalFileSystem.getInstance().refreshAndFindFileByPath(path) ?: return
+    OpenFileDescriptor(project, file, (line - 1).coerceAtLeast(0), 0).navigate(true)
+}
+
+/** Open a file as it is in journal snapshot [sha], read-only: for a ticket no checkout has. */
+internal fun openSnapshot(project: Project, sha: String, rel: String, line: Int = 1, label: String) {
+    project.service<WishService>().show(sha, rel).onEdt(project) { r ->
+        val type = FileTypeManager.getInstance().getFileTypeByFileName(rel.substringAfterLast('/'))
+        val file = LightVirtualFile("${rel.substringAfterLast('/')} ($label)", type, r.after).apply { isWritable = false }
+        OpenFileDescriptor(project, file, (line - 1).coerceAtLeast(0), 0).navigate(true)
+    }
 }
 
 internal fun Tree.onDoubleClick(handler: (Any?) -> Unit) {
