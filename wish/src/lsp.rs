@@ -171,7 +171,7 @@ fn range(l0: u32, c0: u32, l1: u32, c1: u32) -> Value {
 }
 
 fn line_len(text: &str, line: usize) -> u32 {
-    text.lines().nth(line).map(|l| l.chars().count() as u32).unwrap_or(0)
+    text.lines().nth(line).map(|l| l.encode_utf16().count() as u32).unwrap_or(0)
 }
 
 // ---- server ----------------------------------------------------------------

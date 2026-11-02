@@ -107,15 +107,22 @@ impl CycleMessage {
         m
     }
 
-    /// The reason for an item, trying the item itself and then its parents
-    /// (`Mode::Windowed` falls back to `Mode`).
+    /// The reason for an item, trying the item itself, its bare name when it
+    /// is an overload (`Window.open(int, int)` falls back to `Window.open`) and
+    /// then its parents (`Mode::Windowed` falls back to `Mode`).
     pub fn why_for(&self, item: &str) -> Option<&str> {
+        let find = |p: &str| self.why.iter().find(|(i, _)| i == p).map(|(_, w)| w.as_str());
         let mut path = item;
         loop {
-            if let Some((_, w)) = self.why.iter().find(|(i, _)| i == path) {
+            if let Some(w) = find(path) {
                 return Some(w);
             }
-            path = path.rsplit_once("::")?.0;
+            let bare = path.split('(').next().unwrap_or(path);
+            if let Some(w) = find(bare) {
+                return Some(w);
+            }
+            let cut = bare.rfind("::").into_iter().chain(bare.rfind('.')).max()?;
+            path = &bare[..cut];
         }
     }
 }
@@ -168,6 +175,15 @@ mod tests {
         let m = CycleMessage { why: vec![("Mode".into(), "because".into())], ..Default::default() };
         assert_eq!(m.why_for("Mode::Windowed"), Some("because"));
         assert_eq!(m.why_for("App::new"), None);
+    }
+
+    #[test]
+    fn why_falls_back_for_overloads() {
+        let m = CycleMessage { why: vec![("Window.open".into(), "bare".into()), ("Window.open(int)".into(), "exact".into()), ("Mode".into(), "parent".into())], ..Default::default() };
+        assert_eq!(m.why_for("Window.open(int)"), Some("exact"));
+        assert_eq!(m.why_for("Window.open(int, int)"), Some("bare"));
+        assert_eq!(m.why_for("Mode.WINDOWED"), Some("parent"));
+        assert_eq!(m.why_for("Window.close(int)"), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! "Will be generated": references in a buffer that the vocabulary doesn't
-//! define yet. Purely syntactic (syn), so it works on unsaved buffers and in
-//! milliseconds, at the cost of being a heuristic rather than type-aware.
+//! define yet. Purely syntactic (syn for Rust, tree-sitter for Java, see
+//! `java.rs`), so it works on unsaved buffers and in milliseconds, at the cost
+//! of being a heuristic rather than type-aware.
 
 use crate::items::Item;
 use crate::project::Lang;
@@ -17,7 +18,7 @@ pub struct Pending {
 }
 
 /// What the project already defines.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Known {
     paths: BTreeSet<String>,
     /// Last path segments of everything (variants, methods, types, fns).
@@ -27,14 +28,38 @@ pub struct Known {
 impl Known {
     pub fn from_items<'a>(items: impl IntoIterator<Item = &'a Item>) -> Self {
         let mut k = Known::default();
-        for i in items {
-            k.paths.insert(i.path.clone());
-            if let Some(last) = i.path.rsplit("::").next() {
-                k.names.insert(last.to_string());
-            }
-        }
+        k.add(items);
         k
     }
+
+    pub fn add<'a>(&mut self, items: impl IntoIterator<Item = &'a Item>) {
+        for i in items {
+            // An overload (`Window.open(int)`) also defines the bare `Window.open`.
+            let bare = i.path.split('(').next().unwrap_or(&i.path);
+            self.paths.insert(i.path.clone());
+            self.paths.insert(bare.to_string());
+            if let Some(last) = bare.rsplit([':', '.']).next() {
+                self.names.insert(last.to_string());
+            }
+        }
+    }
+
+    pub fn has_path(&self, p: &str) -> bool {
+        self.paths.contains(p)
+    }
+
+    pub fn has_name(&self, n: &str) -> bool {
+        self.names.contains(n)
+    }
+}
+
+/// LSP columns count UTF-16 code units; syn counts chars and tree-sitter bytes.
+pub fn utf16_col_from_chars(line: &str, col: usize) -> u32 {
+    line.chars().take(col).map(|c| c.len_utf16() as u32).sum()
+}
+
+pub fn utf16_col_from_bytes(line: &str, col: usize) -> u32 {
+    line.char_indices().take_while(|(i, _)| *i < col).map(|(_, c)| c.len_utf16() as u32).sum()
 }
 
 /// Names that come from std's prelude or are otherwise always available.
@@ -52,6 +77,7 @@ fn upper(s: &str) -> bool {
 }
 
 struct V<'a> {
+    lines: Vec<&'a str>,
     known: &'a Known,
     /// Names imported from outside the project (`use winit::window::Window`).
     imported: &'a BTreeSet<String>,
@@ -61,7 +87,9 @@ struct V<'a> {
 impl V<'_> {
     fn push(&mut self, name: String, a: Span, b: Span) {
         let (s, e) = (a.start(), b.end());
-        self.out.push(Pending { name, start: (s.line as u32 - 1, s.column as u32), end: (e.line as u32 - 1, e.column as u32) });
+        let col = |l: proc_macro2::LineColumn| utf16_col_from_chars(self.lines.get(l.line - 1).copied().unwrap_or(""), l.column);
+        let (start, end) = ((s.line as u32 - 1, col(s)), (e.line as u32 - 1, col(e)));
+        self.out.push(Pending { name, start, end });
     }
 
     fn is_known_type(&self, t: &str) -> bool {
@@ -187,8 +215,7 @@ impl<'ast> Visit<'ast> for V<'_> {
 pub fn find(lang: Lang, src: &str, known: &Known) -> Option<Vec<Pending>> {
     match lang {
         Lang::Rust => find_rust(src, known),
-        // Java support arrives with tree-sitter; until then nothing is pending.
-        Lang::Java => Some(Vec::new()),
+        Lang::Java => crate::java::find_pending(src, known),
     }
 }
 
@@ -196,16 +223,11 @@ fn find_rust(src: &str, known: &Known) -> Option<Vec<Pending>> {
     let file = syn::parse_file(src).ok()?;
     // Items defined in this very buffer count as known too.
     let own = crate::items::parse(Lang::Rust, src).unwrap_or_default();
-    let mut k = Known { paths: known.paths.clone(), names: known.names.clone() };
-    for i in &own {
-        k.paths.insert(i.path.clone());
-        if let Some(last) = i.path.rsplit("::").next() {
-            k.names.insert(last.to_string());
-        }
-    }
+    let mut k = known.clone();
+    k.add(&own);
     // Generic parameters and use-imported names are in scope, so they're known too.
     let imported = imported_names(&file);
-    let mut v = V { known: &k, imported: &imported, out: Vec::new() };
+    let mut v = V { lines: src.lines().collect(), known: &k, imported: &imported, out: Vec::new() };
     v.visit_file(&file);
     v.out.retain(|p| !imported.contains(p.name.split("::").next().unwrap_or("")));
     v.out.sort_by_key(|p| p.start);
@@ -288,6 +310,13 @@ mod tests {
         let p = find(Lang::Rust, "fn main() {\n    Mode::Windowed(1, 2);\n}", &known(VOCAB)).unwrap();
         assert_eq!(p[0].start, (1, 4));
         assert_eq!(p[0].end, (1, 18));
+    }
+
+    #[test]
+    fn columns_are_utf16() {
+        // The emoji is one char but two UTF-16 units.
+        let p = find(Lang::Rust, "fn main() { let s = \"😀\"; Mode::Windowed(1, 2); }", &known(VOCAB)).unwrap();
+        assert_eq!(p[0].start.1, 26);
     }
 
     #[test]

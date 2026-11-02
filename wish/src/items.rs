@@ -88,8 +88,7 @@ fn is_pub(v: &syn::Visibility) -> bool {
 pub fn parse(lang: Lang, src: &str) -> Result<Vec<Item>> {
     match lang {
         Lang::Rust => parse_rust(src),
-        // Java parsing arrives with tree-sitter; until then no items.
-        Lang::Java => Ok(Vec::new()),
+        Lang::Java => crate::java::parse(src),
     }
 }
 
@@ -177,14 +176,35 @@ pub fn hash_map<'a>(lang: Lang, files: impl IntoIterator<Item = (&'a String, &'a
     m
 }
 
-/// A markdown section of a doc comment (`# Name`), as bullet entries.
-/// Returns None if the heading is absent. `# Name: text` counts as one entry.
+/// A section of a doc comment, as bullet entries: markdown `# Name` (Rust) or
+/// Javadoc `<h2>Name</h2>` with `<li>` bullets. Returns None if the heading is
+/// absent. `# Name: text` counts as one entry.
 pub fn doc_section(docs: &str, name: &str) -> Option<Vec<String>> {
+    let html = regex::Regex::new(r"(?i)^<(h2|li|/?[uo]l)\b").unwrap();
+    let tags = regex::Regex::new(r"<[^>]+>").unwrap();
     let mut out: Vec<String> = Vec::new();
     let mut found = false;
     let mut inside = false;
     for line in docs.lines() {
-        let t = line.trim();
+        let raw = line.trim();
+        // Javadoc HTML: `<h2>X</h2>` reads as the heading `# X`, `<li>x</li>` as the bullet `- x`.
+        let converted;
+        let t = match html.captures(raw) {
+            Some(c) => {
+                let text = tags.replace_all(raw, "").trim().to_string();
+                converted = match c[1].to_ascii_lowercase().as_str() {
+                    "h2" => format!("# {text}"),
+                    "li" => format!("- {text}"),
+                    _ => text,
+                };
+                converted.as_str()
+            }
+            None if raw.contains("</") => {
+                converted = tags.replace_all(raw, "").trim().to_string();
+                converted.as_str()
+            }
+            None => raw,
+        };
         if t.starts_with('#') {
             let h = t.trim_start_matches('#').trim();
             let (head, rest) = h.split_once(':').unwrap_or((h, ""));
@@ -286,5 +306,13 @@ impl std::fmt::Display for Mode { fn fmt(&self, f: &mut std::fmt::Formatter) -> 
         assert_eq!(open.mocked().unwrap(), ["Doesn't really open anything."]);
         assert!(get(&items, "Mode").mocked().is_none());
         assert_eq!(doc_section("# Mocked: fakes it", "mocked").unwrap(), ["fakes it"]);
+    }
+
+    #[test]
+    fn javadoc_sections() {
+        let docs = "Opens it.\n<h2>Decisions</h2>\n<ul>\n<li>Maximized asks the WM,\nnot exclusive.</li>\n<li>Second.</li>\n</ul>\n<h2>Mocked</h2>\n<ul><li>Fakes the <code>scene</code>.</li></ul>";
+        assert_eq!(local_decisions(docs), ["Maximized asks the WM, not exclusive.", "Second."]);
+        assert_eq!(doc_section(docs, "mocked").unwrap(), ["Fakes the scene."]);
+        assert!(doc_section("Opens it.", "mocked").is_none());
     }
 }

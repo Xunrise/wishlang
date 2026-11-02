@@ -8,6 +8,7 @@ mod events;
 mod git;
 mod hook;
 mod items;
+mod java;
 mod journal;
 mod lsp;
 mod pending;

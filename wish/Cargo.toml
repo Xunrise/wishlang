@@ -19,3 +19,5 @@ sha2 = "0.11.1"
 similar = "3.2.1"
 syn = { version = "3.0.9", features = ["full", "extra-traits", "visit"] }
 toml = "1.1.8"
+tree-sitter = "0.25"
+tree-sitter-java = "0.23"
