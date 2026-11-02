@@ -323,16 +323,29 @@ pub fn share(p: &Project, remote: &str) -> Result<String> {
     Ok(format!("pushed wish journals to {remote}\n{out}\nothers get them with `wish sync`"))
 }
 
+/// A journal with no Claude cycles, only the baseline wish records the first
+/// time it runs in a fresh clone (journals aren't fetched by `git clone`).
+fn is_fresh_baseline(history: &[crate::git::Entry]) -> bool {
+    history.iter().all(|e| e.who != crate::git::Who::Claude || e.subject.starts_with("baseline"))
+}
+
 /// Fetch others' wish journals. New branches' journals are adopted, behind
 /// ones fast-forwarded; diverged ones are merged on your next save once your
-/// code contains theirs.
+/// code contains theirs. A fresh local baseline unrelated to theirs is
+/// replaced by their journal.
 pub fn sync(p: &Project, remote: &str) -> Result<String> {
     let git = crate::git::Git::open(&p.root)?;
     git.fetch_journals(remote)?;
     let mut lines = Vec::new();
     for j in git.journals().into_iter().filter(|j| j.remote.as_deref() == Some(remote)) {
         let local = git.resolve(&git.ref_for("journal", &j.branch));
+        let mut replaced = false;
         match local {
+            Some(l) if git.merge_base_time(&l, &j.sha) == 0 && is_fresh_baseline(&git.history(&l)) => {
+                git.set_branch_journal(&j.branch, &j.sha)?;
+                replaced = true;
+                lines.push(format!("  {}: adopted (replaced fresh local baseline)", j.branch));
+            }
             None => {
                 git.set_branch_journal(&j.branch, &j.sha)?;
                 lines.push(format!("  {}: adopted", j.branch));
@@ -344,9 +357,9 @@ pub fn sync(p: &Project, remote: &str) -> Result<String> {
             }
             Some(_) => lines.push(format!("  {}: diverged; merged on your next save once your code contains theirs", j.branch)),
         }
-        // Adopt their "last green" for branches you didn't have.
+        // Adopt their "last green" for branches you didn't have (or only had a fresh baseline of).
         let theirs_last = format!("refs/wish-remote/{remote}/{}", git.ref_for("last", &j.branch).trim_start_matches("refs/wish/"));
-        if git.resolve(&git.ref_for("last", &j.branch)).is_none() {
+        if replaced || git.resolve(&git.ref_for("last", &j.branch)).is_none() {
             if let Some(l) = git.resolve(&theirs_last) {
                 let _ = std::process::Command::new("git").args(["update-ref", &git.ref_for("last", &j.branch), &l]).current_dir(&p.root).status();
             }
@@ -362,4 +375,22 @@ pub fn sync(p: &Project, remote: &str) -> Result<String> {
 pub fn ticket(p: &Project, json: bool) -> Result<String> {
     let t = crate::ticket::trace(p, &crate::git::Git::open(&p.root)?)?;
     Ok(if json { serde_json::to_string_pretty(&t)? } else { crate::ticket::render(&t) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::{Entry, Who};
+
+    fn entry(who: Who, subject: &str) -> Entry {
+        Entry { sha: String::new(), who, subject: subject.into(), body: String::new(), age: String::new(), files: vec![], parent: None, side: vec![] }
+    }
+
+    #[test]
+    fn fresh_baseline() {
+        let fresh = [entry(Who::Human, "save: src/main.rs"), entry(Who::Claude, "baseline: existing project"), entry(Who::Human, "save: your files")];
+        assert!(is_fresh_baseline(&fresh));
+        let worked = [entry(Who::Claude, "cycle ok: Added `Mode`"), entry(Who::Claude, "baseline: existing project")];
+        assert!(!is_fresh_baseline(&worked));
+    }
 }
