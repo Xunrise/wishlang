@@ -344,3 +344,9 @@ pub fn sync(p: &Project, remote: &str) -> Result<String> {
     }
     Ok(format!("synced wish journals from {remote}:\n{}", lines.join("\n")))
 }
+
+/// The ticket of the current branch and the code that solves each of its problems.
+pub fn ticket(p: &Project, json: bool) -> Result<String> {
+    let t = crate::ticket::trace(p, &crate::git::Git::open(&p.root)?)?;
+    Ok(if json { serde_json::to_string_pretty(&t)? } else { crate::ticket::render(&t) })
+}

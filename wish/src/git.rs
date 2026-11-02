@@ -386,6 +386,11 @@ impl Git {
         self.git(&["show", &format!("{sha}:./{rel}")]).ok()
     }
 
+    /// Lines added and removed per file between two snapshots.
+    pub fn numstat(&self, a: &str, b: &str) -> Result<Vec<FileStat>> {
+        Ok(parse_numstat(&self.git(&["diff", "--relative", "--numstat", "--no-renames", a, b])?))
+    }
+
     /// (status, path) for files that differ between two snapshots.
     pub fn changed(&self, a: &str, b: &str) -> Result<Vec<(char, String)>> {
         let out = self.git(&["diff", "--relative", "--name-status", "--no-renames", a, b])?;

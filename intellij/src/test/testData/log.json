@@ -1,0 +1,127 @@
+{
+  "decisions": [],
+  "entries": [
+    {
+      "author": "claude",
+      "decisions": [],
+      "files": [],
+      "label": "cycle ok",
+      "mode": "prototype",
+      "sha": "<sha>",
+      "summary": "Added App.",
+      "ticket": "DEMO-1",
+      "triggeredBy": [],
+      "when": "<age>",
+      "why": [
+        {
+          "file": "src/main/java/demo/App.java",
+          "item": "App.create",
+          "line": 11,
+          "problems": [
+            "P2"
+          ],
+          "why": "Main calls App.create."
+        }
+      ]
+    },
+    {
+      "author": "claude",
+      "decisions": [],
+      "files": [
+        {
+          "added": 15,
+          "path": "src/main/java/demo/App.java",
+          "removed": 0
+        },
+        {
+          "added": 4,
+          "path": "src/main/java/demo/Quit.java",
+          "removed": 0
+        }
+      ],
+      "label": "cycle ok",
+      "mode": "prototype",
+      "sha": "<sha>",
+      "summary": "Added App.",
+      "ticket": "DEMO-1",
+      "triggeredBy": [],
+      "when": "<age>",
+      "why": [
+        {
+          "file": "src/main/java/demo/App.java",
+          "item": "App.create",
+          "line": 11,
+          "problems": [
+            "P1"
+          ],
+          "why": "Main calls App.create."
+        },
+        {
+          "file": "src/main/java/demo/App.java",
+          "item": "App.run",
+          "line": 14,
+          "problems": [],
+          "why": "Main calls App.run."
+        }
+      ]
+    },
+    {
+      "author": "claude",
+      "decisions": [],
+      "files": [
+        {
+          "added": 1,
+          "path": ".gitignore",
+          "removed": 0
+        },
+        {
+          "added": 1,
+          "path": "pom.xml",
+          "removed": 0
+        }
+      ],
+      "label": "baseline",
+      "mode": "",
+      "sha": "<sha>",
+      "summary": "",
+      "ticket": null,
+      "triggeredBy": [],
+      "when": "<age>",
+      "why": []
+    },
+    {
+      "author": "you",
+      "decisions": [],
+      "files": [
+        {
+          "added": 8,
+          "path": "src/main/java/demo/Main.java",
+          "removed": 0
+        },
+        {
+          "added": 2,
+          "path": "wish.toml",
+          "removed": 0
+        }
+      ],
+      "label": "save",
+      "mode": "",
+      "sha": "<sha>",
+      "summary": "",
+      "ticket": null,
+      "triggeredBy": [],
+      "when": "<age>",
+      "why": []
+    }
+  ],
+  "problems": [
+    {
+      "id": "P1",
+      "text": "The demo window does not open"
+    },
+    {
+      "id": "P2",
+      "text": "Closing the window leaves the app running"
+    }
+  ]
+}

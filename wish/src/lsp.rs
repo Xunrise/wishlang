@@ -25,6 +25,7 @@ use crate::pending::{self, Pending};
 use crate::preview::Preview;
 use crate::project::{Lang, Project, Status};
 use crate::provenance;
+use crate::ticket::{self, Problem, Trace};
 use anyhow::{Context, Result, bail};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use serde::Serialize;
@@ -51,6 +52,8 @@ struct State {
     published: std::collections::BTreeSet<String>,
     /// Items of each file's last successful parse, so markers survive a buffer with a syntax error.
     last_items: BTreeMap<String, Vec<Item>>,
+    /// The ticket trace of the branch's journal tip, keyed by "branch@journal".
+    trace: Option<(String, Option<Arc<Trace>>)>,
     next_id: i32,
     pending: HashMap<RequestId, Callback>,
 }
@@ -86,6 +89,7 @@ struct FileBlock {
 /// `wish/fileState`) is a projection of this.
 struct FileState {
     git: Option<Git>,
+    ticket: Option<Arc<Trace>>,
     text: String,
     items: Vec<Item>,
     whos: Vec<Who>,
@@ -205,13 +209,13 @@ fn run_with(conn: Connection) -> Result<()> {
             "inlayHintProvider": true,
             "codeLensProvider": {"resolveProvider": false},
             "semanticTokensProvider": {"legend": {"tokenTypes": ["generated"], "tokenModifiers": ["prototype"]}, "full": true},
-            "executeCommandProvider": {"commands": ["wish.adopt", "wish.unadopt", "wish.accept", "wish.reject", "wish.decide", "wish.undo", "wish.implement", "wish.regenerate", "wish.nextBlock"]}
+            "executeCommandProvider": {"commands": ["wish.adopt", "wish.unadopt", "wish.accept", "wish.reject", "wish.decide", "wish.undo", "wish.implement", "wish.regenerate", "wish.nextBlock", "wish.ticket.edit"]}
         },
         "serverInfo": {"name": "wishlang", "version": env!("CARGO_PKG_VERSION")}
     });
     conn.initialize_finish(id, caps)?;
     let server = Server {
-        state: Arc::new(Mutex::new(State { root, docs: BTreeMap::new(), busy: false, queued: None, checked_head: None, preview: Preview::default(), check: BTreeMap::new(), published: Default::default(), last_items: BTreeMap::new(), next_id: 1, pending: HashMap::new() })),
+        state: Arc::new(Mutex::new(State { root, docs: BTreeMap::new(), busy: false, queued: None, checked_head: None, preview: Preview::default(), check: BTreeMap::new(), published: Default::default(), last_items: BTreeMap::new(), trace: None, next_id: 1, pending: HashMap::new() })),
         out: crossbeam_sender::Sender(conn.sender.clone()),
     };
     // Start the journal now, before any edits, so provenance is right from the first keystroke.
@@ -468,8 +472,17 @@ impl Server {
             vec![]
         };
         let lenses = lenses(&p, rel, &text, &items);
-        let blocks = item_blocks(&whos, &text, &items);
-        Some(FileState { git, text, items, whos, shas, generated, prototype, pending, lenses, blocks })
+        let mut blocks = item_blocks(&whos, &text, &items);
+        let ticket = git.as_ref().and_then(|g| self.ticket_trace(&p, g));
+        if let Some(t) = &ticket {
+            for b in &mut blocks {
+                if let Some(served) = b.item.as_deref().and_then(|i| ticket::problems_of(&t.union, i)) {
+                    b.problems = served.iter().cloned().collect();
+                    b.untraced = served.is_empty();
+                }
+            }
+        }
+        Some(FileState { git, ticket, text, items, whos, shas, generated, prototype, pending, lenses, blocks })
     }
 
     fn file_state_of_uri(&self, params: &Value) -> Option<FileState> {
@@ -514,16 +527,44 @@ impl Server {
         }))
     }
 
-    /// Where each item currently lives: item path -> (file, 1-based line).
-    fn item_locations(&self, p: &Project) -> HashMap<String, (String, usize)> {
-        let mut locs = HashMap::new();
-        for f in p.src_files() {
-            let Some(text) = self.text(&f) else { continue };
-            for it in self.items_of(p.lang, &f, &text) {
-                locs.entry(it.path).or_insert((f.clone(), it.line));
-            }
+    /// The ticket trace of the current branch, cached per journal tip (an
+    /// edit of the problems clears it; `wish/ticket` always recomputes).
+    fn ticket_trace(&self, p: &Project, git: &Git) -> Option<Arc<Trace>> {
+        ticket::key(git.branch())?;
+        let key = format!("{}@{}", git.branch(), git.journal()?);
+        let cached = self.state.lock().unwrap().trace.as_ref().filter(|(k, _)| *k == key).map(|(_, t)| t.clone());
+        if let Some(t) = cached {
+            return t;
         }
-        locs
+        let t = match ticket::trace(p, git) {
+            Ok(t) => Some(Arc::new(t)),
+            Err(e) => {
+                self.log(&format!("wishlang: ticket: {e:#}"));
+                None
+            }
+        };
+        self.state.lock().unwrap().trace = Some((key, t.clone()));
+        t
+    }
+
+    /// `wish/ticket`: the ticket of the current branch with the items that serve each problem.
+    fn ticket_request(&self) -> Result<Value> {
+        let p = self.project().context("no wishlang project")?;
+        let git = self.git().context("no wishlang project")?;
+        let t = ticket::trace(&p, &git)?;
+        self.state.lock().unwrap().trace = Some((format!("{}@{}", git.branch(), git.journal().unwrap_or_default()), Some(Arc::new(t.clone()))));
+        Ok(serde_json::to_value(t)?)
+    }
+
+    /// `wish.ticket.edit [problems]`: replace the ticket's `problems.json`.
+    fn edit_problems(&self, p: &Project, arg: Option<&Value>) -> Result<String> {
+        let ps: Vec<Problem> = serde_json::from_value(arg.cloned().unwrap_or_default()).context("expected a list of problems [{id, text, scenarios}]")?;
+        let git = Git::open(&p.root)?;
+        let key = ticket::key(git.branch()).with_context(|| format!("branch {} has no ticket", git.branch()))?;
+        let dir = ticket::notes_dir(&p.root, &key).with_context(|| format!("no .work/{key} in the main checkout"))?;
+        ticket::save_problems(&dir, &ps)?;
+        self.state.lock().unwrap().trace = None;
+        Ok(format!("{key}: {} problem(s) saved", ps.len()))
     }
 
     /// `wish/log`: what wish did, for a history view.
@@ -531,7 +572,7 @@ impl Server {
         let p = self.project().context("no wishlang project")?;
         let git = self.git().context("no wishlang project")?;
         let journal = git.journal().context("no journal yet")?;
-        let locs = self.item_locations(&p);
+        let locs = p.item_locations();
         let entries = git
             .history(&journal)
             .into_iter()
@@ -545,11 +586,12 @@ impl Server {
                         WireWhy { file: at.map(|a| a.0.clone()), line: at.map(|a| a.1), item: w.item, why: w.why, problems: w.problems }
                     })
                     .collect();
-                WireEntry { sha: e.sha, author: e.who.name(), when: e.age, label: m.label, summary: m.summary, ticket: None, why, triggered_by: m.triggered_by, decisions: m.decisions, mode: m.mode, files: e.files }
+                WireEntry { sha: e.sha, author: e.who.name(), when: e.age, label: m.label, summary: m.summary, ticket: m.ticket, why, triggered_by: m.triggered_by, decisions: m.decisions, mode: m.mode, files: e.files }
             })
             .collect();
         let decisions = p.decisions().into_iter().map(|d| WireDecision { id: d.id, title: d.title, choice: d.choice, why: d.why, status: d.status }).collect();
-        Ok(serde_json::to_value(WireLog { entries, decisions, problems: vec![] })?)
+        let problems = self.ticket_trace(&p, &git).map(|t| t.problems.iter().map(|x| WireProblem { id: x.id.clone(), text: x.text.clone() }).collect()).unwrap_or_default();
+        Ok(serde_json::to_value(WireLog { entries, decisions, problems })?)
     }
 
     // ---- diagnostics ----
@@ -622,6 +664,7 @@ impl Server {
             "textDocument/codeAction" => Ok(self.code_actions(&req.params)),
             "wish/fileState" => Ok(self.wire_file_state(&req.params)),
             "wish/log" => self.journal_log(),
+            "wish/ticket" => self.ticket_request(),
             "wish/show" => self.show_file(&req.params),
             "workspace/executeCommand" => {
                 self.execute(&req.params);
@@ -779,6 +822,7 @@ impl Server {
                 self.cycle(Options { force: true, ..Options::default() });
                 return;
             }
+            "wish.ticket.edit" => self.edit_problems(&p, args.first()),
             "wish.nextBlock" => {
                 self.next_block(&s(0), n(1) as usize, s(2) == "human");
                 return;
@@ -1039,6 +1083,13 @@ fn hover_markdown(fs: &FileState, lang: Lang, line: usize) -> String {
         let name = (start..=line.min(lines.len().saturating_sub(1))).rev().find_map(|l| re.captures(lines[l]).map(|c| c[1].to_string()))?;
         m.why.iter().find(|w| w.item.split('(').next().and_then(|p| p.rsplit([':', '.']).next()) == Some(name.as_str())).map(|w| (w.item.clone(), w.why.clone()))
     });
+    if let Some(t) = &fs.ticket {
+        let path = why.as_ref().map(|(path, _)| path).or(item.map(|i| &i.path));
+        for id in path.and_then(|path| ticket::problems_of(&t.union, path)).into_iter().flatten() {
+            let text = t.problems.iter().find(|p| p.id == *id).map(|p| p.text.as_str()).unwrap_or("");
+            s.push_str(&format!("\n\n**Solves {id}**: {text}"));
+        }
+    }
     match why {
         Some((path, w)) => s.push_str(&format!("\n\n**`{path}`**: {w}")),
         None => {
@@ -1217,8 +1268,13 @@ mod tests {
         std::fs::write(dir.join("pom.xml"), "<project/>").unwrap();
         std::fs::write(dir.join("wish.toml"), "[protected]\nfiles = [\"src/main/java/demo/Main.java\"]\n").unwrap();
         std::fs::write(java.join("Main.java"), "package demo;\n\npublic class Main {\n    public static void main(String[] args) {\n        App.create(\"Demo\").run();\n        new Window(800, 600).show();\n    }\n}\n").unwrap();
-        std::fs::write(java.join("App.java"), APP).unwrap();
-        for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]] {
+        std::fs::write(dir.join(".gitignore"), ".work/\n").unwrap();
+        // The ticket's notes live in the main checkout, which is this directory.
+        let notes = dir.join(".work/DEMO-1");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("intent.md"), "# DEMO-1 — Open the demo window\n\nThe demo should open a window.\n").unwrap();
+        std::fs::write(notes.join("problems.json"), r#"[{"id": "P1", "text": "The demo window does not open", "scenarios": ["Open the window"]}, {"id": "P2", "text": "Closing the window leaves the app running"}]"#).unwrap();
+        for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"], &["checkout", "-qb", "feature/DEMO-1-window"]] {
             assert!(Cmd::new("git").args(args).current_dir(&dir).status().unwrap().success());
         }
         dir
@@ -1229,6 +1285,8 @@ mod tests {
         conn: Connection,
         next: i32,
         changed: usize,
+        /// `window/showMessage` texts received so far.
+        shown: Vec<String>,
     }
 
     impl Client {
@@ -1241,6 +1299,7 @@ mod tests {
                     Message::Response(r) if r.id == id => return r.response_result.map_err(|e| e.message),
                     Message::Request(r) => self.conn.sender.send(Message::Response(Response::new_ok(r.id, Value::Null))).unwrap(),
                     Message::Notification(n) if n.method == "wish/changed" => self.changed += 1,
+                    Message::Notification(n) if n.method == "window/showMessage" => self.shown.push(n.params["message"].as_str().unwrap_or("").to_string()),
                     _ => {}
                 }
             }
@@ -1258,7 +1317,7 @@ mod tests {
     fn start(dir: &Path) -> (Client, std::thread::JoinHandle<Result<()>>) {
         let (server_side, client_side) = Connection::memory();
         let handle = std::thread::spawn(move || run_with(server_side));
-        let mut c = Client { conn: client_side, next: 0, changed: 0 };
+        let mut c = Client { conn: client_side, next: 0, changed: 0, shown: vec![] };
         c.ok("initialize", json!({"capabilities": {}, "workspaceFolders": [{"uri": path_to_uri(dir)}]}));
         c.notify("initialized", json!({}));
         (c, handle)
@@ -1270,15 +1329,37 @@ mod tests {
         handle.join().unwrap().unwrap();
     }
 
+    /// With WISH_BLESS=1, record a response (shas, ages and paths normalised) as test data for the IntelliJ plugin.
+    fn bless(name: &str, value: &Value, root: &Path) {
+        if std::env::var("WISH_BLESS").is_err() {
+            return;
+        }
+        let mut text = serde_json::to_string_pretty(value).unwrap();
+        for dir in [root.canonicalize().unwrap(), root.to_path_buf()] {
+            text = text.replace(&dir.display().to_string(), "<root>");
+        }
+        for (re, to) in [(r"\b[0-9a-f]{40}\b", "<sha>"), (r"git show [0-9a-f]{8}", "git show <sha>"), (r"\d+ (second|minute|hour|day|week|month|year)s? ago", "<age>")] {
+            text = regex::Regex::new(re).unwrap().replace_all(&text, to).to_string();
+        }
+        let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../intellij/src/test/testData");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join(format!("{name}.json")), text + "\n").unwrap();
+    }
+
     #[test]
     fn serves_file_state_over_lsp() {
         let dir = temp_project();
-        // A Claude cycle on top of the baseline, as the engine would record it.
+        // Two ticket cycles on top of the baseline, as the engine would record them: the first adds
+        // two files and tags `create` with P1 and `run` with nothing, the second adds P2 to `create`.
         let (project, git) = (Project::load(&dir).unwrap(), Git::open(&dir).unwrap());
         let base = engine::ensure_journal(&project, &git).unwrap();
-        let cycle = CycleMessage { label: "cycle ok".into(), summary: "Added App.".into(), why: vec![Why::new("App.create", "Main calls App.create.")], mode: "prototype".into(), ..Default::default() };
-        let cycle = git.snapshot(&[&base], Who::Claude, &cycle.render()).unwrap();
-        git.set_ref(&git.ref_name("journal"), &cycle).unwrap();
+        let ticket_cycle = |why: Vec<Why>| CycleMessage { label: "cycle ok".into(), summary: "Added App.".into(), why, mode: "prototype".into(), ticket: Some("DEMO-1".into()), ..Default::default() };
+        let tagged = |item: &str, problems: &[&str]| Why { item: item.into(), why: format!("Main calls {item}."), problems: problems.iter().map(|p| p.to_string()).collect() };
+        std::fs::write(dir.join("src/main/java/demo/App.java"), APP).unwrap();
+        std::fs::write(dir.join("src/main/java/demo/Quit.java"), "package demo;\n\n/** Quits. */\nclass Quit {}\n").unwrap();
+        let first = git.snapshot(&[&base], Who::Claude, &ticket_cycle(vec![tagged("App.create", &["P1"]), tagged("App.run", &[])]).render()).unwrap();
+        let second = git.snapshot(&[&first], Who::Claude, &ticket_cycle(vec![tagged("App.create", &["P2"])]).render()).unwrap();
+        git.set_ref(&git.ref_name("journal"), &second).unwrap();
         let (mut c, handle) = start(&dir);
         let uri = |f: &str| path_to_uri(&dir.join("src/main/java/demo").join(f));
         let app_uri = uri("App.java");
@@ -1288,14 +1369,24 @@ mod tests {
 
         // Generated code, the prototype `create`, and the blocks with their anchored hover.
         let st = c.ok("wish/fileState", json!({"textDocument": {"uri": app_uri}}));
+        bless("fileState", &st, &dir);
         assert_eq!(st["prototype"].as_array().unwrap().len(), 1);
         assert_eq!(st["prototype"][0]["start"]["line"], 10);
         assert!(st["generated"].as_array().unwrap().iter().all(|r| r["start"]["line"] != 10));
-        let create = st["blocks"].as_array().unwrap().iter().find(|b| b["item"] == "App.create").unwrap();
+        let block = |item: &str| st["blocks"].as_array().unwrap().iter().find(|b| b["item"] == item).unwrap().clone();
+        let create = block("App.create");
         assert_eq!((create["start"].as_u64(), create["end"].as_u64()), (Some(4), Some(10)));
         assert!(create["hover"].as_str().unwrap().contains("generated"));
-        assert_eq!(create["untraced"], false);
         assert!(st["lenses"].as_array().unwrap().iter().any(|l| l["line"] == 4 && l["command"] == "wish.implement"));
+
+        // Ticket tracing: `create` serves P1 and P2 (united over both cycles); `run` was tagged with nothing.
+        assert_eq!((create["problems"].clone(), create["untraced"].clone()), (json!(["P1", "P2"]), json!(false)));
+        let (run, class) = (block("App.run"), block("App"));
+        assert_eq!((run["problems"].clone(), run["untraced"].clone()), (json!([]), json!(true)));
+        assert_eq!(class["untraced"], false); // `App` itself was never in a ticket cycle
+        assert!(create["hover"].as_str().unwrap().contains("**Solves P1**: The demo window does not open"));
+        assert!(create["hover"].as_str().unwrap().contains("**Solves P2**: Closing the window leaves the app running"));
+        assert!(!run["hover"].as_str().unwrap().contains("Solves"));
 
         // Your protected file has no generated lines; the wished `Window` is pending.
         let main = c.ok("wish/fileState", json!({"textDocument": {"uri": uri("Main.java")}}));
@@ -1308,17 +1399,45 @@ mod tests {
         let hover = c.ok("textDocument/hover", json!({"textDocument": {"uri": app_uri}, "position": {"line": 13, "character": 4}}));
         assert!(hover["contents"]["value"].as_str().unwrap().contains("generated"));
 
-        // wish/log: newest first, with each reason located in the code, files with line counts and no problems yet.
+        // wish/log: newest first, with each reason located in the code, its problems, files with line counts.
         let log = c.ok("wish/log", Value::Null);
+        bless("log", &log, &dir);
         let entries = log["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 3);
-        assert_eq!((entries[0]["sha"].as_str(), entries[0]["label"].as_str(), entries[0]["author"].as_str()), (Some(cycle.as_str()), Some("cycle ok"), Some("claude")));
-        assert_eq!(entries[0]["why"][0], json!({"item": "App.create", "why": "Main calls App.create.", "problems": [], "file": "src/main/java/demo/App.java", "line": 11}));
-        assert_eq!(entries[0]["summary"], "Added App.");
-        assert_eq!(entries[2]["author"], "you");
-        let app_stat = entries[1]["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/main/java/demo/App.java").unwrap();
-        assert_eq!(app_stat["added"], APP.lines().count());
-        assert_eq!((log["decisions"].as_array().unwrap().len(), log["problems"].as_array().unwrap().len()), (0, 0));
+        assert_eq!(entries.len(), 4);
+        assert_eq!((entries[0]["sha"].as_str(), entries[0]["label"].as_str(), entries[0]["author"].as_str(), entries[0]["ticket"].as_str()), (Some(second.as_str()), Some("cycle ok"), Some("claude"), Some("DEMO-1")));
+        assert_eq!(entries[1]["why"][0], json!({"item": "App.create", "why": "Main calls App.create.", "problems": ["P1"], "file": "src/main/java/demo/App.java", "line": 11}));
+        assert_eq!(entries[1]["why"][1]["problems"], json!([]));
+        assert_eq!(entries[1]["summary"], "Added App.");
+        assert_eq!(entries[3]["author"], "you");
+        let two_files = json!([{"path": "src/main/java/demo/App.java", "added": APP.lines().count(), "removed": 0}, {"path": "src/main/java/demo/Quit.java", "added": 4, "removed": 0}]);
+        assert_eq!(entries[1]["files"], two_files);
+        assert_eq!(log["problems"], json!([{"id": "P1", "text": "The demo window does not open"}, {"id": "P2", "text": "Closing the window leaves the app running"}]));
+        assert_eq!(log["decisions"], json!([]));
+
+        // wish/ticket: problems with their items and reasons per cycle, untraced items, and the ticket's whole diff.
+        let t = c.ok("wish/ticket", Value::Null);
+        bless("ticket", &t, &dir);
+        assert_eq!((t["key"].as_str(), t["title"].as_str(), t["cycles"].as_u64()), (Some("DEMO-1"), Some("Open the demo window"), Some(2)));
+        assert_eq!((t["head"].as_str(), t["base"].as_str()), (Some(second.as_str()), Some(format!("{first}^").as_str())));
+        let items = |problem: usize| t["problems"][problem]["items"].as_array().unwrap().clone();
+        assert_eq!(items(0).len(), 1);
+        assert_eq!((items(0)[0]["item"].clone(), items(0)[0]["line"].clone(), items(0)[0]["reasons"].as_array().unwrap().len()), (json!("App.create"), json!(11), 1));
+        assert_eq!(items(1)[0]["reasons"][0]["sha"], second.as_str());
+        assert_eq!(t["problems"][0]["scenarios"], json!(["Open the window"]));
+        assert_eq!(t["untraced"].as_array().unwrap().iter().map(|i| i["item"].clone()).collect::<Vec<_>>(), [json!("App.run")]);
+        assert_eq!(t["files"], two_files);
+        assert!(t["notesDir"].as_str().unwrap().ends_with(".work/DEMO-1"));
+
+        // Editing the problems validates, saves and refreshes; a bad edit shows a message and changes nothing.
+        let edit = |c: &mut Client, ps: Value| c.ok("workspace/executeCommand", json!({"command": "wish.ticket.edit", "arguments": [ps]}));
+        let before = c.changed;
+        edit(&mut c, json!([{"id": "P1", "text": "Only one now", "scenarios": []}]));
+        assert!(c.changed > before);
+        assert_eq!(c.ok("wish/ticket", Value::Null)["problems"].as_array().unwrap().len(), 1);
+        edit(&mut c, json!([]));
+        assert!(c.ok("wish/ticket", Value::Null)["problems"].as_array().unwrap().len() == 1);
+        c.ok("wish/log", Value::Null);
+        assert!(c.shown.iter().any(|m| m.contains("1 to 8 problems")), "{:?}", c.shown);
 
         // wish/show: the file before and after a journal commit, with validated arguments.
         let tip = entries[1]["sha"].as_str().unwrap().to_string();

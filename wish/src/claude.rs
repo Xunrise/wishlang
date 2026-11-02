@@ -137,8 +137,9 @@ fn allowed_tools(lang: Lang) -> &'static str {
     }
 }
 
-pub fn report_schema() -> Value {
-    json!({
+/// The report's JSON schema; for a ticket cycle every change must name the problems it serves.
+pub fn report_schema(ticket: bool) -> Value {
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "summary": {"type": "string", "description": "2-4 lines: what you built or changed and why"},
@@ -174,7 +175,13 @@ pub fn report_schema() -> Value {
             }}
         },
         "required": ["summary", "changes", "decisions", "suggestions"]
-    })
+    });
+    if ticket {
+        let change = &mut schema["properties"]["changes"]["items"];
+        change["properties"]["problems"] = json!({"type": "array", "items": {"type": "string"}, "description": "Ids of the ticket's problems this item serves; [] if none"});
+        change["required"] = json!(["item", "why", "problems"]);
+    }
+    schema
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -192,6 +199,8 @@ pub struct Report {
 pub struct ReportChange {
     pub item: String,
     pub why: String,
+    #[serde(default)]
+    pub problems: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,7 +223,7 @@ pub struct ReportSuggestion {
     pub with: String,
 }
 
-pub fn run(project: &Project, prompt: &str, rules: &str, sink: &mut dyn Sink) -> Result<Report> {
+pub fn run(project: &Project, prompt: &str, rules: &str, ticket: bool, sink: &mut dyn Sink) -> Result<Report> {
     let exe = std::env::current_exe()?;
     let settings = json!({"hooks": {"PreToolUse": [{
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
@@ -225,7 +234,7 @@ pub fn run(project: &Project, prompt: &str, rules: &str, sink: &mut dyn Sink) ->
     cmd.current_dir(&project.root)
         .arg("-p")
         .args(["--output-format", "stream-json", "--verbose"])
-        .args(["--json-schema", &report_schema().to_string()])
+        .args(["--json-schema", &report_schema(ticket).to_string()])
         .args(["--settings", &settings.to_string()])
         .args(["--append-system-prompt", rules])
         .args(["--allowedTools", allowed_tools(project.lang)]);

@@ -15,6 +15,7 @@ mod pending;
 mod preview;
 mod provenance;
 mod project;
+mod ticket;
 
 use clap::{Parser, Subcommand};
 use project::Project;
@@ -98,6 +99,12 @@ enum Cmd {
         #[arg(default_value = "origin")]
         remote: String,
     },
+    /// Show which generated code solves each problem of this branch's ticket.
+    Ticket {
+        /// Print the full trace as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Language server for editors (Zed): blue markers, provenance hints, compile on save.
     Lsp,
     /// Claude Code PreToolUse hook (internal).
@@ -146,6 +153,7 @@ fn run() -> anyhow::Result<()> {
         Cmd::Suggestions => print(commands::suggestions(&Project::discover()?)),
         Cmd::Accept { id } => print(commands::accept(&mut Project::discover()?, id)),
         Cmd::Reject { id } => print(commands::reject(&Project::discover()?, id)),
+        Cmd::Ticket { json } => print(commands::ticket(&Project::discover()?, json)),
         Cmd::Lsp => lsp::run(),
         Cmd::Share { remote } => print(commands::share(&Project::discover()?, &remote)),
         Cmd::Sync { remote } => print(commands::sync(&Project::discover()?, &remote)),

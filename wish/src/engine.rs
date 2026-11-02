@@ -10,6 +10,7 @@ use crate::git::{Git, Who};
 use crate::items;
 use crate::project::{Decision, Lang, Project, Status, Suggestion, wiring_only};
 use crate::provenance;
+use crate::ticket::{self, Ticket};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
@@ -259,6 +260,7 @@ struct PromptInput<'a> {
     check_errors: &'a str,
     opts: &'a Options,
     history: Option<String>,
+    ticket: &'a Option<Ticket>,
 }
 
 fn build_prompt(p: &Project, i: &PromptInput) -> String {
@@ -351,6 +353,9 @@ fn build_prompt(p: &Project, i: &PromptInput) -> String {
         }
         s.push('\n');
     }
+    if let Some(t) = i.ticket {
+        s.push_str(&ticket::prompt_section(t));
+    }
     s.push_str("Make the user's code compile and do what it says, following your rules. Then give the JSON report.\n");
     s
 }
@@ -424,9 +429,10 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
         (_, Some(d)) if d.is_empty() && owned_edits.is_empty() => "asking Claude to fix the build".into(),
         _ => "your code changed: asking Claude to regenerate".into(),
     }});
-    let prompt = build_prompt(p, &PromptInput { diff: &diff, owned_edits: &owned_edits, human_owned: &human_owned, check_errors: if ok { "" } else { &errors }, opts, history });
+    let ticket = ticket::start(&p.root, git.branch(), sink);
+    let prompt = build_prompt(p, &PromptInput { diff: &diff, owned_edits: &owned_edits, human_owned: &human_owned, check_errors: if ok { "" } else { &errors }, opts, history, ticket: &ticket });
     let rules = claude::rules(p.lang, implement);
-    let report = match claude::run(p, &prompt, &rules, sink) {
+    let report = match claude::run(p, &prompt, &rules, ticket.is_some(), sink) {
         Ok(r) => r,
         Err(e) => {
             sink.emit(Event::Done { ok: false, summary: format!("{e:#}") });
@@ -534,10 +540,11 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
     let message = crate::journal::CycleMessage {
         label: label.into(),
         summary: report.summary.clone(),
-        why: report.changes.iter().map(|c| crate::journal::Why::new(&c.item, &c.why)).collect(),
+        why: report.changes.iter().map(|c| crate::journal::Why { item: c.item.clone(), why: c.why.clone(), problems: known_problems(c, ticket.as_ref(), sink) }).collect(),
         triggered_by,
         decisions: decision_notes,
         mode: if implement { "implement".into() } else { "prototype".into() },
+        ticket: ticket.as_ref().map(|t| t.key.clone()),
     };
     // Your lines that Claude reformatted or expanded (`pub enum Color {}` → `{ … }`)
     // are committed as yours first, so blame keeps them yours and only what
@@ -564,6 +571,19 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
     }
     sink.emit(Event::Done { ok, summary: report.summary });
     Ok(ok)
+}
+
+/// The problems of a change that the ticket actually has, sorted; unknown ids are dropped with a warning.
+fn known_problems(c: &claude::ReportChange, ticket: Option<&Ticket>, sink: &mut dyn Sink) -> Vec<String> {
+    let Some(t) = ticket else { return vec![] };
+    let (known, unknown): (Vec<&String>, Vec<&String>) = c.problems.iter().partition(|id| t.problems.iter().any(|p| &p.id == *id));
+    if !unknown.is_empty() {
+        sink.emit(Event::Warning { msg: format!("`{}` names problems that {} does not have ({}); dropped", c.item, t.key, unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")) });
+    }
+    let mut known: Vec<String> = known.into_iter().cloned().collect();
+    known.sort();
+    known.dedup();
+    known
 }
 
 /// Public signatures and type definitions that changed between two snapshots.

@@ -248,6 +248,17 @@ impl Project {
     }
 
     /// Locate an item by path in any source file.
+    /// Where each item of the source files is: item path -> (file, 1-based line).
+    pub fn item_locations(&self) -> std::collections::HashMap<String, (String, usize)> {
+        let mut locations = std::collections::HashMap::new();
+        for f in self.src_files() {
+            for it in crate::items::parse(self.lang, &self.read(&f).unwrap_or_default()).unwrap_or_default() {
+                locations.entry(it.path).or_insert((f.clone(), it.line));
+            }
+        }
+        locations
+    }
+
     pub fn find_item(&self, path: &str) -> Result<(String, crate::items::Item)> {
         for f in self.src_files() {
             let Some(src) = self.read(&f) else { continue };
