@@ -14,5 +14,10 @@
     "label": "wish: suggestions",
     "command": "wish suggestions",
     "reveal": "always"
+  },
+  {
+    "label": "wish: ticket",
+    "command": "wish ticket",
+    "reveal": "always"
   }
 ]

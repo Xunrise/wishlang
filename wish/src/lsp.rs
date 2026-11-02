@@ -9,19 +9,26 @@
 //! - on save: a compile cycle with progress in the status bar, then the
 //!   preview app restarts;
 //! - code actions: adopt/unadopt, accept/reject suggestions, implement the
-//!   prototype (file or project), undo, regenerate, jump between blocks.
+//!   prototype (file or project), undo, regenerate, jump between blocks;
+//! - `wish/*` requests for editors that render the same data natively
+//!   (`wish/fileState`, `wish/show`) and a `wish/changed` notification.
+//!
+//! Every per-file answer is a projection of one [`FileState`].
 
 use crate::commands;
 use crate::engine::{self, Mode, Options};
 use crate::events::{Event, Sink};
-use crate::git::{Git, Who};
-use crate::items;
-use crate::pending;
+use crate::git::{FileStat, Git, Who};
+use crate::items::{self, Item};
+use crate::journal::CycleMessage;
+use crate::pending::{self, Pending};
 use crate::preview::Preview;
-use crate::project::{Project, Status};
+use crate::project::{Lang, Project, Status, locate};
 use crate::provenance;
-use anyhow::Result;
-use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
+use crate::ticket::{self, Problem, Trace};
+use anyhow::{Context, Result, bail};
+use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -39,10 +46,14 @@ struct State {
     /// "branch@HEAD" last checked for journals to merge.
     checked_head: Option<String>,
     preview: Preview,
-    /// Diagnostics from the last `cargo check`, by relative path.
+    /// Diagnostics from the last check, by relative path.
     check: BTreeMap<String, Vec<Value>>,
     /// Files we published diagnostics for (to clear them later).
     published: std::collections::BTreeSet<String>,
+    /// Items of each file's last successful parse, so markers survive a buffer with a syntax error.
+    last_items: BTreeMap<String, Vec<Item>>,
+    /// The ticket trace of the branch's journal tip, keyed by "branch@journal".
+    trace: Option<(String, Option<Arc<Trace>>)>,
     next_id: i32,
     pending: HashMap<RequestId, Callback>,
 }
@@ -51,6 +62,119 @@ struct State {
 struct Server {
     state: Arc<Mutex<State>>,
     out: crossbeam_sender::Sender,
+}
+
+/// A code lens in the editor-neutral shape of `wish/fileState`.
+#[derive(Serialize, Clone)]
+struct Lens {
+    line: usize,
+    title: String,
+    command: String,
+    arguments: Value,
+}
+
+/// A run of generated lines: an item with its doc comment and body (0-based, inclusive).
+struct FileBlock {
+    start: usize,
+    end: usize,
+    /// The item's name line (or the first line of a block without one): hover is anchored here.
+    anchor: usize,
+    item: Option<String>,
+    problems: Vec<String>,
+    untraced: bool,
+}
+
+/// Everything known about one file: the single place that blames and parses it.
+/// Every per-file answer (tokens, hover, hints, lenses, diagnostics,
+/// `wish/fileState`) is a projection of this.
+struct FileState {
+    git: Option<Git>,
+    ticket: Option<Arc<Trace>>,
+    text: String,
+    items: Vec<Item>,
+    whos: Vec<Who>,
+    /// The journal commit behind each line (None for lines not saved yet).
+    shas: Vec<Option<String>>,
+    /// Generated and prototype lines (0-based); a line is never in both.
+    generated: Vec<usize>,
+    prototype: Vec<usize>,
+    pending: Vec<Pending>,
+    lenses: Vec<Lens>,
+    blocks: Vec<FileBlock>,
+}
+
+#[derive(Serialize)]
+struct WirePending {
+    range: Value,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct WireBlock {
+    start: usize,
+    end: usize,
+    item: Option<String>,
+    hover: String,
+    problems: Vec<String>,
+    untraced: bool,
+}
+
+/// `wish/fileState`: ranges are 0-based LSP ranges (UTF-16 columns), blocks and lenses use 0-based lines.
+#[derive(Serialize)]
+struct WireFileState {
+    generated: Vec<Value>,
+    prototype: Vec<Value>,
+    pending: Vec<WirePending>,
+    lenses: Vec<Lens>,
+    blocks: Vec<WireBlock>,
+}
+
+#[derive(Serialize)]
+struct WireWhy {
+    item: String,
+    why: String,
+    problems: Vec<String>,
+    file: Option<String>,
+    line: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireEntry {
+    sha: String,
+    author: &'static str,
+    when: String,
+    label: String,
+    summary: String,
+    ticket: Option<String>,
+    why: Vec<WireWhy>,
+    triggered_by: Vec<String>,
+    decisions: Vec<String>,
+    mode: String,
+    files: Vec<FileStat>,
+}
+
+#[derive(Serialize)]
+struct WireDecision {
+    id: u32,
+    title: String,
+    choice: String,
+    why: String,
+    status: Status,
+}
+
+#[derive(Serialize)]
+struct WireProblem {
+    id: String,
+    text: String,
+}
+
+/// `wish/log`: the journal (newest first), every decision with its live status, and the ticket's problems.
+#[derive(Serialize)]
+struct WireLog {
+    entries: Vec<WireEntry>,
+    decisions: Vec<WireDecision>,
+    problems: Vec<WireProblem>,
 }
 
 /// Lets worker threads talk to the client.
@@ -67,6 +191,14 @@ mod crossbeam_sender {
 
 pub fn run() -> Result<()> {
     let (conn, io) = Connection::stdio();
+    let result = run_with(conn);
+    // Worker threads may still hold sender clones, so don't wait for the IO threads.
+    drop(io);
+    result
+}
+
+/// Serve one client over `conn` until it shuts down.
+fn run_with(conn: Connection) -> Result<()> {
     let (id, params) = conn.initialize_start()?;
     let root = root_from_init(&params).and_then(|r| Project::discover_from(&r)).map(|p| p.root);
     let caps = json!({
@@ -76,14 +208,14 @@ pub fn run() -> Result<()> {
             "hoverProvider": true,
             "inlayHintProvider": true,
             "codeLensProvider": {"resolveProvider": false},
-            "semanticTokensProvider": {"legend": {"tokenTypes": ["generated"], "tokenModifiers": ["prototype"]}, "full": true},
-            "executeCommandProvider": {"commands": ["wish.adopt", "wish.unadopt", "wish.accept", "wish.reject", "wish.decide", "wish.undo", "wish.implement", "wish.regenerate", "wish.nextBlock"]}
+            "semanticTokensProvider": {"legend": {"tokenTypes": ["generated"], "tokenModifiers": ["prototype", "untraced"]}, "full": true},
+            "executeCommandProvider": {"commands": ["wish.adopt", "wish.unadopt", "wish.accept", "wish.reject", "wish.decide", "wish.undo", "wish.implement", "wish.cycle", "wish.regenerate", "wish.nextBlock", "wish.ticket.edit", "wish.ticket.open"]}
         },
         "serverInfo": {"name": "wishlang", "version": env!("CARGO_PKG_VERSION")}
     });
     conn.initialize_finish(id, caps)?;
     let server = Server {
-        state: Arc::new(Mutex::new(State { root, docs: BTreeMap::new(), busy: false, queued: None, checked_head: None, preview: Preview::default(), check: BTreeMap::new(), published: Default::default(), next_id: 1, pending: HashMap::new() })),
+        state: Arc::new(Mutex::new(State { root, docs: BTreeMap::new(), busy: false, queued: None, checked_head: None, preview: Preview::default(), check: BTreeMap::new(), published: Default::default(), last_items: BTreeMap::new(), trace: None, next_id: 1, pending: HashMap::new() })),
         out: crossbeam_sender::Sender(conn.sender.clone()),
     };
     // Start the journal now, before any edits, so provenance is right from the first keystroke.
@@ -123,14 +255,19 @@ pub fn run() -> Result<()> {
         }
     }
     server.state.lock().unwrap().preview.stop();
-    // Worker threads may still hold sender clones, so don't wait for the IO threads.
-    drop(io);
     Ok(())
 }
 
 fn root_from_init(params: &Value) -> Option<PathBuf> {
     let uri = params["workspaceFolders"][0]["uri"].as_str().or(params["rootUri"].as_str())?;
     uri_to_path(uri)
+}
+
+/// Adds `root`, the project's URI: the files in a response are relative to it, which need not be the
+/// editor's workspace (a project in `backend/` of a repository opened at its root).
+fn with_root(mut v: Value, p: &Project) -> Value {
+    v["root"] = json!(path_to_uri(&p.root));
+    v
 }
 
 // ---- URIs ------------------------------------------------------------------
@@ -171,7 +308,7 @@ fn range(l0: u32, c0: u32, l1: u32, c1: u32) -> Value {
 }
 
 fn line_len(text: &str, line: usize) -> u32 {
-    text.lines().nth(line).map(|l| l.chars().count() as u32).unwrap_or(0)
+    text.lines().nth(line).map(|l| l.encode_utf16().count() as u32).unwrap_or(0)
 }
 
 // ---- server ----------------------------------------------------------------
@@ -179,6 +316,11 @@ fn line_len(text: &str, line: usize) -> u32 {
 impl Server {
     fn root(&self) -> Option<PathBuf> {
         self.state.lock().unwrap().root.clone()
+    }
+
+    /// The project's language (Rust until a root is known).
+    fn lang(&self) -> Lang {
+        self.root().map_or(Lang::Rust, |r| Lang::detect(&r))
     }
 
     fn project(&self) -> Option<Project> {
@@ -291,44 +433,240 @@ impl Server {
                     for refresh in ["workspace/semanticTokens/refresh", "workspace/inlayHint/refresh"] {
                         self.ask(refresh, Value::Null, Box::new(|_| {}));
                     }
+                    self.notify("wish/changed", json!({}));
                 }
             }
             "textDocument/didClose" => {
                 self.state.lock().unwrap().docs.remove(&rel);
             }
-            "textDocument/didSave" if rel.ends_with(".rs") => self.cycle(Options::default()),
+            "textDocument/didSave" if self.project().is_some_and(|p| p.lang.is_src(&rel)) => self.cycle(Options::default()),
             _ => {}
         }
+    }
+
+    // ---- file state ----
+
+    /// The items of a buffer; while it has a syntax error, those of its last good parse.
+    fn items_of(&self, lang: Lang, rel: &str, text: &str) -> Vec<Item> {
+        match items::parse(lang, text) {
+            Ok(items) => {
+                self.state.lock().unwrap().last_items.insert(rel.to_string(), items.clone());
+                items
+            }
+            Err(_) => self.state.lock().unwrap().last_items.get(rel).cloned().unwrap_or_default(),
+        }
+    }
+
+    fn file_state(&self, rel: &str) -> Option<FileState> {
+        let p = self.project()?;
+        let text = self.text(rel)?;
+        let git = self.git();
+        let (whos, shas): (Vec<Who>, Vec<Option<String>>) = git.as_ref().and_then(|g| g.blame_lines(rel, &text)).unwrap_or_default().into_iter().unzip();
+        let src = p.lang.is_src(rel) && !p.is_build_output(rel);
+        let items = if src { self.items_of(p.lang, rel, &text) } else { vec![] };
+        let mocked: Vec<(usize, usize)> = items.iter().filter(|i| i.mocked().is_some()).map(|i| (i.line, i.end_line)).collect();
+        let (generated, prototype) = paint_lines(&whos, &text, &mocked);
+        let pending = if src {
+            // Everything the rest of the project defines, using open buffers where they exist.
+            let mut all = Vec::new();
+            let mut implicit = Vec::new();
+            for f in p.src_files().iter().filter(|f| f.as_str() != rel) {
+                if let Some(src) = self.text(f) {
+                    all.extend(self.items_of(p.lang, f, &src));
+                    if p.lang == Lang::Java {
+                        implicit.extend(crate::java::implicit_members(&src));
+                    }
+                }
+            }
+            let mut known = pending::Known::from_items(&all);
+            for (path, ty) in &implicit {
+                known.add_member(path, ty.as_deref());
+            }
+            pending::find(p.lang, &text, &known).unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let lenses = lenses(&p, rel, &text, &items);
+        let mut blocks = item_blocks(&whos, &text, &items);
+        let ticket = git.as_ref().and_then(|g| self.ticket_trace(&p, g));
+        if let Some(t) = &ticket {
+            for b in &mut blocks {
+                if let Some(served) = b.item.as_deref().and_then(|i| ticket::problems_of(&t.union, i)) {
+                    b.problems = served.iter().cloned().collect();
+                    b.untraced = served.is_empty();
+                }
+            }
+        }
+        let mut lenses = lenses;
+        if ticket.as_ref().is_some_and(|t| t.notes_dir.is_some()) {
+            for b in blocks.iter().filter(|b| !b.problems.is_empty()) {
+                lenses.push(Lens { line: b.start, title: format!("◆ {}", b.problems.join(" · ")), command: "wish.ticket.open".into(), arguments: json!([b.problems[0]]) });
+            }
+        }
+        Some(FileState { git, ticket, text, items, whos, shas, generated, prototype, pending, lenses, blocks })
+    }
+
+    fn file_state_of_uri(&self, params: &Value) -> Option<FileState> {
+        self.file_state(&params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u))?)
+    }
+
+    /// `wish/fileState`: everything an editor needs to decorate one file.
+    fn wire_file_state(&self, params: &Value) -> Value {
+        let line_range = |l: &usize, text: &str| range(*l as u32, 0, *l as u32, line_len(text, *l));
+        let Some(fs) = self.file_state_of_uri(params) else {
+            return serde_json::to_value(WireFileState { generated: vec![], prototype: vec![], pending: vec![], lenses: vec![], blocks: vec![] }).unwrap_or_default();
+        };
+        let lang = self.lang();
+        let wire = WireFileState {
+            generated: fs.generated.iter().map(|l| line_range(l, &fs.text)).collect(),
+            prototype: fs.prototype.iter().map(|l| line_range(l, &fs.text)).collect(),
+            pending: fs.pending.iter().map(|x| WirePending { range: range(x.start.0, x.start.1, x.end.0, x.end.1), name: x.name.clone() }).collect(),
+            lenses: fs.lenses.clone(),
+            blocks: fs.blocks.iter().map(|b| WireBlock { start: b.start, end: b.end, item: b.item.clone(), hover: hover_markdown(&fs, lang, b.anchor), problems: b.problems.clone(), untraced: b.untraced }).collect(),
+        };
+        serde_json::to_value(wire).unwrap_or_default()
+    }
+
+    /// `wish/show {sha, path, base?}`: a file before and after a journal commit
+    /// (before = `base`, else the commit's parent), for a diff view.
+    fn show_file(&self, params: &Value) -> Result<Value> {
+        let (sha, path, base) = (params["sha"].as_str().unwrap_or(""), params["path"].as_str().unwrap_or(""), params["base"].as_str());
+        let rev = regex::Regex::new(r"^[0-9a-f]{7,40}\^?$").unwrap();
+        if !rev.is_match(sha) || base.is_some_and(|b| !rev.is_match(b)) {
+            bail!("invalid revision (expected a hex sha, optionally followed by ^)");
+        }
+        if path.is_empty() || path.starts_with('/') || path.split('/').any(|s| s == "..") {
+            bail!("invalid path {path:?} (expected a path relative to the project)");
+        }
+        let git = self.git().context("no wishlang project")?;
+        let after = git.resolve(sha).with_context(|| format!("unknown revision {sha}"))?;
+        let before = base.map(String::from).unwrap_or_else(|| format!("{sha}^"));
+        // A file the commit added has no "before"; a root commit has no parent.
+        Ok(json!({
+            "before": git.resolve(&before).and_then(|b| git.show(&b, path)).unwrap_or_default(),
+            "after": git.show(&after, path).unwrap_or_default(),
+        }))
+    }
+
+    /// The ticket trace of the current branch, cached per journal tip (an
+    /// edit of the problems clears it; `wish/ticket` always recomputes).
+    fn ticket_trace(&self, p: &Project, git: &Git) -> Option<Arc<Trace>> {
+        ticket::key(git.branch())?;
+        let key = format!("{}@{}", git.branch(), git.journal()?);
+        let cached = self.state.lock().unwrap().trace.as_ref().filter(|(k, _)| *k == key).map(|(_, t)| t.clone());
+        if let Some(t) = cached {
+            return t;
+        }
+        let t = match ticket::trace(p, git) {
+            Ok(t) => Some(Arc::new(t)),
+            Err(e) => {
+                self.log(&format!("wishlang: ticket: {e:#}"));
+                None
+            }
+        };
+        self.state.lock().unwrap().trace = Some((key, t.clone()));
+        t
+    }
+
+    /// `wish/ticket`: the ticket of the current branch with the items that serve each problem.
+    /// `wish/ticket {branch?}`: the trace of this branch's ticket, or of another ticket branch.
+    fn ticket_request(&self, branch: Option<&str>) -> Result<Value> {
+        let p = self.project().context("no wishlang project")?;
+        let git = self.git().context("no wishlang project")?;
+        if let Some(b) = branch.filter(|b| *b != git.branch()) {
+            let t = ticket::trace_branch(&p, &git, b)?;
+            // Files are relative to the checkout that has the branch; without one there is no root to open them from.
+            let root = t.checkout.as_deref().map(path_to_uri);
+            let mut v = serde_json::to_value(t)?;
+            v["root"] = json!(root);
+            return Ok(v);
+        }
+        let t = ticket::trace(&p, &git)?;
+        self.state.lock().unwrap().trace = Some((format!("{}@{}", git.branch(), git.journal().unwrap_or_default()), Some(Arc::new(t.clone()))));
+        Ok(with_root(serde_json::to_value(t)?, &p))
+    }
+
+    /// `wish/tickets`: every ticket branch with a journal, the current one first.
+    fn tickets_request(&self) -> Result<Value> {
+        let p = self.project().context("no wishlang project")?;
+        let git = self.git().context("no wishlang project")?;
+        Ok(serde_json::to_value(ticket::tickets(&p, &git))?)
+    }
+
+    /// `wish.ticket.edit [problems, branch?]`: replace the `problems.json` of this branch's ticket (or `branch`'s).
+    fn edit_problems(&self, p: &Project, arg: Option<&Value>, branch: Option<&str>) -> Result<String> {
+        let ps: Vec<Problem> = serde_json::from_value(arg.cloned().unwrap_or_default()).context("expected a list of problems [{id, text, scenarios}]")?;
+        let git = Git::open(&p.root)?;
+        let branch = branch.filter(|b| !b.is_empty()).unwrap_or(git.branch());
+        let key = ticket::key(branch).with_context(|| format!("branch {branch} has no ticket"))?;
+        let dir = ticket::notes_dir(&p.root, &key).with_context(|| format!("no .work/{key} in the main checkout"))?;
+        ticket::save_problems(&dir, &ps)?;
+        self.state.lock().unwrap().trace = None;
+        Ok(format!("{key}: {} problem(s) saved", ps.len()))
+    }
+
+    /// Open the ticket's problems.json in the editor, selecting the line of problem `id`.
+    fn open_problem(&self, p: &Project, id: &str) {
+        let Some(dir) = self.git().and_then(|g| self.ticket_trace(p, &g)).and_then(|t| t.notes_dir.clone()) else { return };
+        let file = Path::new(&dir).join("problems.json");
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let line = ["\"id\": \"", "\"id\":\""].iter().find_map(|k| text.find(&format!("{k}{id}\""))).map_or(0, |at| text[..at].matches('\n').count() as u32);
+        self.ask("window/showDocument", json!({"uri": path_to_uri(&file), "takeFocus": true, "selection": range(line, 0, line, 0)}), Box::new(|_| {}));
+    }
+
+    /// `wish/log`: what wish did, for a history view.
+    fn journal_log(&self) -> Result<Value> {
+        let p = self.project().context("no wishlang project")?;
+        let git = self.git().context("no wishlang project")?;
+        let journal = git.journal().context("no journal yet")?;
+        let locs = p.item_locations();
+        let entries = git
+            .history(&journal)
+            .into_iter()
+            .map(|e| {
+                let m = CycleMessage::parse(&format!("{}\n\n{}", e.subject, e.body));
+                let why = m
+                    .why
+                    .into_iter()
+                    .map(|w| {
+                        let at = locate(&locs, &w.item);
+                        WireWhy { file: at.map(|a| a.0.clone()), line: at.map(|a| a.1), item: w.item, why: w.why, problems: w.problems }
+                    })
+                    .collect();
+                WireEntry { sha: e.sha, author: e.who.name(), when: e.age, label: m.label, summary: m.summary, ticket: m.ticket, why, triggered_by: m.triggered_by, decisions: m.decisions, mode: m.mode, files: e.files }
+            })
+            .collect();
+        let decisions = p.decisions().into_iter().map(|d| WireDecision { id: d.id, title: d.title, choice: d.choice, why: d.why, status: d.status }).collect();
+        let problems = self.ticket_trace(&p, &git).map(|t| t.problems.iter().map(|x| WireProblem { id: x.id.clone(), text: x.text.clone() }).collect()).unwrap_or_default();
+        Ok(with_root(serde_json::to_value(WireLog { entries, decisions, problems })?, &p))
     }
 
     // ---- diagnostics ----
 
     fn diagnostics(&self, rel: &str) -> Vec<Value> {
         let Some(p) = self.project() else { return vec![] };
-        let Some(text) = self.text(rel) else { return vec![] };
         let mut out = Vec::new();
-        if rel.ends_with(".rs") {
-            // Everything the project defines, using open buffers where they exist.
-            let mut all = Vec::new();
-            for f in p.rust_files().iter().filter(|f| f.as_str() != rel) {
-                if let Some(src) = self.text(f) {
-                    all.extend(items::parse(&src).unwrap_or_default());
-                }
-            }
-            let known = pending::Known::from_items(&all);
-            for pnd in pending::find(&text, &known).unwrap_or_default() {
+        if let Some(fs) = self.file_state(rel).filter(|_| p.lang.is_src(rel)) {
+            for pnd in &fs.pending {
                 out.push(json!({
                     "range": range(pnd.start.0, pnd.start.1, pnd.end.0, pnd.end.1),
                     "severity": 3, "source": "wishlang",
                     "message": format!("✦ will be generated: {}", pnd.name),
                 }));
             }
+            if let Some(t) = &fs.ticket {
+                for b in fs.blocks.iter().filter(|b| b.untraced) {
+                    out.push(json!({"range": range(b.anchor as u32, 0, b.anchor as u32, line_len(&fs.text, b.anchor)), "severity": 2, "source": "wishlang",
+                        "code": "untraced", "message": format!("serves no problem of {}", t.key)}));
+                }
+            }
+            let text = &fs.text;
             for s in p.suggestions().into_iter().filter(|s| s.status == Status::Proposed && s.file == rel) {
                 if let Some(at) = text.find(&s.replace) {
                     let l0 = text[..at].matches('\n').count() as u32;
                     let l1 = l0 + s.replace.matches('\n').count() as u32;
                     // Warning, so every suggestion is listed in Zed's project diagnostics.
-                    out.push(json!({"range": range(l0, 0, l1, line_len(&text, l1 as usize)), "severity": 2, "source": "wishlang",
+                    out.push(json!({"range": range(l0, 0, l1, line_len(text, l1 as usize)), "severity": 2, "source": "wishlang",
                         "code": format!("suggestion-{}", s.id),
                         "message": format!("✎ suggestion {}: {}\nproposed:\n{}", s.id, s.reason, s.with)}));
                 }
@@ -351,10 +689,13 @@ impl Server {
             let st = self.state.lock().unwrap();
             st.docs.keys().chain(st.published.iter()).chain(st.check.keys()).cloned().collect::<std::collections::BTreeSet<_>>()
         };
-        // Files with pending suggestions too, so they all appear in Zed's project diagnostics.
+        // Files with pending suggestions or untraced items too, so they all appear in Zed's project diagnostics.
         let mut rels = rels;
         if let Some(p) = self.project() {
             rels.extend(p.suggestions().into_iter().filter(|s| s.status == Status::Proposed).map(|s| s.file));
+            if let Some(t) = self.git().and_then(|g| self.ticket_trace(&p, &g)) {
+                rels.extend(t.untraced.iter().map(|i| i.file.clone()));
+            }
         }
         for r in rels {
             self.publish(&r);
@@ -362,6 +703,7 @@ impl Server {
         for refresh in ["workspace/semanticTokens/refresh", "workspace/inlayHint/refresh", "workspace/codeLens/refresh"] {
             self.ask(refresh, Value::Null, Box::new(|_| {}));
         }
+        self.notify("wish/changed", json!({}));
     }
 
     // ---- requests ----
@@ -370,72 +712,70 @@ impl Server {
         if let Some(uri) = req.params["textDocument"]["uri"].as_str() {
             self.discover_from_uri(uri);
         }
-        let result = match req.method.as_str() {
-            "textDocument/semanticTokens/full" => self.semantic_tokens(&req.params),
-            "textDocument/hover" => self.hover(&req.params),
-            "textDocument/inlayHint" => self.inlay_hints(&req.params),
-            "textDocument/codeLens" => self.code_lenses(&req.params),
-            "textDocument/codeAction" => self.code_actions(&req.params),
+        let result: Result<Value> = match req.method.as_str() {
+            "textDocument/semanticTokens/full" => Ok(self.semantic_tokens(&req.params)),
+            "textDocument/hover" => Ok(self.hover(&req.params)),
+            "textDocument/inlayHint" => Ok(self.inlay_hints(&req.params)),
+            "textDocument/codeLens" => Ok(self.code_lenses(&req.params)),
+            "textDocument/codeAction" => Ok(self.code_actions(&req.params)),
+            "wish/fileState" => Ok(self.wire_file_state(&req.params)),
+            "wish/log" => self.journal_log(),
+            "wish/ticket" => self.ticket_request(req.params["branch"].as_str()),
+            "wish/tickets" => self.tickets_request(),
+            "wish/show" => self.show_file(&req.params),
             "workspace/executeCommand" => {
                 self.execute(&req.params);
-                Value::Null
+                Ok(Value::Null)
             }
-            _ => Value::Null,
+            _ => Ok(Value::Null),
         };
-        self.reply(req.id, result);
+        match result {
+            Ok(v) => self.reply(req.id, v),
+            Err(e) => self.out.send(Message::Response(Response::new_err(req.id, ErrorCode::RequestFailed as i32, format!("{e:#}")))),
+        }
     }
 
     /// Every generated line as a `generated` semantic token; Zed's token rule
     /// paints it blue. Lines inside a still-mocked item also get `prototype`.
     fn semantic_tokens(&self, params: &Value) -> Value {
-        let empty = json!({"data": []});
-        let Some(rel) = params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u)) else { return empty };
-        let Some(text) = self.text(&rel) else { return empty };
-        let Some(git) = self.git() else { return empty };
-        let Some(whos) = provenance::of(&git, &rel, &text) else { return empty };
-        let mocked: Vec<(usize, usize)> = items::parse(&text).unwrap_or_default().iter().filter(|i| i.mocked().is_some()).map(|i| (i.line, i.end_line)).collect();
-        json!({"data": encode_tokens(&whos, &text, &mocked)})
+        let Some(fs) = self.file_state_of_uri(params) else { return json!({"data": []}) };
+        let untraced: Vec<usize> = fs.blocks.iter().filter(|b| b.untraced).flat_map(|b| b.start..=b.end).collect();
+        json!({"data": encode_tokens(&fs.text, &fs.generated, &fs.prototype, &untraced)})
     }
 
     /// Blame the hovered line and show the reasoning recorded in its journal commit.
     fn hover(&self, params: &Value) -> Value {
-        let Some(rel) = params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u)) else { return Value::Null };
+        let Some(fs) = self.file_state_of_uri(params) else { return Value::Null };
         let line = params["position"]["line"].as_u64().unwrap_or(0) as usize;
-        let Some(text) = self.text(&rel) else { return Value::Null };
-        let Some(git) = self.git() else { return Value::Null };
-        let Some(lines) = git.blame_lines(&rel, &text) else { return Value::Null };
-        let Some((who, sha)) = lines.get(line).cloned() else { return Value::Null };
-        if text.lines().nth(line).is_none_or(|l| l.trim().is_empty()) {
+        if fs.whos.get(line).is_none() || fs.text.lines().nth(line).is_none_or(|l| l.trim().is_empty()) {
             return Value::Null;
         }
-        let md = hover_markdown(&git, &text, line, who, sha.as_deref());
-        json!({"contents": {"kind": "markdown", "value": md}, "range": range(line as u32, 0, line as u32, line_len(&text, line))})
+        let md = hover_markdown(&fs, self.lang(), line);
+        json!({"contents": {"kind": "markdown", "value": md}, "range": range(line as u32, 0, line as u32, line_len(&fs.text, line))})
     }
 
     /// Always-visible annotations: `✎` on your lines inside generated files,
     /// and a `◇ prototype` tag after the signature of every still-mocked item.
     fn inlay_hints(&self, params: &Value) -> Value {
-        let Some(rel) = params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u)) else { return json!([]) };
-        let Some(text) = self.text(&rel) else { return json!([]) };
+        let Some(fs) = self.file_state_of_uri(params) else { return json!([]) };
+        let text = &fs.text;
         let mut hints = Vec::new();
-        if let Some(whos) = self.git().and_then(|g| provenance::of(&g, &rel, &text)) {
-            // One marker per block of your lines, only where they mix with generated code.
-            if whos.contains(&Who::Claude) {
-                let lines: Vec<&str> = text.lines().collect();
-                for b in provenance::blocks(&whos, &text).into_iter().filter(|b| b.who == Who::Human) {
-                    let Some(first) = (b.start..=b.end).find(|i| lines.get(*i).is_some_and(|l| !l.trim().is_empty())) else { continue };
-                    let n = (b.start..=b.end).filter(|i| lines.get(*i).is_some_and(|l| !l.trim().is_empty())).count();
-                    let label = if n == 1 { "✎ yours".to_string() } else { format!("✎ yours · {n} lines") };
-                    hints.push(json!({"position": {"line": first, "character": line_len(&text, first)}, "label": label, "paddingLeft": true, "tooltip": "Written by you. Protected: Claude keeps these lines and makes them true."}));
-                }
+        // One marker per block of your lines, only where they mix with generated code.
+        if fs.whos.contains(&Who::Claude) {
+            let lines: Vec<&str> = text.lines().collect();
+            for b in provenance::blocks(&fs.whos, text).into_iter().filter(|b| b.who == Who::Human) {
+                let Some(first) = (b.start..=b.end).find(|i| lines.get(*i).is_some_and(|l| !l.trim().is_empty())) else { continue };
+                let n = (b.start..=b.end).filter(|i| lines.get(*i).is_some_and(|l| !l.trim().is_empty())).count();
+                let label = if n == 1 { "✎ yours".to_string() } else { format!("✎ yours · {n} lines") };
+                hints.push(json!({"position": {"line": first, "character": line_len(text, first)}, "label": label, "paddingLeft": true, "tooltip": "Written by you. Protected: Claude keeps these lines and makes them true."}));
             }
         }
-        for it in items::parse(&text).unwrap_or_default() {
+        for it in &fs.items {
             if let Some(m) = it.mocked() {
                 let l = it.line.max(1) - 1;
                 let what: String = m.join("; ").chars().take(80).collect();
                 let label = if what.is_empty() { "◇ prototype".to_string() } else { format!("◇ prototype · mocked: {what}") };
-                hints.push(json!({"position": {"line": l, "character": line_len(&text, l)}, "label": label, "paddingLeft": true, "tooltip": "Still mocked. Use the ▶ Implement lens above to make it real."}));
+                hints.push(json!({"position": {"line": l, "character": line_len(text, l)}, "label": label, "paddingLeft": true, "tooltip": "Still mocked. Use the ▶ Implement lens above to make it real."}));
             }
         }
         json!(hints)
@@ -444,39 +784,9 @@ impl Server {
     /// Clickable actions above code: implement a prototype item, and accept or
     /// reject Claude's suggestions in place.
     fn code_lenses(&self, params: &Value) -> Value {
-        let Some(rel) = params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u)) else { return json!([]) };
-        let (Some(text), Some(p)) = (self.text(&rel), self.project()) else { return json!([]) };
-        let lines: Vec<&str> = text.lines().collect();
-        let lens = |line: usize, title: String, command: &str, args: Value| json!({"range": range(line as u32, 0, line as u32, 0), "command": {"title": title, "command": command, "arguments": args}});
-        let mut out = Vec::new();
-        let mocked: Vec<items::Item> = items::parse(&text).unwrap_or_default().into_iter().filter(|i| i.mocked().is_some()).collect();
-        if mocked.len() > 1 {
-            out.push(lens(0, format!("▶ Implement all {} prototype items in this file", mocked.len()), "wish.implement", json!([rel, null])));
-        }
-        for it in &mocked {
-            // Put the lens above the item's doc comment and attributes.
-            let mut start = it.line.max(1) - 1;
-            while start > 0 && lines.get(start - 1).is_some_and(|l| { let t = l.trim_start(); t.starts_with("///") || t.starts_with("#[") }) {
-                start -= 1;
-            }
-            out.push(lens(start, format!("▶ Implement `{}`", it.path), "wish.implement", json!([rel, it.path])));
-        }
-        for s in p.suggestions().into_iter().filter(|s| s.status == Status::Proposed && s.file == rel) {
-            if let Some(at) = text.find(&s.replace) {
-                let l = text[..at].matches('\n').count();
-                let reason: String = s.reason.chars().take(90).collect();
-                out.push(lens(l, format!("✓ Accept suggestion {}: {reason}", s.id), "wish.accept", json!([s.id])));
-                out.push(lens(l, "✗ Reject".into(), "wish.reject", json!([s.id])));
-            }
-        }
-        json!(out)
-    }
-
-    fn blocks(&self, rel: &str) -> Option<Vec<provenance::Block>> {
-        let text = self.text(rel)?;
-        let git = self.git()?;
-        let whos = provenance::of(&git, rel, &text)?;
-        Some(provenance::blocks(&whos, &text))
+        let Some(fs) = self.file_state_of_uri(params) else { return json!([]) };
+        let lens = |l: &Lens| json!({"range": range(l.line as u32, 0, l.line as u32, 0), "command": {"title": l.title, "command": l.command, "arguments": l.arguments}});
+        json!(fs.lenses.iter().map(lens).collect::<Vec<_>>())
     }
 
     fn code_actions(&self, params: &Value) -> Value {
@@ -511,7 +821,7 @@ impl Server {
             actions.push(cmd(format!("✗ Reject suggestion {id}"), "wish.reject", json!([id])));
         }
         let text = self.text(&rel).unwrap_or_default();
-        let own = items::parse(&text).unwrap_or_default();
+        let own = self.items_of(p.lang, &rel, &text);
         if !p.is_protected(&rel) {
             // The item whose name is on, or nearest above, the cursor line.
             if let Some(it) = own.iter().filter(|i| i.line > 0 && i.line - 1 <= line).max_by_key(|i| i.line) {
@@ -566,8 +876,18 @@ impl Server {
                 self.cycle(commands::implement_options(file, item));
                 return;
             }
+            // What a save does: a cycle for your edits since the last one (nothing to do: no Claude call).
+            "wish.cycle" => {
+                self.cycle(Options::default());
+                return;
+            }
             "wish.regenerate" => {
                 self.cycle(Options { force: true, ..Options::default() });
+                return;
+            }
+            "wish.ticket.edit" => self.edit_problems(&p, args.first(), args.get(1).and_then(|v| v.as_str())),
+            "wish.ticket.open" => {
+                self.open_problem(&p, &s(0));
                 return;
             }
             "wish.nextBlock" => {
@@ -584,8 +904,8 @@ impl Server {
     }
 
     fn next_block(&self, uri: &str, line: usize, human: bool) {
-        let Some(rel) = self.rel_of_uri(uri) else { return };
-        let Some(blocks) = self.blocks(&rel) else { return };
+        let Some(fs) = self.rel_of_uri(uri).and_then(|rel| self.file_state(&rel)) else { return };
+        let blocks = provenance::blocks(&fs.whos, &fs.text);
         let want = if human { Who::Human } else { Who::Claude };
         let target = blocks.iter().find(|b| b.who == want && b.start > line).or_else(|| blocks.iter().find(|b| b.who == want));
         match target {
@@ -636,7 +956,11 @@ impl Server {
                 None => false,
             };
             if let Some(errors) = sink.check.take() {
-                me.state.lock().unwrap().check = parse_cargo(&errors);
+                let diagnostics = match me.lang() {
+                    Lang::Rust => parse_cargo(&errors),
+                    Lang::Java => parse_mvn(&errors),
+                };
+                me.state.lock().unwrap().check = diagnostics;
             }
             if ok {
                 me.notify("$/progress", json!({"token": token, "value": {"kind": "report", "message": "building preview"}}));
@@ -693,27 +1017,114 @@ impl Server {
     }
 }
 
-/// LSP semantic token data: one `generated` token per generated, non-blank
-/// line (whole line), with the `prototype` modifier inside mocked items
-/// (`mocked` holds 1-based inclusive line ranges).
-pub fn encode_tokens(whos: &[Who], text: &str, mocked: &[(usize, usize)]) -> Vec<u32> {
-    let mut data = Vec::new();
-    let mut prev = 0usize;
+/// Claude's non-blank lines (0-based), split into those inside a still-mocked
+/// item (`mocked` holds 1-based inclusive line ranges) and the rest. A line
+/// is never in both.
+fn paint_lines(whos: &[Who], text: &str, mocked: &[(usize, usize)]) -> (Vec<usize>, Vec<usize>) {
+    let (mut generated, mut prototype) = (Vec::new(), Vec::new());
     for (i, (l, who)) in text.lines().zip(whos).enumerate() {
         if *who != Who::Claude || l.trim().is_empty() {
             continue;
         }
-        let proto = mocked.iter().any(|(a, b)| (*a..=*b).contains(&(i + 1)));
-        data.extend([(i - prev) as u32, 0, l.encode_utf16().count() as u32, 0, proto as u32]);
-        prev = i;
+        if mocked.iter().any(|(a, b)| (*a..=*b).contains(&(i + 1))) {
+            prototype.push(i);
+        } else {
+            generated.push(i);
+        }
+    }
+    (generated, prototype)
+}
+
+/// LSP semantic token data: one `generated` token per generated line (whole
+/// line), with the `prototype` modifier on prototype lines and `untraced` on
+/// lines in `untraced`.
+pub fn encode_tokens(text: &str, generated: &[usize], prototype: &[usize], untraced: &[usize]) -> Vec<u32> {
+    let mut painted: Vec<(usize, bool)> = generated.iter().map(|l| (*l, false)).chain(prototype.iter().map(|l| (*l, true))).collect();
+    painted.sort_unstable();
+    let mut data = Vec::new();
+    let mut prev = 0usize;
+    for (line, proto) in painted {
+        data.extend([(line - prev) as u32, 0, line_len(text, line), 0, proto as u32 | (untraced.contains(&line) as u32) << 1]);
+        prev = line;
     }
     data
 }
 
+/// First line (0-based) of the doc comment and attributes above the item
+/// whose name is on `line`: Rust `///` and `#[..]`, Java `/** .. */` and `@..`.
+fn doc_start(lines: &[&str], line: usize) -> usize {
+    let mut start = line.min(lines.len());
+    while start > 0 {
+        let t = lines[start - 1].trim();
+        if t.starts_with("///") || t.starts_with("#[") || t.starts_with('@') {
+            start -= 1;
+        } else if t.ends_with("*/") && (t.starts_with("/*") || t.starts_with('*')) {
+            match (0..start).rev().find(|&i| lines[i].trim_start().starts_with("/*")) {
+                Some(open) => start = open,
+                None => break,
+            }
+        } else {
+            break;
+        }
+    }
+    start
+}
+
+/// Split Claude's lines into blocks: runs of generated lines that start at
+/// each item (at its doc comment, if it has one) or after one of your lines.
+/// Blank lines belong to whichever block they sit in.
+fn item_blocks(whos: &[Who], text: &str, items: &[Item]) -> Vec<FileBlock> {
+    let lines: Vec<&str> = text.lines().collect();
+    let starts: Vec<usize> = items.iter().filter(|i| i.line > 0).map(|i| doc_start(&lines, i.line - 1)).collect();
+    let mut out = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    let mut close = |run: Option<(usize, usize)>| {
+        let Some((start, end)) = run else { return };
+        let named = |i: usize| items.iter().find(|it| it.line == i + 1);
+        let anchor = (start..=end).find(|&i| named(i).is_some()).or_else(|| (start..=end).find(|&i| !lines[i].trim().is_empty())).unwrap_or(start);
+        let item = named(anchor).or_else(|| items.iter().filter(|it| it.line <= anchor + 1 && anchor < it.end_line).min_by_key(|it| it.end_line - it.line)).map(|it| it.path.clone());
+        out.push(FileBlock { start, end, anchor, item, problems: vec![], untraced: false });
+    };
+    for (i, (l, who)) in lines.iter().zip(whos).enumerate() {
+        if *who != Who::Claude || (starts.contains(&i) && open.is_some()) {
+            close(open.take());
+        }
+        if *who == Who::Claude && !l.trim().is_empty() {
+            open = Some((open.map_or(i, |o| o.0), i));
+        }
+    }
+    close(open.take());
+    out
+}
+
+/// Lenses for one file: implement a prototype item (above its doc comment),
+/// and accept or reject Claude's suggestions in place.
+fn lenses(p: &Project, rel: &str, text: &str, items: &[Item]) -> Vec<Lens> {
+    let lines: Vec<&str> = text.lines().collect();
+    let lens = |line: usize, title: String, command: &str, arguments: Value| Lens { line, title, command: command.into(), arguments };
+    let mut out = Vec::new();
+    let mocked: Vec<&Item> = items.iter().filter(|i| i.mocked().is_some()).collect();
+    if mocked.len() > 1 {
+        out.push(lens(0, format!("▶ Implement all {} prototype items in this file", mocked.len()), "wish.implement", json!([rel, null])));
+    }
+    for it in mocked {
+        out.push(lens(doc_start(&lines, it.line.max(1) - 1), format!("▶ Implement `{}`", it.path), "wish.implement", json!([rel, it.path])));
+    }
+    for s in p.suggestions().into_iter().filter(|s| s.status == Status::Proposed && s.file == rel) {
+        if let Some(at) = text.find(&s.replace) {
+            let l = text[..at].matches('\n').count();
+            let reason: String = s.reason.chars().take(90).collect();
+            out.push(lens(l, format!("✓ Accept suggestion {}: {reason}", s.id), "wish.accept", json!([s.id])));
+            out.push(lens(l, "✗ Reject".into(), "wish.reject", json!([s.id])));
+        }
+    }
+    out
+}
+
 /// Hover text for one line: who wrote it, when, and why (from the journal commit).
-fn hover_markdown(git: &Git, text: &str, line: usize, who: Who, sha: Option<&str>) -> String {
-    use crate::journal::CycleMessage;
-    let Some(sha) = sha else { return "✎ **yours**, not saved yet".into() };
+fn hover_markdown(fs: &FileState, lang: Lang, line: usize) -> String {
+    let (Some(git), Some(&who), Some(sha)) = (&fs.git, fs.whos.get(line), fs.shas.get(line)) else { return String::new() };
+    let Some(sha) = sha.as_deref() else { return "✎ **yours**, not saved yet".into() };
     let Some((msg, age)) = git.message(sha) else { return String::new() };
     let short = &sha[..sha.len().min(8)];
     let m = CycleMessage::parse(&msg);
@@ -726,16 +1137,27 @@ fn hover_markdown(git: &Git, text: &str, line: usize, who: Who, sha: Option<&str
     }
     let mut s = format!("⚙ **generated** · {} · {age}{}", m.label, if m.mode.is_empty() { String::new() } else { format!(" · {}", m.mode) });
     // The innermost item enclosing this line.
-    let item = items::parse(text).unwrap_or_default().into_iter().filter(|i| i.line <= line + 1 && line + 1 <= i.end_line).min_by_key(|i| i.end_line - i.line);
-    let why = item.as_ref().and_then(|i| m.why_for(&i.path).map(|w| (i.path.clone(), w.to_string()))).or_else(|| {
-        // Methods inside trait impls aren't separate items: match the nearest
-        // enclosing `fn name` against reasons given for `Type::name`.
-        let re = regex::Regex::new(r"\bfn\s+(\w+)").unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        let start = item.as_ref().map(|i| i.line.saturating_sub(1)).unwrap_or(0);
+    let item = fs.items.iter().filter(|i| i.line <= line + 1 && line + 1 <= i.end_line).min_by_key(|i| i.end_line - i.line);
+    let why = item.and_then(|i| m.why_for(&i.path).map(|w| (i.path.clone(), w.to_string()))).or_else(|| {
+        // Members that aren't separate items (methods in trait impls): match
+        // the nearest enclosing `fn name` / `name(` against reasons given for `Type::name` / `Type.name`.
+        let re = regex::Regex::new(match lang {
+            Lang::Rust => r"\bfn\s+(\w+)",
+            Lang::Java => r"\b(\w+)\s*\(",
+        })
+        .unwrap();
+        let lines: Vec<&str> = fs.text.lines().collect();
+        let start = item.map(|i| i.line.saturating_sub(1)).unwrap_or(0);
         let name = (start..=line.min(lines.len().saturating_sub(1))).rev().find_map(|l| re.captures(lines[l]).map(|c| c[1].to_string()))?;
-        m.why.iter().find(|(i, _)| i.rsplit("::").next() == Some(name.as_str())).map(|(i, w)| (i.clone(), w.clone()))
+        m.why.iter().find(|w| w.item.split('(').next().and_then(|p| p.rsplit([':', '.']).next()) == Some(name.as_str())).map(|w| (w.item.clone(), w.why.clone()))
     });
+    if let Some(t) = &fs.ticket {
+        let path = why.as_ref().map(|(path, _)| path).or(item.map(|i| &i.path));
+        for id in path.and_then(|path| ticket::problems_of(&t.union, path)).into_iter().flatten() {
+            let text = t.problems.iter().find(|p| p.id == id).map(|p| p.text.as_str()).unwrap_or("");
+            s.push_str(&format!("\n\n**Solves {id}**: {text}"));
+        }
+    }
     match why {
         Some((path, w)) => s.push_str(&format!("\n\n**`{path}`**: {w}")),
         None => {
@@ -764,6 +1186,22 @@ fn parse_cargo(text: &str) -> BTreeMap<String, Vec<Value>> {
             let col = c[3].parse::<u32>().unwrap_or(1).saturating_sub(1);
             let sev = if &c[4] == "error" { 1 } else { 2 };
             m.entry(c[1].to_string()).or_default().push(json!({"range": range(line, col, line, col + 1), "severity": sev, "source": "wishlang (cargo)", "message": c[6].to_string()}));
+        }
+    }
+    m
+}
+
+/// Turn `mvn -q compile` output (`[ERROR] File.java:[line,col] message`, paths
+/// relative to the project) into diagnostics.
+fn parse_mvn(text: &str) -> BTreeMap<String, Vec<Value>> {
+    let re = regex::Regex::new(r"^\[(ERROR|WARNING)\]\s+(\S+\.java):\[(\d+),(\d+)\]\s+(.*)$").unwrap();
+    let mut m: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for l in text.lines() {
+        if let Some(c) = re.captures(l) {
+            let line = c[3].parse::<u32>().unwrap_or(1).saturating_sub(1);
+            let col = c[4].parse::<u32>().unwrap_or(1).saturating_sub(1);
+            let sev = if &c[1] == "ERROR" { 1 } else { 2 };
+            m.entry(c[2].to_string()).or_default().push(json!({"range": range(line, col, line, col + 1), "severity": sev, "source": "wishlang (mvn)", "message": c[5].to_string()}));
         }
     }
     m
@@ -810,6 +1248,7 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::Why;
 
     #[test]
     fn uris_roundtrip() {
@@ -825,7 +1264,20 @@ mod tests {
         let text = "a\n\nbb\nmine\nccc\n";
         let whos = [Claude, Claude, Claude, Human, Claude];
         // line 0 len 1; blank line 1 skipped; line 2 len 2 (+2); line 3 yours; line 4 len 3 (+2, prototype)
-        assert_eq!(encode_tokens(&whos, text, &[(5, 5)]), [0, 0, 1, 0, 0, 2, 0, 2, 0, 0, 2, 0, 3, 0, 1]);
+        let (generated, prototype) = paint_lines(&whos, text, &[(5, 5)]);
+        assert_eq!((&generated[..], &prototype[..]), (&[0, 2][..], &[4][..]));
+        assert_eq!(encode_tokens(text, &generated, &prototype, &[]), [0, 0, 1, 0, 0, 2, 0, 2, 0, 0, 2, 0, 3, 0, 1]);
+        // `untraced` is bit 1 (prototype is bit 0), and can combine with it.
+        assert_eq!(encode_tokens(text, &generated, &prototype, &[2, 4]), [0, 0, 1, 0, 0, 2, 0, 2, 0, 2, 2, 0, 3, 0, 3]);
+    }
+
+    #[test]
+    fn mvn_diagnostics() {
+        let m = parse_mvn("[ERROR] src/main/java/demo/Main.java:[7,42] cannot find symbol\n[ERROR]   symbol:   method open(int,int)\n[WARNING] src/main/java/demo/App.java:[3,1] unchecked call\n[ERROR] -> [Help 1]");
+        assert_eq!(m["src/main/java/demo/Main.java"].len(), 1);
+        assert_eq!(m["src/main/java/demo/Main.java"][0]["severity"], 1);
+        assert_eq!(m["src/main/java/demo/Main.java"][0]["range"]["start"]["character"], 41);
+        assert_eq!(m["src/main/java/demo/App.java"][0]["severity"], 2);
     }
 
     #[test]
@@ -834,5 +1286,268 @@ mod tests {
         assert_eq!(m["src/main.rs"][0]["severity"], 1);
         assert_eq!(m["src/main.rs"][0]["range"]["start"]["line"], 6);
         assert_eq!(m["src/window.rs"][0]["severity"], 2);
+    }
+
+    const APP: &str = "package demo;\n\n/** The app. */\npublic class App {\n    /**\n     * Makes one.\n     * <h2>Mocked</h2>\n     * returns a stub\n     */\n    @Deprecated\n    public static App create(String name) { return new App(); }\n\n    /** Runs it. */\n    public void run() {}\n}\n";
+
+    #[test]
+    fn doc_start_handles_rust_and_java() {
+        let java: Vec<&str> = APP.lines().collect();
+        assert_eq!(doc_start(&java, 10), 4); // create: Javadoc + @Deprecated
+        assert_eq!(doc_start(&java, 3), 2); // class: one-line Javadoc
+        let rust: Vec<&str> = "/// a\n#[derive(Debug)]\nstruct S;".lines().collect();
+        assert_eq!(doc_start(&rust, 2), 0);
+        let none: Vec<&str> = "int x; /* c */\nint y;".lines().collect();
+        assert_eq!(doc_start(&none, 1), 1);
+    }
+
+    #[test]
+    fn paint_lines_are_disjoint() {
+        let items = items::parse(Lang::Java, APP).unwrap();
+        let mocked: Vec<(usize, usize)> = items.iter().filter(|i| i.mocked().is_some()).map(|i| (i.line, i.end_line)).collect();
+        let whos = vec![Who::Claude; APP.lines().count()];
+        let (generated, prototype) = paint_lines(&whos, APP, &mocked);
+        assert_eq!(prototype, [10]);
+        assert!(generated.iter().all(|l| !prototype.contains(l)));
+        assert!(!generated.contains(&1)); // blank lines are never painted
+    }
+
+    #[test]
+    fn blocks_start_at_items_and_their_docs() {
+        let items = items::parse(Lang::Java, APP).unwrap();
+        let whos = vec![Who::Claude; APP.lines().count()];
+        let blocks = item_blocks(&whos, APP, &items);
+        let got: Vec<(usize, usize, usize, Option<&str>)> = blocks.iter().map(|b| (b.start, b.end, b.anchor, b.item.as_deref())).collect();
+        // The package line, the class header, `create` with Javadoc and annotation, and `run` with the closing brace.
+        assert_eq!(got, [(0, 0, 0, None), (2, 3, 3, Some("App")), (4, 10, 10, Some("App.create")), (12, 14, 13, Some("App.run"))]);
+        // Your lines split blocks too.
+        let mut mixed = whos.clone();
+        mixed[10] = Who::Human;
+        assert_eq!(item_blocks(&mixed, APP, &items).iter().map(|b| (b.start, b.end)).collect::<Vec<_>>(), [(0, 0), (2, 3), (4, 9), (12, 14)]);
+    }
+
+    // ---- in-process server on a temp git repo ----
+
+    use std::process::Command as Cmd;
+
+    fn temp_project() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wish-lsp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let java = dir.join("src/main/java/demo");
+        std::fs::create_dir_all(&java).unwrap();
+        std::fs::write(dir.join("pom.xml"), "<project/>").unwrap();
+        std::fs::write(dir.join("wish.toml"), "[protected]\nfiles = [\"src/main/java/demo/Main.java\"]\n").unwrap();
+        std::fs::write(java.join("Main.java"), "package demo;\n\npublic class Main {\n    public static void main(String[] args) {\n        App.create(\"Demo\").run();\n        new Window(800, 600).show();\n    }\n}\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), ".work/\n").unwrap();
+        // The ticket's notes live in the main checkout, which is this directory.
+        let notes = dir.join(".work/DEMO-1");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("intent.md"), "# DEMO-1 — Open the demo window\n\nThe demo should open a window.\n").unwrap();
+        std::fs::write(notes.join("problems.json"), r#"[{"id": "P1", "text": "The demo window does not open", "scenarios": ["Open the window"]}, {"id": "P2", "text": "Closing the window leaves the app running"}]"#).unwrap();
+        for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"], &["checkout", "-qb", "feature/DEMO-1-window"]] {
+            assert!(Cmd::new("git").args(args).current_dir(&dir).status().unwrap().success());
+        }
+        dir
+    }
+
+    /// A client for an in-process server: sends requests and waits for their responses.
+    struct Client {
+        conn: Connection,
+        next: i32,
+        changed: usize,
+        /// `window/showMessage` texts received so far.
+        shown: Vec<String>,
+        /// The latest diagnostics published per document uri.
+        diagnostics: HashMap<String, Vec<Value>>,
+        /// `window/showDocument` requests received so far.
+        documents: Vec<Value>,
+    }
+
+    impl Client {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            self.next += 1;
+            let id = RequestId::from(self.next);
+            self.conn.sender.send(Message::Request(Request::new(id.clone(), method.into(), params))).unwrap();
+            loop {
+                match self.conn.receiver.recv_timeout(std::time::Duration::from_secs(20)).expect("server went quiet") {
+                    Message::Response(r) if r.id == id => return r.response_result.map_err(|e| e.message),
+                    Message::Request(r) => {
+                        if r.method == "window/showDocument" {
+                            self.documents.push(r.params.clone());
+                        }
+                        self.conn.sender.send(Message::Response(Response::new_ok(r.id, Value::Null))).unwrap();
+                    }
+                    Message::Notification(n) if n.method == "textDocument/publishDiagnostics" => {
+                        self.diagnostics.insert(n.params["uri"].as_str().unwrap_or("").to_string(), n.params["diagnostics"].as_array().cloned().unwrap_or_default());
+                    }
+                    Message::Notification(n) if n.method == "wish/changed" => self.changed += 1,
+                    Message::Notification(n) if n.method == "window/showMessage" => self.shown.push(n.params["message"].as_str().unwrap_or("").to_string()),
+                    _ => {}
+                }
+            }
+        }
+
+        fn ok(&mut self, method: &str, params: Value) -> Value {
+            self.call(method, params).unwrap_or_else(|e| panic!("{method}: {e}"))
+        }
+
+        fn notify(&self, method: &str, params: Value) {
+            self.conn.sender.send(Message::Notification(Notification::new(method.into(), params))).unwrap();
+        }
+    }
+
+    fn start(dir: &Path) -> (Client, std::thread::JoinHandle<Result<()>>) {
+        let (server_side, client_side) = Connection::memory();
+        let handle = std::thread::spawn(move || run_with(server_side));
+        let mut c = Client { conn: client_side, next: 0, changed: 0, shown: vec![], diagnostics: HashMap::new(), documents: vec![] };
+        c.ok("initialize", json!({"capabilities": {}, "workspaceFolders": [{"uri": path_to_uri(dir)}]}));
+        c.notify("initialized", json!({}));
+        (c, handle)
+    }
+
+    fn stop(mut c: Client, handle: std::thread::JoinHandle<Result<()>>) {
+        c.ok("shutdown", Value::Null);
+        c.notify("exit", Value::Null);
+        handle.join().unwrap().unwrap();
+    }
+
+    /// With WISH_BLESS=1, record a response (shas, ages and paths normalised) as test data for the IntelliJ plugin.
+    fn bless(name: &str, value: &Value, root: &Path) {
+        if std::env::var("WISH_BLESS").is_err() {
+            return;
+        }
+        let mut text = serde_json::to_string_pretty(value).unwrap();
+        for dir in [root.canonicalize().unwrap(), root.to_path_buf()] {
+            text = text.replace(&dir.display().to_string(), "<root>");
+        }
+        for (re, to) in [(r"\b[0-9a-f]{40}\b", "<sha>"), (r"git show [0-9a-f]{8}", "git show <sha>"), (r"\d+ (second|minute|hour|day|week|month|year)s? ago", "<age>")] {
+            text = regex::Regex::new(re).unwrap().replace_all(&text, to).to_string();
+        }
+        let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../intellij/src/test/testData");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join(format!("{name}.json")), text + "\n").unwrap();
+    }
+
+    #[test]
+    fn serves_file_state_over_lsp() {
+        let dir = temp_project();
+        // Two ticket cycles on top of the baseline, as the engine would record them: the first adds
+        // two files and tags `create` with P1 and `run` with nothing, the second adds P2 to `create`.
+        let (project, git) = (Project::load(&dir).unwrap(), Git::open(&dir).unwrap());
+        let base = engine::ensure_journal(&project, &git).unwrap();
+        let ticket_cycle = |why: Vec<Why>| CycleMessage { label: "cycle ok".into(), summary: "Added App.".into(), why, mode: "prototype".into(), ticket: Some("DEMO-1".into()), ..Default::default() };
+        let tagged = |item: &str, problems: &[&str]| Why { item: item.into(), why: format!("Main calls {item}."), problems: problems.iter().map(|p| p.to_string()).collect() };
+        std::fs::write(dir.join("src/main/java/demo/App.java"), APP).unwrap();
+        std::fs::write(dir.join("src/main/java/demo/Quit.java"), "package demo;\n\n/** Quits. */\nclass Quit {}\n").unwrap();
+        let first = git.snapshot(&[&base], Who::Claude, &ticket_cycle(vec![tagged("App.create", &["P1"]), tagged("App.run", &[])]).render()).unwrap();
+        let second = git.snapshot(&[&first], Who::Claude, &ticket_cycle(vec![tagged("App.create", &["P2"])]).render()).unwrap();
+        git.set_ref(&git.ref_name("journal"), &second).unwrap();
+        let (mut c, handle) = start(&dir);
+        let uri = |f: &str| path_to_uri(&dir.join("src/main/java/demo").join(f));
+        let app_uri = uri("App.java");
+        for (f, text) in [("Main.java", std::fs::read_to_string(dir.join("src/main/java/demo/Main.java")).unwrap()), ("App.java", APP.to_string())] {
+            c.notify("textDocument/didOpen", json!({"textDocument": {"uri": uri(f), "languageId": "java", "version": 1, "text": text}}));
+        }
+
+        // Generated code, the prototype `create`, and the blocks with their anchored hover.
+        let st = c.ok("wish/fileState", json!({"textDocument": {"uri": app_uri}}));
+        bless("fileState", &st, &dir);
+        assert_eq!(st["prototype"].as_array().unwrap().len(), 1);
+        assert_eq!(st["prototype"][0]["start"]["line"], 10);
+        assert!(st["generated"].as_array().unwrap().iter().all(|r| r["start"]["line"] != 10));
+        let block = |item: &str| st["blocks"].as_array().unwrap().iter().find(|b| b["item"] == item).unwrap().clone();
+        let create = block("App.create");
+        assert_eq!((create["start"].as_u64(), create["end"].as_u64()), (Some(4), Some(10)));
+        assert!(create["hover"].as_str().unwrap().contains("generated"));
+        assert!(st["lenses"].as_array().unwrap().iter().any(|l| l["line"] == 4 && l["command"] == "wish.implement"));
+
+        // Ticket tracing: `create` serves P1 and P2 (united over both cycles); `run` was tagged with nothing.
+        assert_eq!((create["problems"].clone(), create["untraced"].clone()), (json!(["P1", "P2"]), json!(false)));
+        let (run, class) = (block("App.run"), block("App"));
+        assert_eq!((run["problems"].clone(), run["untraced"].clone()), (json!([]), json!(true)));
+        assert_eq!(class["untraced"], false); // `App` itself was never in a ticket cycle
+        assert!(create["hover"].as_str().unwrap().contains("**Solves P1**: The demo window does not open"));
+        assert!(create["hover"].as_str().unwrap().contains("**Solves P2**: Closing the window leaves the app running"));
+        assert!(!run["hover"].as_str().unwrap().contains("Solves"));
+        let ticket_lens = st["lenses"].as_array().unwrap().iter().filter(|l| l["command"] == "wish.ticket.open").cloned().collect::<Vec<_>>();
+        assert_eq!(ticket_lens.len(), 1);
+        assert_eq!((ticket_lens[0]["line"].clone(), ticket_lens[0]["title"].clone(), ticket_lens[0]["arguments"].clone()), (json!(4), json!("◆ P1 · P2"), json!(["P1"])));
+        let marks = c.diagnostics.get(&app_uri).cloned().unwrap_or_default();
+        let untraced = marks.iter().find(|d| d["code"] == "untraced").expect("untraced diagnostic");
+        assert_eq!((untraced["severity"].clone(), untraced["source"].clone(), untraced["message"].clone()), (json!(2), json!("wishlang"), json!("serves no problem of DEMO-1")));
+        assert_eq!(untraced["range"]["start"]["line"], APP.lines().position(|l| l.contains("run() {}")).unwrap());
+        // The lens opens problems.json at P2's line.
+        c.ok("workspace/executeCommand", json!({"command": "wish.ticket.open", "arguments": ["P2"]}));
+        c.ok("wish/log", Value::Null);
+        assert!(c.documents[0]["uri"].as_str().unwrap().ends_with(".work/DEMO-1/problems.json"));
+
+        // Your protected file has no generated lines; the wished `Window` is pending.
+        let main = c.ok("wish/fileState", json!({"textDocument": {"uri": uri("Main.java")}}));
+        assert!(main["generated"].as_array().unwrap().is_empty());
+        assert!(main["pending"].as_array().unwrap().iter().any(|p| p["name"] == "Window"));
+
+        // The standard handlers answer from the same state.
+        let tokens = c.ok("textDocument/semanticTokens/full", json!({"textDocument": {"uri": app_uri}}));
+        assert!(!tokens["data"].as_array().unwrap().is_empty());
+        let hover = c.ok("textDocument/hover", json!({"textDocument": {"uri": app_uri}, "position": {"line": 13, "character": 4}}));
+        assert!(hover["contents"]["value"].as_str().unwrap().contains("generated"));
+
+        // wish/log: newest first, with each reason located in the code, its problems, files with line counts.
+        let log = c.ok("wish/log", Value::Null);
+        bless("log", &log, &dir);
+        let entries = log["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!((entries[0]["sha"].as_str(), entries[0]["label"].as_str(), entries[0]["author"].as_str(), entries[0]["ticket"].as_str()), (Some(second.as_str()), Some("cycle ok"), Some("claude"), Some("DEMO-1")));
+        assert_eq!(entries[1]["why"][0], json!({"item": "App.create", "why": "Main calls App.create.", "problems": ["P1"], "file": "src/main/java/demo/App.java", "line": 11}));
+        assert_eq!(entries[1]["why"][1]["problems"], json!([]));
+        assert_eq!(entries[1]["summary"], "Added App.");
+        assert_eq!(entries[3]["author"], "you");
+        let two_files = json!([{"path": "src/main/java/demo/App.java", "added": APP.lines().count(), "removed": 0}, {"path": "src/main/java/demo/Quit.java", "added": 4, "removed": 0}]);
+        assert_eq!(entries[1]["files"], two_files);
+        assert_eq!(log["problems"], json!([{"id": "P1", "text": "The demo window does not open"}, {"id": "P2", "text": "Closing the window leaves the app running"}]));
+        assert_eq!(log["decisions"], json!([]));
+
+        // wish/ticket: problems with their items and reasons per cycle, untraced items, and the ticket's whole diff.
+        let t = c.ok("wish/ticket", Value::Null);
+        bless("ticket", &t, &dir);
+        assert_eq!((t["key"].as_str(), t["title"].as_str(), t["cycles"].as_u64()), (Some("DEMO-1"), Some("Open the demo window"), Some(2)));
+        assert_eq!((t["head"].as_str(), t["base"].as_str()), (Some(second.as_str()), Some(format!("{first}^").as_str())));
+        let items = |problem: usize| t["problems"][problem]["items"].as_array().unwrap().clone();
+        assert_eq!(items(0).len(), 1);
+        assert_eq!((items(0)[0]["item"].clone(), items(0)[0]["line"].clone(), items(0)[0]["reasons"].as_array().unwrap().len()), (json!("App.create"), json!(11), 1));
+        assert_eq!(items(1)[0]["reasons"][0]["sha"], second.as_str());
+        assert_eq!(t["problems"][0]["scenarios"], json!(["Open the window"]));
+        assert_eq!(t["untraced"].as_array().unwrap().iter().map(|i| i["item"].clone()).collect::<Vec<_>>(), [json!("App.run")]);
+        assert_eq!(t["files"], two_files);
+        assert!(t["notesDir"].as_str().unwrap().ends_with(".work/DEMO-1"));
+        assert!(t["root"].as_str().unwrap().starts_with("file:///"));
+
+        // Editing the problems validates, saves and refreshes; a bad edit shows a message and changes nothing.
+        let edit = |c: &mut Client, ps: Value| c.ok("workspace/executeCommand", json!({"command": "wish.ticket.edit", "arguments": [ps]}));
+        let before = c.changed;
+        edit(&mut c, json!([{"id": "P1", "text": "Only one now", "scenarios": []}]));
+        assert!(c.changed > before);
+        assert_eq!(c.ok("wish/ticket", Value::Null)["problems"].as_array().unwrap().len(), 1);
+        edit(&mut c, json!([]));
+        assert!(c.ok("wish/ticket", Value::Null)["problems"].as_array().unwrap().len() == 1);
+        c.ok("wish/log", Value::Null);
+        assert!(c.shown.iter().any(|m| m.contains("1 to 8 problems")), "{:?}", c.shown);
+
+        // wish/show: the file before and after a journal commit, with validated arguments.
+        let tip = entries[1]["sha"].as_str().unwrap().to_string();
+        let shown = c.ok("wish/show", json!({"sha": tip, "path": "src/main/java/demo/App.java"}));
+        assert_eq!((shown["before"].as_str(), shown["after"].as_str()), (Some(""), Some(APP)));
+        for bad in [json!({"sha": "--output=x", "path": "pom.xml"}), json!({"sha": tip, "path": "../x"}), json!({"sha": tip, "path": "/etc/passwd"}), json!({"sha": tip, "path": "pom.xml", "base": "HEAD"}), json!({"sha": "deadbeefdead", "path": "pom.xml"})] {
+            assert!(c.call("wish/show", bad).is_err());
+        }
+
+        // A syntax error keeps the last good markers.
+        c.notify("textDocument/didChange", json!({"textDocument": {"uri": app_uri, "version": 2}, "contentChanges": [{"text": APP.replace("run() {}", "run() {")}]}));
+        let broken = c.ok("wish/fileState", json!({"textDocument": {"uri": app_uri}}));
+        assert!(broken["blocks"].as_array().unwrap().iter().any(|b| b["item"] == "App.create"));
+        assert!(c.changed > 0);
+
+        stop(c, handle);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

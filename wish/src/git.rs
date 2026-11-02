@@ -21,7 +21,9 @@
 //! it was made on.
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use std::io::Write;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -38,6 +40,9 @@ impl Who {
             Who::Claude => ("claude", "claude@wishlang"),
         }
     }
+    pub fn name(self) -> &'static str {
+        self.ident().0
+    }
     fn from_mail(mail: &str) -> Who {
         if mail.contains("claude@wishlang") { Who::Claude } else { Who::Human }
     }
@@ -51,11 +56,25 @@ pub struct JournalRef {
     pub sha: String,
 }
 
+/// Lines added and removed in one file (`git diff --numstat`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FileStat {
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub sha: String,
     pub who: Who,
     pub subject: String,
+    /// The rest of the commit message.
+    pub body: String,
+    /// "5 minutes ago".
+    pub age: String,
+    /// Files changed against the first parent.
+    pub files: Vec<FileStat>,
     pub parent: Option<String>,
     /// Parents beyond the first: reverted attempts / undone cycles.
     pub side: Vec<String>,
@@ -215,6 +234,40 @@ impl Git {
         self.commit(&tree, parents, who, msg)
     }
 
+    /// Tree of commit `rev` limited to the project (its directory, at its place in the repository),
+    /// the shape of a journal snapshot.
+    pub fn tree_at(&self, rev: &str) -> Result<String> {
+        if self.prefix.is_empty() {
+            return self.tree_of(rev).with_context(|| format!("{rev} has no tree"));
+        }
+        let _ = std::fs::remove_file(&self.index);
+        self.run(&["read-tree", "--empty"], true, Who::Human, None)?;
+        let sub = format!("{rev}:{}", self.prefix.trim_end_matches('/'));
+        if self.resolve(&sub).is_some() {
+            self.run(&["read-tree", &format!("--prefix={}", self.prefix), &sub], true, Who::Human, None)?;
+        }
+        let tree = self.run(&["write-tree"], true, Who::Human, None)?;
+        let _ = std::fs::remove_file(&self.index);
+        Ok(tree.trim().to_string())
+    }
+
+    /// The code commits after `base` up to HEAD, oldest first, along the first parent.
+    pub fn first_parent_commits(&self, base: &str) -> Result<Vec<String>> {
+        Ok(self.git(&["rev-list", "--reverse", "--first-parent", &format!("{base}..HEAD")])?.lines().map(String::from).collect())
+    }
+
+    /// A commit's subject and body.
+    pub fn subject_body(&self, sha: &str) -> Result<(String, String)> {
+        let out = self.git(&["log", "-1", "--format=%s%x1f%b", sha])?;
+        let (s, b) = out.split_once('\x1f').unwrap_or((out.as_str(), ""));
+        Ok((s.trim().to_string(), b.trim().to_string()))
+    }
+
+    /// A file of wish's own in the git directory (never in a snapshot), per project.
+    pub fn private_file(&self, name: &str) -> PathBuf {
+        self.index.with_file_name(format!("wish-{}{name}", self.prefix.replace('/', "_")))
+    }
+
     pub fn tree_of(&self, sha: &str) -> Option<String> {
         self.resolve(&format!("{sha}^{{tree}}"))
     }
@@ -258,6 +311,26 @@ impl Git {
 
     /// Every journal of this project: local ones for each branch, and ones
     /// fetched from remotes by `wish sync`.
+    /// Branch -> the directory of the worktree that has it checked out (this checkout included).
+    pub fn worktrees(&self) -> BTreeMap<String, PathBuf> {
+        let mut out = BTreeMap::new();
+        let Ok(o) = self.git(&["worktree", "list", "--porcelain"]) else { return out };
+        let mut dir = None;
+        for l in o.lines() {
+            if let Some(d) = l.strip_prefix("worktree ") {
+                dir = Some(PathBuf::from(d));
+            } else if let (Some(b), Some(d)) = (l.strip_prefix("branch refs/heads/"), &dir) {
+                out.insert(b.to_string(), d.clone());
+            }
+        }
+        out
+    }
+
+    /// The project directory inside another checkout of the repository (the same `prefix` below it).
+    pub fn project_in(&self, checkout: &Path) -> PathBuf {
+        checkout.join(self.prefix.trim_end_matches('/'))
+    }
+
     pub fn journals(&self) -> Vec<JournalRef> {
         let mut out = Vec::new();
         let local = format!("refs/wish/{}journal/", self.prefix);
@@ -368,6 +441,11 @@ impl Git {
         self.git(&["show", &format!("{sha}:./{rel}")]).ok()
     }
 
+    /// Lines added and removed per file between two snapshots.
+    pub fn numstat(&self, a: &str, b: &str) -> Result<Vec<FileStat>> {
+        Ok(parse_numstat(&self.git(&["diff", "--relative", "--numstat", "--no-renames", a, b])?))
+    }
+
     /// (status, path) for files that differ between two snapshots.
     pub fn changed(&self, a: &str, b: &str) -> Result<Vec<(char, String)>> {
         let out = self.git(&["diff", "--relative", "--name-status", "--no-renames", a, b])?;
@@ -424,14 +502,22 @@ impl Git {
 
     /// The journal's first-parent history, newest first.
     pub fn history(&self, rev: &str) -> Vec<Entry> {
-        let Ok(out) = self.git(&["log", "--first-parent", "--format=%H%x1f%P%x1f%ae%x1f%s%x1f%b%x1e", rev]) else { return vec![] };
+        let Ok(out) = self.git(&["log", "--first-parent", "--relative", "--numstat", "--format=%x1e%H%x1f%P%x1f%ae%x1f%ar%x1f%s%x1f%b%x1f", rev]) else { return vec![] };
         out.split('\x1e')
             .filter_map(|rec| {
-                let f: Vec<&str> = rec.trim_start_matches('\n').split('\x1f').collect();
-                if f.len() < 5 {
-                    return None;
-                }
-                Some(Entry { sha: f[0].into(), parent: f[1].split_whitespace().next().map(String::from), side: f[1].split_whitespace().skip(1).map(String::from).collect(), who: Who::from_mail(f[2]), subject: f[3].into() })
+                let f: Vec<&str> = rec.trim_start_matches('\n').splitn(7, '\x1f').collect();
+                let [sha, parents, mail, age, subject, body, stat] = f[..] else { return None };
+                let mut parents = parents.split_whitespace();
+                Some(Entry {
+                    sha: sha.into(),
+                    parent: parents.next().map(String::from),
+                    side: parents.map(String::from).collect(),
+                    who: Who::from_mail(mail),
+                    subject: subject.into(),
+                    body: body.trim().into(),
+                    age: age.into(),
+                    files: parse_numstat(stat),
+                })
             })
             .collect()
     }
@@ -488,4 +574,15 @@ impl Git {
     pub fn subject(&self, sha: &str) -> String {
         self.git(&["log", "-1", "--format=%s", sha]).map(|s| s.trim().to_string()).unwrap_or_default()
     }
+}
+
+/// Parse `git diff --numstat` lines (`added<TAB>removed<TAB>path`; binary files count as 0).
+pub fn parse_numstat(text: &str) -> Vec<FileStat> {
+    text.lines()
+        .filter_map(|l| {
+            let mut it = l.splitn(3, '\t');
+            let (added, removed, path) = (it.next()?, it.next()?, it.next()?);
+            Some(FileStat { path: path.into(), added: added.parse().unwrap_or(0), removed: removed.parse().unwrap_or(0) })
+        })
+        .collect()
 }

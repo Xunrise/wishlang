@@ -1,8 +1,10 @@
 //! "Will be generated": references in a buffer that the vocabulary doesn't
-//! define yet. Purely syntactic (syn), so it works on unsaved buffers and in
-//! milliseconds, at the cost of being a heuristic rather than type-aware.
+//! define yet. Purely syntactic (syn for Rust, tree-sitter for Java, see
+//! `java.rs`), so it works on unsaved buffers and in milliseconds, at the cost
+//! of being a heuristic rather than type-aware.
 
 use crate::items::Item;
+use crate::project::Lang;
 use proc_macro2::Span;
 use std::collections::BTreeSet;
 use syn::visit::{self, Visit};
@@ -16,24 +18,117 @@ pub struct Pending {
 }
 
 /// What the project already defines.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Known {
     paths: BTreeSet<String>,
     /// Last path segments of everything (variants, methods, types, fns).
     names: BTreeSet<String>,
+    /// Last path segment -> the declared types of the members by that name (Java fields and methods).
+    types: std::collections::BTreeMap<String, BTreeSet<String>>,
+    /// Every path's trailing segments (`Rejection.BLANK` of `Validator.Rejection.BLANK`): how a nested
+    /// type is referred to inside its outer type.
+    tails: BTreeSet<String>,
+    /// Simple names of the types (Java classes, interfaces, enums, records; Rust types), nested ones too.
+    type_names: BTreeSet<String>,
+    /// Path (and each multi-segment tail of it) -> declared types, for `Codes.VALUES`-style lookups.
+    path_types: std::collections::BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Known {
     pub fn from_items<'a>(items: impl IntoIterator<Item = &'a Item>) -> Self {
         let mut k = Known::default();
-        for i in items {
-            k.paths.insert(i.path.clone());
-            if let Some(last) = i.path.rsplit("::").next() {
-                k.names.insert(last.to_string());
-            }
-        }
+        k.add(items);
         k
     }
+
+    pub fn add<'a>(&mut self, items: impl IntoIterator<Item = &'a Item>) {
+        for i in items {
+            self.add_member(&i.path, i.ty.as_deref());
+            if matches!(i.kind, "class" | "interface" | "enum" | "record" | "struct" | "trait" | "type") {
+                if let Some(last) = i.path.rsplit([':', '.']).next() {
+                    self.type_names.insert(last.to_string());
+                }
+            }
+        }
+    }
+
+    /// A member that is not an item of its own, e.g. a Java record's accessor or an enum's `values()`.
+    pub fn add_member(&mut self, path: &str, ty: Option<&str>) {
+        // An overload (`Window.open(int)`) also defines the bare `Window.open`.
+        let bare = path.split('(').next().unwrap_or(path);
+        self.paths.insert(path.to_string());
+        self.paths.insert(bare.to_string());
+        if let Some(t) = ty {
+            self.path_types.entry(bare.to_string()).or_default().insert(t.to_string());
+        }
+        let mut rest = bare;
+        while let Some((_, tail)) = rest.split_once('.') {
+            if tail.contains('.') {
+                self.tails.insert(tail.to_string());
+                if let Some(t) = ty {
+                    self.path_types.entry(tail.to_string()).or_default().insert(t.to_string());
+                }
+            }
+            rest = tail;
+        }
+        if let Some(last) = bare.rsplit([':', '.']).next() {
+            self.names.insert(last.to_string());
+            if let Some(t) = ty {
+                self.types.entry(last.to_string()).or_default().insert(t.to_string());
+            }
+        }
+    }
+
+    /// Everything `other` knows, added to this.
+    pub fn merge(&mut self, other: &Known) {
+        self.paths.extend(other.paths.iter().cloned());
+        self.names.extend(other.names.iter().cloned());
+        self.tails.extend(other.tails.iter().cloned());
+        self.type_names.extend(other.type_names.iter().cloned());
+        for (k, v) in &other.types {
+            self.types.entry(k.clone()).or_default().extend(v.iter().cloned());
+        }
+        for (k, v) in &other.path_types {
+            self.path_types.entry(k.clone()).or_default().extend(v.iter().cloned());
+        }
+    }
+
+    /// A path, or the trailing segments of one (a nested type named from inside its outer type).
+    pub fn has_path_or_tail(&self, p: &str) -> bool {
+        self.paths.contains(p) || self.tails.contains(p) || self.type_names.contains(p)
+    }
+
+    /// Is `n` the simple name of a type?
+    pub fn is_type(&self, n: &str) -> bool {
+        self.type_names.contains(n)
+    }
+
+    pub fn has_path(&self, p: &str) -> bool {
+        self.paths.contains(p)
+    }
+
+    pub fn has_name(&self, n: &str) -> bool {
+        self.names.contains(n)
+    }
+
+    /// The declared types of the member at `path` (`Codes.VALUES`, or a nested `Inner.f`), if known.
+    pub fn types_at(&self, path: &str) -> Option<&BTreeSet<String>> {
+        self.path_types.get(path)
+    }
+
+    /// The declared types of the members named `n`, if any are known.
+    pub fn types_of(&self, n: &str) -> Option<&BTreeSet<String>> {
+        self.types.get(n)
+    }
+}
+
+/// LSP columns count UTF-16 code units; syn counts chars and tree-sitter bytes.
+pub fn utf16_col_from_chars(line: &str, col: usize) -> u32 {
+    line.chars().take(col).map(|c| c.len_utf16() as u32).sum()
+}
+
+pub fn utf16_col_from_bytes(line: &str, col: usize) -> u32 {
+    line.char_indices().take_while(|(i, _)| *i < col).map(|(_, c)| c.len_utf16() as u32).sum()
 }
 
 /// Names that come from std's prelude or are otherwise always available.
@@ -51,6 +146,7 @@ fn upper(s: &str) -> bool {
 }
 
 struct V<'a> {
+    lines: Vec<&'a str>,
     known: &'a Known,
     /// Names imported from outside the project (`use winit::window::Window`).
     imported: &'a BTreeSet<String>,
@@ -60,7 +156,9 @@ struct V<'a> {
 impl V<'_> {
     fn push(&mut self, name: String, a: Span, b: Span) {
         let (s, e) = (a.start(), b.end());
-        self.out.push(Pending { name, start: (s.line as u32 - 1, s.column as u32), end: (e.line as u32 - 1, e.column as u32) });
+        let col = |l: proc_macro2::LineColumn| utf16_col_from_chars(self.lines.get(l.line - 1).copied().unwrap_or(""), l.column);
+        let (start, end) = ((s.line as u32 - 1, col(s)), (e.line as u32 - 1, col(e)));
+        self.out.push(Pending { name, start, end });
     }
 
     fn is_known_type(&self, t: &str) -> bool {
@@ -183,20 +281,22 @@ impl<'ast> Visit<'ast> for V<'_> {
 }
 
 /// Find references in `src` that `known` doesn't define. None if `src` doesn't parse.
-pub fn find(src: &str, known: &Known) -> Option<Vec<Pending>> {
+pub fn find(lang: Lang, src: &str, known: &Known) -> Option<Vec<Pending>> {
+    match lang {
+        Lang::Rust => find_rust(src, known),
+        Lang::Java => crate::java::find_pending(src, known),
+    }
+}
+
+fn find_rust(src: &str, known: &Known) -> Option<Vec<Pending>> {
     let file = syn::parse_file(src).ok()?;
     // Items defined in this very buffer count as known too.
-    let own = crate::items::parse(src).unwrap_or_default();
-    let mut k = Known { paths: known.paths.clone(), names: known.names.clone() };
-    for i in &own {
-        k.paths.insert(i.path.clone());
-        if let Some(last) = i.path.rsplit("::").next() {
-            k.names.insert(last.to_string());
-        }
-    }
+    let own = crate::items::parse(Lang::Rust, src).unwrap_or_default();
+    let mut k = known.clone();
+    k.add(&own);
     // Generic parameters and use-imported names are in scope, so they're known too.
     let imported = imported_names(&file);
-    let mut v = V { known: &k, imported: &imported, out: Vec::new() };
+    let mut v = V { lines: src.lines().collect(), known: &k, imported: &imported, out: Vec::new() };
     v.visit_file(&file);
     v.out.retain(|p| !imported.contains(p.name.split("::").next().unwrap_or("")));
     v.out.sort_by_key(|p| p.start);
@@ -244,13 +344,13 @@ mod tests {
     use super::*;
 
     fn known(src: &str) -> Known {
-        Known::from_items(&crate::items::parse(src).unwrap())
+        Known::from_items(&crate::items::parse(Lang::Rust, src).unwrap())
     }
 
     const VOCAB: &str = "pub struct App; impl App { pub fn new(_: &str) -> Self { App } pub fn window(self) -> W { W } } pub struct W; impl W { pub fn open(self, _: Mode) -> W { self } pub fn run(self) {} } pub enum Mode { Maximized }";
 
     fn names(src: &str) -> Vec<String> {
-        find(src, &known(VOCAB)).unwrap().into_iter().map(|p| p.name).collect()
+        find(Lang::Rust, src, &known(VOCAB)).unwrap().into_iter().map(|p| p.name).collect()
     }
 
     #[test]
@@ -276,13 +376,20 @@ mod tests {
 
     #[test]
     fn positions() {
-        let p = find("fn main() {\n    Mode::Windowed(1, 2);\n}", &known(VOCAB)).unwrap();
+        let p = find(Lang::Rust, "fn main() {\n    Mode::Windowed(1, 2);\n}", &known(VOCAB)).unwrap();
         assert_eq!(p[0].start, (1, 4));
         assert_eq!(p[0].end, (1, 18));
     }
 
     #[test]
+    fn columns_are_utf16() {
+        // The emoji is one char but two UTF-16 units.
+        let p = find(Lang::Rust, "fn main() { let s = \"😀\"; Mode::Windowed(1, 2); }", &known(VOCAB)).unwrap();
+        assert_eq!(p[0].start.1, 26);
+    }
+
+    #[test]
     fn unparseable_is_none() {
-        assert!(find("fn main() { App::new(", &known(VOCAB)).is_none());
+        assert!(find(Lang::Rust, "fn main() { App::new(", &known(VOCAB)).is_none());
     }
 }

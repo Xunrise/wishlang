@@ -15,6 +15,9 @@ impl Preview {
     /// (Re)start the app; each output line is passed to `on_line`.
     pub fn restart(&mut self, p: &Project, on_line: impl Fn(String) + Send + Clone + 'static) -> std::io::Result<()> {
         self.stop();
+        if !p.preview_enabled() {
+            return Ok(());
+        }
         let mut c = engine::spawn_preview(p, true)?;
         let streams: Vec<Box<dyn Read + Send>> = [c.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>), c.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>)].into_iter().flatten().collect();
         for stream in streams {

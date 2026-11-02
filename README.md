@@ -1,6 +1,6 @@
 # wishlang
 
-Create-from-usage for Rust. You write the call sites you wish existed; Claude writes the vocabulary underneath, first as a skimmable **prototype**, then, once you're happy, as the real **implementation**. The app restarts on every save so you see each change.
+Create-from-usage for Rust and Java (Maven), in Zed and IntelliJ. You write the call sites you wish existed; Claude writes the vocabulary underneath, first as a skimmable **prototype**, then, once you're happy, as the real **implementation**. The app restarts on every save so you see each change.
 
 ```rust
 fn main() {
@@ -8,7 +8,7 @@ fn main() {
 }
 ```
 
-The project stays normal, clean Rust. The only extra files are `wish.toml`, `DECISIONS.md`, `.wish/` and `.zed/settings.json`.
+The project stays normal, clean Rust (or Java). The only extra files are `wish.toml`, `DECISIONS.md`, `.wish/` and, for Zed, `.zed/settings.json`.
 
 ## Install
 
@@ -18,20 +18,91 @@ cargo install --path wish        # puts `wish` on PATH (Zed looks for it there, 
 
 Then, in Zed, open the command palette, run **zed: install dev extension**, and pick the `zed/` folder of this repo.
 
-The blue comes from two semantic token rules in your Zed **user** settings (Zed only reads `global_lsp_settings` there):
+The colors come from three semantic token rules in your Zed **user** settings (Zed only reads `global_lsp_settings` there):
 
 ```json
 "global_lsp_settings": {
   "semantic_token_rules": [
+    { "token_type": "generated", "token_modifiers": ["untraced"], "background_color": "#dc26262e" },
     { "token_type": "generated", "token_modifiers": ["prototype"], "background_color": "#3b82f633", "font_style": "italic" },
     { "token_type": "generated", "background_color": "#3b82f61f" }
   ]
 }
 ```
 
-They only match the token type `generated`, which only `wish lsp` emits. The project's `.zed/settings.json` turns on `"semantic_tokens": "combined"` for Rust. After changing settings, run `editor: restart language server` once.
+Zed applies the first rule that matches, so the more specific ones come first (untraced beats prototype). They only match the token type `generated`, which only `wish lsp` emits. The project's `.zed/settings.json` turns on `"semantic_tokens": "combined"` for Rust. After changing settings, run `editor: restart language server` once.
 
 Requires Claude Code (`claude`) on PATH and a git repository (`wish init` creates one). Set `WISH_MODEL=sonnet` for faster cycles.
+
+## Java
+
+A project with a `pom.xml` is a Java project; otherwise `Cargo.toml` makes it a Rust one. The same loop applies, with these differences:
+
+- **Check:** `mvn -q compile` instead of `cargo check`.
+- **Run:** the app is started as `java -cp target/classes <main class>`. The class is `[java] main_class` in `wish.toml`, else `<mainClass>` in `pom.xml`, else `Main`.
+- **Prototypes:** a Javadoc `<h2>Mocked</h2>` section marks an item as mocked (the counterpart of `# Mocked`).
+- **Protected files** (`[protected]` in `wish.toml`) may only gain `import` lines.
+- **Multi-module builds:** a root `pom.xml` with `<modules>` (nested ones too) is one wish project. Sources come from every module's `src/main/java`, Claude may edit every module's `pom.xml`, and `mvn -q compile` runs at the root. `wish init` sets `[java] preview = false` there, because `java -cp target/classes` can't start a reactor module. Set `preview = false` yourself to stop any app from being run after cycles.
+- **Existing codebases:** `wish init --protect-existing` protects every source file that exists, so Claude writes what you wish into new files and only adds imports to yours. Remove a file from `[protected]` to let Claude change it.
+- `examples/demo-java` is the Java demo.
+
+Java editing is supported in IntelliJ only. In Zed, jdtls reports unresolved-symbol errors for code that doesn't exist yet and they can't be filtered.
+
+## IntelliJ
+
+```sh
+cd intellij && ./gradlew buildPlugin     # add -PlocalIde="/Applications/IntelliJ IDEA.app" to build against an installed IDE
+```
+
+Install `intellij/build/distributions/*.zip` via **Settings › Plugins › ⚙ › Install Plugin from Disk**. To try it in a sandbox IDE instead: `./gradlew runIde -PdemoProject=/path/to/project`.
+
+The plugin runs `wish lsp` from `$WISH_BIN`, else `~/.cargo/bin/wish`. It does not search PATH, because `/usr/bin/wish` on macOS is Tk.
+
+**Windows IDE, project in WSL** (opened as `\\wsl.localhost\<distro>\…`): the plugin starts `wish lsp` inside that distro through `wsl.exe`, in an interactive login bash so `.bashrc`'s PATH (Java, Maven, `claude`) applies, and maps the IDE's UNC paths to Linux paths. Install wish in WSL (`cargo install --path wish`). `$WISH_BIN` is then read on the Linux side. From WSL, `intellij/deploy.sh` builds the plugin and publishes it to a custom plugin repository on the Windows side (`C:\Users\<you>\hexagonal-inspector-repo\updatePlugins.xml` by default, `WISH_DEPLOY_DIR` to override). After each deploy, update it under **Settings › Plugins › Updates**.
+
+| You see | Meaning |
+|---|---|
+| bar in the gutter + faint tint | generated by Claude (stronger while still mocked) |
+| **red** bar | generated in a ticket cycle but serves no problem of the ticket |
+| **hover** | who wrote it and, for generated code, why and which edit triggered it |
+| warning on a call site | `will be generated` on save |
+| no red `Cannot resolve symbol` | IntelliJ's unresolved error is hidden for wished symbols |
+| lens actions in the gutter | implement, accept/reject suggestion, open problems (`◆ P1 · P2`) |
+
+The **Wish** tool window has two tabs:
+
+- **Log:** the journal as a table (ticket key, author, date), with the selected entry's files and diffs and Claude's reasoning. For ticket entries, **Group by Problem** (on by default) regroups files as problem, file, item. Pending decisions get Accept and Reject buttons.
+- **Ticket:** the branch's ticket as one tree: ticket → problems (plus an **Untraced** group) → files → items, with details for the selection. The picker at the left of its toolbar switches to any other ticket branch that has a journal (journals are shared by all worktrees of a repository): its files open from the worktree that has the branch checked out, or read-only from its journal when none does. Double-click opens the file (an item at its line); the toolbar has **Open File** and **Show Diff** (the ticket's diff of that file), toggles the changes browser over the ticket's whole diff, and adds, edits and removes problems.
+
+The tool window's title bar has **Fulfil Wishes** (run a cycle for your edits now) and **Build on Save** (on by default, per project): turn it off to save freely and trigger cycles only with Fulfil Wishes.
+
+## Ticket tracing
+
+When the branch belongs to a ticket, wish traces generated code back to the ticket's problems. It works with protoflow notes:
+
+- **Ticket key:** branch `feature|fix|chore/<KEY>-…` or `proto/<KEY>`.
+- **Notes:** `<main checkout>/.work/<KEY>/` (`intent.md`, `spec.md`).
+- **Problems:** the first cycle extracts them into `.work/<KEY>/problems.json` (P1, P2, …). Edit the file (or use the IntelliJ Ticket tab) to correct them.
+- **Journal:** every item line is `- Item [P1,P3]: why`, and the commit has a `Ticket: <KEY>` trailer.
+- **Untraced:** generated in a ticket cycle but serving no problem.
+
+`wish ticket [--json]` prints problems with their files and items.
+
+### Code Claude writes outside wish
+
+An ordinary Claude Code session ("change X") is recorded too, once `wish session` is a hook in your **user** settings (`~/.claude/settings.json`, so it covers every checkout and worktree):
+
+```json
+"hooks": {
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.cargo/bin/wish session"}]}],
+  "Stop": [{"hooks": [{"type": "command", "command": "~/.cargo/bin/wish session"}]}]
+},
+"permissions": {"allow": ["Bash(~/.cargo/bin/wish explain:*)"]}
+```
+
+(Write the full path of `wish`.) When you send a prompt, what is on disk is recorded as yours. When Claude's turn ends, everything that changed during the turn is Claude's, however it was written (Edit, Write or a shell command). If the turn changed items, the hook first sends Claude back once to explain them, with the ticket's problems: Claude pipes `{"summary", "changes": [{"item", "why", "problems"}]}` into `wish explain`. The result is a `session` entry in the journal, like a cycle: blue code, hovers with the reason, `Triggered by` your prompt, and the ticket tab. The hook does nothing without a `wish.toml` in the session's directory, a parent, or a direct subdirectory, and nothing inside wish's own cycles.
+
+For code written before that, `wish import <since>` rebuilds the branch's journal: the code at `<since>` is yours, every commit since that touches the project is Claude's (one `imported` entry each, explained by its commit message), uncommitted changes are yours. `--report file.json` adds per-item reasons and problem tags: `{"<sha>": {"changes": [{"item", "why", "problems"}], "problems": [...]}}` (`problems` creates `problems.json` if it doesn't exist). In Zed, hovering an item says "Solves P#", the `◆ P1 · P2` lens opens `problems.json`, untraced code gets the red rule from the settings above, untraced warnings show in project diagnostics, and the task `wish: ticket` lists the tracing in the terminal.
 
 ## Working in Zed
 
@@ -45,6 +116,8 @@ Open `examples/demo` (or any project after `wish init`) in Zed.
 | **blue** `◇ prototype …` | this item's behaviour is still mocked (its doc has a `# Mocked` section) |
 | **blue background** | Claude generated this code, persistently, every time you open the project |
 | **stronger blue, italic** | generated *and* still mocked (prototype) |
+| **red background** | generated in a ticket cycle but serves none of the ticket's problems (also a warning `serves no problem of KEY`) |
+| `◆ P1 · P3` above an item | the ticket problems this item serves; click to open `problems.json` at the first one |
 | no background, `✎` at line start | you wrote it (always visible in files that also contain generated code) |
 | `◇ prototype · mocked: …` after a signature | that item is still mocked |
 | `▶ Implement …` above an item | click to make just that item real (or all items in the file, from the top-of-file lens) |
@@ -161,6 +234,7 @@ Adopted items are pinned by token hashes in `wish.toml`, because adoption is per
 ```
 wish lsp                     language server (Zed launches it via the extension)
 wish log [--patch]           the journal: saves and cycles with Claude's reasoning
+wish ticket [--json]         this branch's ticket: problems, and the files and items serving each
 wish share [REMOTE]          push wish journals (default: origin)
 wish sync [REMOTE]           fetch others' wish journals
 wish dev                     terminal loop: c compile · f force · w compile-on-save · r restart · u undo · I implement
@@ -172,7 +246,7 @@ wish adopt|unadopt <item>    e.g. Mode, Window::open, Mode::Maximized (see `wish
 wish decisions | wish decide <id> accept|reject [reason]
 wish suggestions | wish accept <id> | wish reject <id>
 wish check                   adopted intact + dependencies decided + cargo check
-wish init                    wish.toml + .zed/settings.json + git journal for a cargo project
+wish init                    wish.toml (+ .zed/settings.json) + git journal for a cargo or Maven project
 ```
 
 ## Layout

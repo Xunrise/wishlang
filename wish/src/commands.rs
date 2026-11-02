@@ -2,25 +2,46 @@
 //! show it. Claude is blocked from running any of these by the hook.
 
 use crate::items;
-use crate::project::{Adopted, Project, Status};
-use anyhow::{Result, bail};
+use crate::project::{Adopted, Lang, Project, Status};
+use anyhow::{Result, anyhow, bail};
 use std::fmt::Write;
 
-pub fn init() -> Result<String> {
+pub fn init(protect_existing: bool) -> Result<String> {
     let cwd = std::env::current_dir()?;
-    if !cwd.join("Cargo.toml").is_file() {
-        bail!("run `wish init` inside a cargo project");
+    let lang = Lang::detect(&cwd);
+    if !cwd.join(lang.manifest()).is_file() {
+        bail!("run `wish init` inside a cargo project (Cargo.toml) or a Maven project (pom.xml)");
     }
     if cwd.join("wish.toml").exists() {
         bail!("wish.toml already exists");
     }
-    let in_git = std::process::Command::new("git").args(["rev-parse", "--git-dir"]).current_dir(&cwd).output().is_ok_and(|o| o.status.success());
-    if !in_git {
-        std::process::Command::new("git").arg("init").arg("-q").current_dir(&cwd).status()?;
+    let mut p = Project { root: cwd, cfg: Default::default(), lang };
+    if protect_existing {
+        p.cfg.protected.files = p.src_files();
+        if p.cfg.protected.files.is_empty() {
+            bail!("no source files under {} to protect", p.lang.src_dir());
+        }
+    } else if lang == Lang::Java {
+        p.cfg.protected.files = vec![java_entry_point(&p)?];
     }
-    let p = Project { root: cwd, cfg: Default::default() };
+    if lang == Lang::Java && p.modules().len() > 1 {
+        // `java -cp target/classes` can't start a module of a reactor build (no dependency classpath).
+        p.cfg.java = Some(crate::project::JavaCfg { main_class: None, preview: Some(false) });
+    }
+    let in_git = std::process::Command::new("git").args(["rev-parse", "--git-dir"]).current_dir(&p.root).output().is_ok_and(|o| o.status.success());
+    if !in_git {
+        std::process::Command::new("git").arg("init").arg("-q").current_dir(&p.root).status()?;
+    }
     p.save()?;
     crate::engine::ensure_journal(&p, &crate::git::Git::open(&p.root)?)?;
+    let entry = &p.cfg.protected.files[0];
+    let n = p.cfg.protected.files.len();
+    let entry = if n > 1 { format!("{n} existing source files are") } else { format!("{entry} is") };
+    if lang == Lang::Java {
+        let modules = p.modules().len();
+        let modules = if modules > 1 { format!(" ({modules} Maven modules; the app is not run after cycles)") } else { String::new() };
+        return Ok(format!("created wish.toml{modules}: {entry} protected. Write your wishes there, then run `wish dev`."));
+    }
     let zed = p.root.join(".zed/settings.json");
     if !zed.exists() {
         std::fs::create_dir_all(zed.parent().unwrap())?;
@@ -31,7 +52,15 @@ pub fn init() -> Result<String> {
     if !has_rule {
         println!("note: to see generated code in blue, add wishlang's `semantic_token_rules` (see README) to your Zed user settings");
     }
-    Ok("created wish.toml and .zed/settings.json: src/main.rs is protected. Write your wishes there, then run `wish dev`.".into())
+    Ok(format!("created wish.toml and .zed/settings.json: {entry} protected. Write your wishes there, then run `wish dev`."))
+}
+
+/// The first Java file with a `main` method: the user's own, protected file.
+fn java_entry_point(p: &Project) -> Result<String> {
+    p.src_files()
+        .into_iter()
+        .find(|f| p.read(f).is_some_and(|s| s.contains("static void main(")))
+        .ok_or_else(|| anyhow!("no class with a `static void main(` under {}: write your entry point there first, it becomes the protected file", p.lang.src_dir()))
 }
 
 /// Project settings for Zed: run `wish lsp` next to rust-analyzer, let
@@ -59,11 +88,11 @@ pub fn unadopt(p: &mut Project, path: &str) -> Result<String> {
 
 pub fn items(p: &Project) -> Result<String> {
     let mut s = String::new();
-    for f in p.rust_files() {
+    for f in p.src_files() {
         let Some(src) = p.read(&f) else { continue };
         let owner = if p.is_protected(&f) { "yours" } else { "claude" };
         writeln!(s, "{f} ({owner})")?;
-        match items::parse(&src) {
+        match items::parse(p.lang, &src) {
             Ok(list) => {
                 for i in list {
                     let mark = if p.cfg.adopted.contains_key(&i.path) { "★ adopted" } else { "" };
@@ -104,7 +133,7 @@ pub fn decisions(p: &Project) -> Result<String> {
     writeln!(s, "\nLocal decisions (doc comments):")?;
     let mut any = false;
     for (f, src) in p.owned_files() {
-        let Ok(list) = items::parse(&src) else { continue };
+        let Ok(list) = items::parse(p.lang, &src) else { continue };
         for i in list {
             let local = items::local_decisions(&i.docs);
             if !local.is_empty() {
@@ -166,7 +195,7 @@ pub fn accept(p: &mut Project, id: u32) -> Result<String> {
     std::fs::write(p.root.join(&x.file), &new)?;
     // You approved this change, so re-lock any adopted items it touched.
     let mut relocked = Vec::new();
-    if let Ok(list) = items::parse(&new) {
+    if let Ok(list) = items::parse(p.lang, &new) {
         for (path, a) in p.cfg.adopted.iter_mut().filter(|(_, a)| a.file == x.file) {
             if let Some(i) = list.iter().find(|i| &i.path == path) {
                 if i.hash != a.hash {
@@ -249,7 +278,7 @@ pub fn undo(p: &Project) -> Result<String> {
 }
 
 fn is_green(subject: &str) -> bool {
-    subject.starts_with("cycle ok") || subject.starts_with("implemented") || subject.starts_with("baseline")
+    ["cycle ok", "implemented", "baseline", "session", "imported"].iter().any(|l| subject.starts_with(l))
 }
 
 /// Implement the prototype (whole project, or one file).
@@ -269,13 +298,19 @@ pub fn check(p: &Project) -> (bool, String) {
         ok = false;
         let _ = writeln!(s, "✗ dependency `{d}` has no decision record");
     }
-    let (cargo_ok, errors) = crate::engine::cargo_check(p);
-    if !cargo_ok {
-        ok = false;
-        let _ = writeln!(s, "✗ cargo check failed\n{errors}");
+    match crate::engine::check(p) {
+        Ok((true, _)) => {}
+        Ok((false, errors)) => {
+            ok = false;
+            let _ = writeln!(s, "✗ check failed\n{errors}");
+        }
+        Err(e) => {
+            ok = false;
+            let _ = writeln!(s, "✗ {e:#}");
+        }
     }
     if ok {
-        s.push_str("✓ adopted items intact, every dependency decided, cargo check passes");
+        s.push_str("✓ adopted items intact, every dependency decided, check passes");
     }
     (ok, s)
 }
@@ -336,13 +371,19 @@ pub fn sync(p: &Project, remote: &str) -> Result<String> {
     Ok(format!("synced wish journals from {remote}:\n{}", lines.join("\n")))
 }
 
+/// The ticket of the current branch and the code that solves each of its problems.
+pub fn ticket(p: &Project, json: bool) -> Result<String> {
+    let t = crate::ticket::trace(p, &crate::git::Git::open(&p.root)?)?;
+    Ok(if json { serde_json::to_string_pretty(&t)? } else { crate::ticket::render(&t) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::git::{Entry, Who};
 
     fn entry(who: Who, subject: &str) -> Entry {
-        Entry { sha: String::new(), who, subject: subject.into(), parent: None, side: vec![] }
+        Entry { sha: String::new(), who, subject: subject.into(), body: String::new(), age: String::new(), files: vec![], parent: None, side: vec![] }
     }
 
     #[test]

@@ -3,13 +3,15 @@
 //! An "item" is a unit the user can adopt: a top-level type, fn, trait or
 //! const (`Mode`, `run`), an enum variant (`Mode::Maximized`), an inherent
 //! method or associated const (`Window::open`), or a whole trait impl
-//! (`impl Display for Mode`).
+//! (`impl Display for Mode`). Java items are the same idea with `.` paths
+//! (see `java.rs`).
 //!
 //! Hashes cover the item's *token stream* (including doc attributes), so
 //! reformatting with rustfmt never breaks an adoption, but any change to
 //! code or docs does. `sig_hash` covers only the public contract (signature
 //! or type definition, without docs), which implement mode must preserve.
 
+use crate::project::Lang;
 use anyhow::{Context, Result};
 use quote::ToTokens;
 use syn::spanned::Spanned;
@@ -30,6 +32,11 @@ pub struct Item {
     /// Hash of the public contract: fn signature, or the type definition
     /// without doc attributes. None for impls and private items.
     pub sig_hash: Option<String>,
+    /// Java only: the head of a method's return type or a field's type (`List` for `List<Code>`,
+    /// `[]` for arrays), so a call chain can tell when it leaves the project's own types. A head the
+    /// declaring file imports, or takes from java.lang, is `import:Head`: only the project's
+    /// own types can make that one of ours, because only that file knew where it came from.
+    pub ty: Option<String>,
 }
 
 impl Item {
@@ -83,7 +90,14 @@ fn is_pub(v: &syn::Visibility) -> bool {
 }
 
 /// Parse a source file into its adoptable items.
-pub fn parse(src: &str) -> Result<Vec<Item>> {
+pub fn parse(lang: Lang, src: &str) -> Result<Vec<Item>> {
+    match lang {
+        Lang::Rust => parse_rust(src),
+        Lang::Java => crate::java::parse(src),
+    }
+}
+
+fn parse_rust(src: &str) -> Result<Vec<Item>> {
     let file = syn::parse_file(src).context("parsing Rust source")?;
     let mut out = Vec::new();
     collect(&file.items, "", &mut out);
@@ -100,7 +114,7 @@ struct Push<'a> {
 impl Push<'_> {
     #[allow(clippy::too_many_arguments)]
     fn item(&mut self, path: String, kind: &'static str, hash: String, docs: String, line: usize, public: bool, sig_hash: Option<String>) {
-        self.out.push(Item { path: format!("{}{path}", self.prefix), kind, hash, docs, line, end_line: self.end.max(line), sig_hash: if public { sig_hash } else { None } });
+        self.out.push(Item { path: format!("{}{path}", self.prefix), kind, hash, docs, line, end_line: self.end.max(line), sig_hash: if public { sig_hash } else { None }, ty: None });
     }
 }
 
@@ -155,10 +169,10 @@ fn collect(items: &[syn::Item], prefix: &str, out: &mut Vec<Item>) {
 }
 
 /// Map of item path → hash across several files. Unparseable files are skipped.
-pub fn hash_map<'a>(files: impl IntoIterator<Item = (&'a String, &'a String)>) -> BTreeMap<String, String> {
+pub fn hash_map<'a>(lang: Lang, files: impl IntoIterator<Item = (&'a String, &'a String)>) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     for (_, src) in files {
-        if let Ok(items) = parse(src) {
+        if let Ok(items) = parse(lang, src) {
             for i in items {
                 m.insert(i.path, i.hash);
             }
@@ -167,14 +181,35 @@ pub fn hash_map<'a>(files: impl IntoIterator<Item = (&'a String, &'a String)>) -
     m
 }
 
-/// A markdown section of a doc comment (`# Name`), as bullet entries.
-/// Returns None if the heading is absent. `# Name: text` counts as one entry.
+/// A section of a doc comment, as bullet entries: markdown `# Name` (Rust) or
+/// Javadoc `<h2>Name</h2>` with `<li>` bullets. Returns None if the heading is
+/// absent. `# Name: text` counts as one entry.
 pub fn doc_section(docs: &str, name: &str) -> Option<Vec<String>> {
+    let html = regex::Regex::new(r"(?i)^<(h2|li|/?[uo]l)\b").unwrap();
+    let tags = regex::Regex::new(r"<[^>]+>").unwrap();
     let mut out: Vec<String> = Vec::new();
     let mut found = false;
     let mut inside = false;
     for line in docs.lines() {
-        let t = line.trim();
+        let raw = line.trim();
+        // Javadoc HTML: `<h2>X</h2>` reads as the heading `# X`, `<li>x</li>` as the bullet `- x`.
+        let converted;
+        let t = match html.captures(raw) {
+            Some(c) => {
+                let text = tags.replace_all(raw, "").trim().to_string();
+                converted = match c[1].to_ascii_lowercase().as_str() {
+                    "h2" => format!("# {text}"),
+                    "li" => format!("- {text}"),
+                    _ => text,
+                };
+                converted.as_str()
+            }
+            None if raw.contains("</") => {
+                converted = tags.replace_all(raw, "").trim().to_string();
+                converted.as_str()
+            }
+            None => raw,
+        };
         if t.starts_with('#') {
             let h = t.trim_start_matches('#').trim();
             let (head, rest) = h.split_once(':').unwrap_or((h, ""));
@@ -237,44 +272,52 @@ impl std::fmt::Display for Mode { fn fmt(&self, f: &mut std::fmt::Formatter) -> 
 
     #[test]
     fn finds_items() {
-        let paths: Vec<_> = parse(SRC).unwrap().into_iter().map(|i| i.path).collect();
+        let paths: Vec<_> = parse(Lang::Rust, SRC).unwrap().into_iter().map(|i| i.path).collect();
         assert_eq!(paths, ["Mode", "Mode::Maximized", "Mode::Fullscreen", "Window", "Window::open", "impl Display for Mode"]);
     }
 
     #[test]
     fn lines() {
-        let items = parse(SRC).unwrap();
+        let items = parse(Lang::Rust, SRC).unwrap();
         assert_eq!(get(&items, "Mode").line, 3);
         assert_eq!(get(&items, "Window::open").line, 14);
         assert_eq!(get(&items, "Window::open").end_line, 14);
         assert_eq!(get(&items, "Window").end_line, 4);
-        let multi = parse("pub struct A;\nimpl A {\n    pub fn f(&self) {\n        let x = 1;\n    }\n}\n").unwrap();
+        let multi = parse(Lang::Rust, "pub struct A;\nimpl A {\n    pub fn f(&self) {\n        let x = 1;\n    }\n}\n").unwrap();
         assert_eq!((get(&multi, "A::f").line, get(&multi, "A::f").end_line), (3, 5));
     }
 
     #[test]
     fn hash_stable_under_reformat() {
         let ws = SRC.replace("pub fn open(self, m: Mode) -> Self { self }", "pub fn open(self,   m: Mode)\n -> Self {\n self\n }");
-        assert_eq!(get(&parse(SRC).unwrap(), "Window::open").hash, get(&parse(&ws).unwrap(), "Window::open").hash);
+        assert_eq!(get(&parse(Lang::Rust, SRC).unwrap(), "Window::open").hash, get(&parse(Lang::Rust, &ws).unwrap(), "Window::open").hash);
     }
 
     #[test]
     fn hash_changes_with_docs_but_sig_does_not() {
-        let a = parse(SRC).unwrap();
-        let b = parse(&SRC.replace("Opens it.", "Opens it now.").replace("-> Self { self }", "-> Self { let s = self; s }")).unwrap();
+        let a = parse(Lang::Rust, SRC).unwrap();
+        let b = parse(Lang::Rust, &SRC.replace("Opens it.", "Opens it now.").replace("-> Self { self }", "-> Self { let s = self; s }")).unwrap();
         assert_ne!(get(&a, "Window::open").hash, get(&b, "Window::open").hash);
         assert_eq!(get(&a, "Window::open").sig_hash, get(&b, "Window::open").sig_hash);
-        let c = parse(&SRC.replace("m: Mode", "m: Mode, x: u8")).unwrap();
+        let c = parse(Lang::Rust, &SRC.replace("m: Mode", "m: Mode, x: u8")).unwrap();
         assert_ne!(get(&a, "Window::open").sig_hash, get(&c, "Window::open").sig_hash);
     }
 
     #[test]
     fn sections() {
-        let items = parse(SRC).unwrap();
+        let items = parse(Lang::Rust, SRC).unwrap();
         let open = get(&items, "Window::open");
         assert_eq!(local_decisions(&open.docs), ["Maximized asks the WM, not exclusive fullscreen."]);
         assert_eq!(open.mocked().unwrap(), ["Doesn't really open anything."]);
         assert!(get(&items, "Mode").mocked().is_none());
         assert_eq!(doc_section("# Mocked: fakes it", "mocked").unwrap(), ["fakes it"]);
+    }
+
+    #[test]
+    fn javadoc_sections() {
+        let docs = "Opens it.\n<h2>Decisions</h2>\n<ul>\n<li>Maximized asks the WM,\nnot exclusive.</li>\n<li>Second.</li>\n</ul>\n<h2>Mocked</h2>\n<ul><li>Fakes the <code>scene</code>.</li></ul>";
+        assert_eq!(local_decisions(docs), ["Maximized asks the WM, not exclusive.", "Second."]);
+        assert_eq!(doc_section(docs, "mocked").unwrap(), ["Fakes the scene."]);
+        assert!(doc_section("Opens it.", "mocked").is_none());
     }
 }
