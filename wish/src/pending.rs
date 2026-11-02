@@ -3,6 +3,7 @@
 //! milliseconds, at the cost of being a heuristic rather than type-aware.
 
 use crate::items::Item;
+use crate::project::Lang;
 use proc_macro2::Span;
 use std::collections::BTreeSet;
 use syn::visit::{self, Visit};
@@ -183,10 +184,18 @@ impl<'ast> Visit<'ast> for V<'_> {
 }
 
 /// Find references in `src` that `known` doesn't define. None if `src` doesn't parse.
-pub fn find(src: &str, known: &Known) -> Option<Vec<Pending>> {
+pub fn find(lang: Lang, src: &str, known: &Known) -> Option<Vec<Pending>> {
+    match lang {
+        Lang::Rust => find_rust(src, known),
+        // Java support arrives with tree-sitter; until then nothing is pending.
+        Lang::Java => Some(Vec::new()),
+    }
+}
+
+fn find_rust(src: &str, known: &Known) -> Option<Vec<Pending>> {
     let file = syn::parse_file(src).ok()?;
     // Items defined in this very buffer count as known too.
-    let own = crate::items::parse(src).unwrap_or_default();
+    let own = crate::items::parse(Lang::Rust, src).unwrap_or_default();
     let mut k = Known { paths: known.paths.clone(), names: known.names.clone() };
     for i in &own {
         k.paths.insert(i.path.clone());
@@ -244,13 +253,13 @@ mod tests {
     use super::*;
 
     fn known(src: &str) -> Known {
-        Known::from_items(&crate::items::parse(src).unwrap())
+        Known::from_items(&crate::items::parse(Lang::Rust, src).unwrap())
     }
 
     const VOCAB: &str = "pub struct App; impl App { pub fn new(_: &str) -> Self { App } pub fn window(self) -> W { W } } pub struct W; impl W { pub fn open(self, _: Mode) -> W { self } pub fn run(self) {} } pub enum Mode { Maximized }";
 
     fn names(src: &str) -> Vec<String> {
-        find(src, &known(VOCAB)).unwrap().into_iter().map(|p| p.name).collect()
+        find(Lang::Rust, src, &known(VOCAB)).unwrap().into_iter().map(|p| p.name).collect()
     }
 
     #[test]
@@ -276,13 +285,13 @@ mod tests {
 
     #[test]
     fn positions() {
-        let p = find("fn main() {\n    Mode::Windowed(1, 2);\n}", &known(VOCAB)).unwrap();
+        let p = find(Lang::Rust, "fn main() {\n    Mode::Windowed(1, 2);\n}", &known(VOCAB)).unwrap();
         assert_eq!(p[0].start, (1, 4));
         assert_eq!(p[0].end, (1, 18));
     }
 
     #[test]
     fn unparseable_is_none() {
-        assert!(find("fn main() { App::new(", &known(VOCAB)).is_none());
+        assert!(find(Lang::Rust, "fn main() { App::new(", &known(VOCAB)).is_none());
     }
 }

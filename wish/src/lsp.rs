@@ -18,7 +18,7 @@ use crate::git::{Git, Who};
 use crate::items;
 use crate::pending;
 use crate::preview::Preview;
-use crate::project::{Project, Status};
+use crate::project::{Lang, Project, Status};
 use crate::provenance;
 use anyhow::Result;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
@@ -39,7 +39,7 @@ struct State {
     /// "branch@HEAD" last checked for journals to merge.
     checked_head: Option<String>,
     preview: Preview,
-    /// Diagnostics from the last `cargo check`, by relative path.
+    /// Diagnostics from the last check, by relative path.
     check: BTreeMap<String, Vec<Value>>,
     /// Files we published diagnostics for (to clear them later).
     published: std::collections::BTreeSet<String>,
@@ -181,6 +181,11 @@ impl Server {
         self.state.lock().unwrap().root.clone()
     }
 
+    /// The project's language (Rust until a root is known).
+    fn lang(&self) -> Lang {
+        self.root().map_or(Lang::Rust, |r| Lang::detect(&r))
+    }
+
     fn project(&self) -> Option<Project> {
         Project::load(&self.root()?).ok()
     }
@@ -296,7 +301,7 @@ impl Server {
             "textDocument/didClose" => {
                 self.state.lock().unwrap().docs.remove(&rel);
             }
-            "textDocument/didSave" if rel.ends_with(".rs") => self.cycle(Options::default()),
+            "textDocument/didSave" if self.project().is_some_and(|p| p.lang.is_src(&rel)) => self.cycle(Options::default()),
             _ => {}
         }
     }
@@ -307,16 +312,16 @@ impl Server {
         let Some(p) = self.project() else { return vec![] };
         let Some(text) = self.text(rel) else { return vec![] };
         let mut out = Vec::new();
-        if rel.ends_with(".rs") {
+        if p.lang.is_src(rel) {
             // Everything the project defines, using open buffers where they exist.
             let mut all = Vec::new();
-            for f in p.rust_files().iter().filter(|f| f.as_str() != rel) {
+            for f in p.src_files().iter().filter(|f| f.as_str() != rel) {
                 if let Some(src) = self.text(f) {
-                    all.extend(items::parse(&src).unwrap_or_default());
+                    all.extend(items::parse(p.lang, &src).unwrap_or_default());
                 }
             }
             let known = pending::Known::from_items(&all);
-            for pnd in pending::find(&text, &known).unwrap_or_default() {
+            for pnd in pending::find(p.lang, &text, &known).unwrap_or_default() {
                 out.push(json!({
                     "range": range(pnd.start.0, pnd.start.1, pnd.end.0, pnd.end.1),
                     "severity": 3, "source": "wishlang",
@@ -393,7 +398,7 @@ impl Server {
         let Some(text) = self.text(&rel) else { return empty };
         let Some(git) = self.git() else { return empty };
         let Some(whos) = provenance::of(&git, &rel, &text) else { return empty };
-        let mocked: Vec<(usize, usize)> = items::parse(&text).unwrap_or_default().iter().filter(|i| i.mocked().is_some()).map(|i| (i.line, i.end_line)).collect();
+        let mocked: Vec<(usize, usize)> = items::parse(self.lang(), &text).unwrap_or_default().iter().filter(|i| i.mocked().is_some()).map(|i| (i.line, i.end_line)).collect();
         json!({"data": encode_tokens(&whos, &text, &mocked)})
     }
 
@@ -408,7 +413,7 @@ impl Server {
         if text.lines().nth(line).is_none_or(|l| l.trim().is_empty()) {
             return Value::Null;
         }
-        let md = hover_markdown(&git, &text, line, who, sha.as_deref());
+        let md = hover_markdown(&git, self.lang(), &text, line, who, sha.as_deref());
         json!({"contents": {"kind": "markdown", "value": md}, "range": range(line as u32, 0, line as u32, line_len(&text, line))})
     }
 
@@ -430,7 +435,7 @@ impl Server {
                 }
             }
         }
-        for it in items::parse(&text).unwrap_or_default() {
+        for it in items::parse(self.lang(), &text).unwrap_or_default() {
             if let Some(m) = it.mocked() {
                 let l = it.line.max(1) - 1;
                 let what: String = m.join("; ").chars().take(80).collect();
@@ -449,7 +454,7 @@ impl Server {
         let lines: Vec<&str> = text.lines().collect();
         let lens = |line: usize, title: String, command: &str, args: Value| json!({"range": range(line as u32, 0, line as u32, 0), "command": {"title": title, "command": command, "arguments": args}});
         let mut out = Vec::new();
-        let mocked: Vec<items::Item> = items::parse(&text).unwrap_or_default().into_iter().filter(|i| i.mocked().is_some()).collect();
+        let mocked: Vec<items::Item> = items::parse(self.lang(), &text).unwrap_or_default().into_iter().filter(|i| i.mocked().is_some()).collect();
         if mocked.len() > 1 {
             out.push(lens(0, format!("▶ Implement all {} prototype items in this file", mocked.len()), "wish.implement", json!([rel, null])));
         }
@@ -511,7 +516,7 @@ impl Server {
             actions.push(cmd(format!("✗ Reject suggestion {id}"), "wish.reject", json!([id])));
         }
         let text = self.text(&rel).unwrap_or_default();
-        let own = items::parse(&text).unwrap_or_default();
+        let own = items::parse(self.lang(), &text).unwrap_or_default();
         if !p.is_protected(&rel) {
             // The item whose name is on, or nearest above, the cursor line.
             if let Some(it) = own.iter().filter(|i| i.line > 0 && i.line - 1 <= line).max_by_key(|i| i.line) {
@@ -711,7 +716,7 @@ pub fn encode_tokens(whos: &[Who], text: &str, mocked: &[(usize, usize)]) -> Vec
 }
 
 /// Hover text for one line: who wrote it, when, and why (from the journal commit).
-fn hover_markdown(git: &Git, text: &str, line: usize, who: Who, sha: Option<&str>) -> String {
+fn hover_markdown(git: &Git, lang: Lang, text: &str, line: usize, who: Who, sha: Option<&str>) -> String {
     use crate::journal::CycleMessage;
     let Some(sha) = sha else { return "✎ **yours**, not saved yet".into() };
     let Some((msg, age)) = git.message(sha) else { return String::new() };
@@ -726,7 +731,7 @@ fn hover_markdown(git: &Git, text: &str, line: usize, who: Who, sha: Option<&str
     }
     let mut s = format!("⚙ **generated** · {} · {age}{}", m.label, if m.mode.is_empty() { String::new() } else { format!(" · {}", m.mode) });
     // The innermost item enclosing this line.
-    let item = items::parse(text).unwrap_or_default().into_iter().filter(|i| i.line <= line + 1 && line + 1 <= i.end_line).min_by_key(|i| i.end_line - i.line);
+    let item = items::parse(lang, text).unwrap_or_default().into_iter().filter(|i| i.line <= line + 1 && line + 1 <= i.end_line).min_by_key(|i| i.end_line - i.line);
     let why = item.as_ref().and_then(|i| m.why_for(&i.path).map(|w| (i.path.clone(), w.to_string()))).or_else(|| {
         // Methods inside trait impls aren't separate items: match the nearest
         // enclosing `fn name` against reasons given for `Type::name`.

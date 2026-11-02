@@ -3,13 +3,15 @@
 //! An "item" is a unit the user can adopt: a top-level type, fn, trait or
 //! const (`Mode`, `run`), an enum variant (`Mode::Maximized`), an inherent
 //! method or associated const (`Window::open`), or a whole trait impl
-//! (`impl Display for Mode`).
+//! (`impl Display for Mode`). Java items are the same idea with `.` paths
+//! (see `java.rs`).
 //!
 //! Hashes cover the item's *token stream* (including doc attributes), so
 //! reformatting with rustfmt never breaks an adoption, but any change to
 //! code or docs does. `sig_hash` covers only the public contract (signature
 //! or type definition, without docs), which implement mode must preserve.
 
+use crate::project::Lang;
 use anyhow::{Context, Result};
 use quote::ToTokens;
 use syn::spanned::Spanned;
@@ -83,7 +85,15 @@ fn is_pub(v: &syn::Visibility) -> bool {
 }
 
 /// Parse a source file into its adoptable items.
-pub fn parse(src: &str) -> Result<Vec<Item>> {
+pub fn parse(lang: Lang, src: &str) -> Result<Vec<Item>> {
+    match lang {
+        Lang::Rust => parse_rust(src),
+        // Java parsing arrives with tree-sitter; until then no items.
+        Lang::Java => Ok(Vec::new()),
+    }
+}
+
+fn parse_rust(src: &str) -> Result<Vec<Item>> {
     let file = syn::parse_file(src).context("parsing Rust source")?;
     let mut out = Vec::new();
     collect(&file.items, "", &mut out);
@@ -155,10 +165,10 @@ fn collect(items: &[syn::Item], prefix: &str, out: &mut Vec<Item>) {
 }
 
 /// Map of item path → hash across several files. Unparseable files are skipped.
-pub fn hash_map<'a>(files: impl IntoIterator<Item = (&'a String, &'a String)>) -> BTreeMap<String, String> {
+pub fn hash_map<'a>(lang: Lang, files: impl IntoIterator<Item = (&'a String, &'a String)>) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     for (_, src) in files {
-        if let Ok(items) = parse(src) {
+        if let Ok(items) = parse(lang, src) {
             for i in items {
                 m.insert(i.path, i.hash);
             }
@@ -237,40 +247,40 @@ impl std::fmt::Display for Mode { fn fmt(&self, f: &mut std::fmt::Formatter) -> 
 
     #[test]
     fn finds_items() {
-        let paths: Vec<_> = parse(SRC).unwrap().into_iter().map(|i| i.path).collect();
+        let paths: Vec<_> = parse(Lang::Rust, SRC).unwrap().into_iter().map(|i| i.path).collect();
         assert_eq!(paths, ["Mode", "Mode::Maximized", "Mode::Fullscreen", "Window", "Window::open", "impl Display for Mode"]);
     }
 
     #[test]
     fn lines() {
-        let items = parse(SRC).unwrap();
+        let items = parse(Lang::Rust, SRC).unwrap();
         assert_eq!(get(&items, "Mode").line, 3);
         assert_eq!(get(&items, "Window::open").line, 14);
         assert_eq!(get(&items, "Window::open").end_line, 14);
         assert_eq!(get(&items, "Window").end_line, 4);
-        let multi = parse("pub struct A;\nimpl A {\n    pub fn f(&self) {\n        let x = 1;\n    }\n}\n").unwrap();
+        let multi = parse(Lang::Rust, "pub struct A;\nimpl A {\n    pub fn f(&self) {\n        let x = 1;\n    }\n}\n").unwrap();
         assert_eq!((get(&multi, "A::f").line, get(&multi, "A::f").end_line), (3, 5));
     }
 
     #[test]
     fn hash_stable_under_reformat() {
         let ws = SRC.replace("pub fn open(self, m: Mode) -> Self { self }", "pub fn open(self,   m: Mode)\n -> Self {\n self\n }");
-        assert_eq!(get(&parse(SRC).unwrap(), "Window::open").hash, get(&parse(&ws).unwrap(), "Window::open").hash);
+        assert_eq!(get(&parse(Lang::Rust, SRC).unwrap(), "Window::open").hash, get(&parse(Lang::Rust, &ws).unwrap(), "Window::open").hash);
     }
 
     #[test]
     fn hash_changes_with_docs_but_sig_does_not() {
-        let a = parse(SRC).unwrap();
-        let b = parse(&SRC.replace("Opens it.", "Opens it now.").replace("-> Self { self }", "-> Self { let s = self; s }")).unwrap();
+        let a = parse(Lang::Rust, SRC).unwrap();
+        let b = parse(Lang::Rust, &SRC.replace("Opens it.", "Opens it now.").replace("-> Self { self }", "-> Self { let s = self; s }")).unwrap();
         assert_ne!(get(&a, "Window::open").hash, get(&b, "Window::open").hash);
         assert_eq!(get(&a, "Window::open").sig_hash, get(&b, "Window::open").sig_hash);
-        let c = parse(&SRC.replace("m: Mode", "m: Mode, x: u8")).unwrap();
+        let c = parse(Lang::Rust, &SRC.replace("m: Mode", "m: Mode, x: u8")).unwrap();
         assert_ne!(get(&a, "Window::open").sig_hash, get(&c, "Window::open").sig_hash);
     }
 
     #[test]
     fn sections() {
-        let items = parse(SRC).unwrap();
+        let items = parse(Lang::Rust, SRC).unwrap();
         let open = get(&items, "Window::open");
         assert_eq!(local_decisions(&open.docs), ["Maximized asks the WM, not exclusive fullscreen."]);
         assert_eq!(open.mocked().unwrap(), ["Doesn't really open anything."]);

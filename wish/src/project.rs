@@ -4,7 +4,8 @@
 //! - `[protected] files`: the user's files. Claude may only *add* single-line
 //!   `mod …;` / `use …;` wiring to them (see [`wiring_only`]).
 //! - `[adopted]`: items the user trusts; hashed, Claude may not change them.
-//! - every other `src/**/*.rs` plus `Cargo.toml`: Claude-owned.
+//! - every other source file (`src/**/*.rs` plus `Cargo.toml`, or
+//!   `src/main/java/**/*.java` plus `pom.xml`): Claude-owned.
 //! - `wish.toml`, `DECISIONS.md`, `.wish/`: tool-owned, Claude may not touch.
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -79,9 +80,69 @@ pub struct Suggestion {
     pub status: Status,
 }
 
+/// The project's language, which decides the parser, toolchain and prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    Rust,
+    Java,
+}
+
+impl Lang {
+    /// A `pom.xml` at the root makes it a Java (Maven) project, anything else Rust.
+    pub fn detect(root: &Path) -> Self {
+        if root.join("pom.xml").is_file() { Lang::Java } else { Lang::Rust }
+    }
+
+    /// Source file extension, without the dot.
+    pub fn ext(self) -> &'static str {
+        match self {
+            Lang::Rust => "rs",
+            Lang::Java => "java",
+        }
+    }
+
+    /// Is `rel` a source file of this language?
+    pub fn is_src(self, rel: &str) -> bool {
+        rel.rsplit_once('.').is_some_and(|(_, e)| e == self.ext())
+    }
+
+    /// Directory (relative to the root) that holds the sources.
+    pub fn src_dir(self) -> &'static str {
+        match self {
+            Lang::Rust => "src",
+            Lang::Java => "src/main/java",
+        }
+    }
+
+    /// The build manifest, which Claude owns.
+    pub fn manifest(self) -> &'static str {
+        match self {
+            Lang::Rust => "Cargo.toml",
+            Lang::Java => "pom.xml",
+        }
+    }
+
+    /// Lowercase name, also the markdown fence tag.
+    pub fn name(self) -> &'static str {
+        match self {
+            Lang::Rust => "rust",
+            Lang::Java => "java",
+        }
+    }
+
+    /// The command that checks the project compiles.
+    pub fn check_cmd(self) -> &'static str {
+        match self {
+            Lang::Rust => "cargo check",
+            Lang::Java => "mvn -q compile",
+        }
+    }
+}
+
 pub struct Project {
     pub root: PathBuf,
     pub cfg: Config,
+    pub lang: Lang,
 }
 
 impl Project {
@@ -104,7 +165,7 @@ impl Project {
     pub fn load(root: &Path) -> Result<Self> {
         let text = fs::read_to_string(root.join("wish.toml"))?;
         let cfg = toml::from_str(&text).context("parsing wish.toml")?;
-        Ok(Self { root: root.to_path_buf(), cfg })
+        Ok(Self { root: root.to_path_buf(), cfg, lang: Lang::detect(root) })
     }
 
     pub fn save(&self) -> Result<()> {
@@ -137,27 +198,28 @@ impl Project {
         fs::read_to_string(self.root.join(rel)).ok()
     }
 
-    /// All `.rs` files under `src/` (relative paths), sorted.
-    pub fn rust_files(&self) -> Vec<String> {
+    /// All source files of the project's language (relative paths), sorted.
+    pub fn src_files(&self) -> Vec<String> {
         let mut out = Vec::new();
-        walk(&self.root.join("src"), &mut out);
+        walk(&self.root.join(self.lang.src_dir()), self.lang.ext(), &mut out);
         let mut rels: Vec<String> = out.iter().filter_map(|p| self.rel(p)).collect();
         rels.sort();
         rels
     }
 
-    /// Claude-owned files and their contents (Rust sources + Cargo.toml).
+    /// Claude-owned files and their contents (sources + build manifest).
     pub fn owned_files(&self) -> BTreeMap<String, String> {
         let mut m = BTreeMap::new();
-        for f in self.rust_files() {
+        for f in self.src_files() {
             if !self.is_protected(&f) {
                 if let Some(s) = self.read(&f) {
                     m.insert(f, s);
                 }
             }
         }
-        if let Some(s) = self.read("Cargo.toml") {
-            m.insert("Cargo.toml".into(), s);
+        let manifest = self.lang.manifest();
+        if let Some(s) = self.read(manifest) {
+            m.insert(manifest.into(), s);
         }
         m
     }
@@ -166,11 +228,11 @@ impl Project {
         self.cfg.protected.files.iter().map(|f| (f.clone(), self.read(f).unwrap_or_default())).collect()
     }
 
-    /// Locate an item by path in any Rust file.
+    /// Locate an item by path in any source file.
     pub fn find_item(&self, path: &str) -> Result<(String, crate::items::Item)> {
-        for f in self.rust_files() {
+        for f in self.src_files() {
             let Some(src) = self.read(&f) else { continue };
-            if let Ok(items) = crate::items::parse(&src) {
+            if let Ok(items) = crate::items::parse(self.lang, &src) {
                 if let Some(i) = items.into_iter().find(|i| i.path == path) {
                     return Ok((f, i));
                 }
@@ -183,7 +245,7 @@ impl Project {
     pub fn verify_adopted(&self) -> Vec<String> {
         let mut bad = Vec::new();
         for (path, a) in &self.cfg.adopted {
-            match self.read(&a.file).map(|s| crate::items::parse(&s)) {
+            match self.read(&a.file).map(|s| crate::items::parse(self.lang, &s)) {
                 Some(Ok(items)) => match items.iter().find(|i| &i.path == path) {
                     Some(i) if i.hash == a.hash => {}
                     Some(_) => bad.push(format!("adopted `{path}` was modified in {}", a.file)),
@@ -227,10 +289,19 @@ impl Project {
 }
 
 /// True if `new` differs from `old` only by *inserted* lines that are blank or
-/// single-line `mod x;` / `use …;` declarations. This is the one change Claude
-/// may make to a protected file: wiring it up to the generated modules.
-pub fn wiring_only(old: &str, new: &str) -> Result<(), String> {
-    let re = regex::Regex::new(r"^\s*(pub(\([^)]*\))?\s+)?(mod\s+\w+|use\s+[^;]+);\s*$").unwrap();
+/// single-line `mod x;` / `use …;` declarations (Java: `import …;`). This is
+/// the one change Claude may make to a protected file: wiring it up to the
+/// generated code.
+pub fn wiring_only(lang: Lang, old: &str, new: &str) -> Result<(), String> {
+    let what = match lang {
+        Lang::Rust => "`mod`/`use`",
+        Lang::Java => "`import`",
+    };
+    let re = regex::Regex::new(match lang {
+        Lang::Rust => r"^\s*(pub(\([^)]*\))?\s+)?(mod\s+\w+|use\s+[^;]+);\s*$",
+        Lang::Java => r"^\s*import\s+(static\s+)?[\w.]+(\.\*)?;\s*$",
+    })
+    .unwrap();
     let diff = similar::TextDiff::from_lines(old, new);
     for ch in diff.iter_all_changes() {
         let line = ch.value().trim_end_matches('\n');
@@ -239,7 +310,7 @@ pub fn wiring_only(old: &str, new: &str) -> Result<(), String> {
             similar::ChangeTag::Delete => return Err(format!("removes or changes the line `{}`", line.trim())),
             similar::ChangeTag::Insert => {
                 if !(line.trim().is_empty() || re.is_match(line)) {
-                    return Err(format!("adds the line `{}` (only single-line `mod`/`use` wiring may be added)", line.trim()));
+                    return Err(format!("adds the line `{}` (only single-line {what} wiring may be added)", line.trim()));
                 }
             }
         }
@@ -280,13 +351,13 @@ fn save_json<T: Serialize + ?Sized>(p: &Path, v: &T) -> Result<()> {
     Ok(())
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
-            walk(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
+            walk(&p, ext, out);
+        } else if p.extension().is_some_and(|x| x == ext) {
             out.push(p);
         }
     }
@@ -308,14 +379,35 @@ fn normalize(p: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::wiring_only;
+    use super::{Lang, wiring_only};
 
     #[test]
     fn wiring() {
         let old = "fn main() {\n    go()\n}\n";
-        assert!(wiring_only(old, "mod app;\nuse app::*;\n\nfn main() {\n    go()\n}\n").is_ok());
-        assert!(wiring_only(old, "fn main() {\n    go2()\n}\n").is_err());
-        assert!(wiring_only(old, "fn helper() {}\nfn main() {\n    go()\n}\n").is_err());
-        assert!(wiring_only(old, "// hi\nfn main() {\n    go()\n}\n").is_err());
+        assert!(wiring_only(Lang::Rust, old, "mod app;\nuse app::*;\n\nfn main() {\n    go()\n}\n").is_ok());
+        assert!(wiring_only(Lang::Rust, old, "fn main() {\n    go2()\n}\n").is_err());
+        assert!(wiring_only(Lang::Rust, old, "fn helper() {}\nfn main() {\n    go()\n}\n").is_err());
+        assert!(wiring_only(Lang::Rust, old, "// hi\nfn main() {\n    go()\n}\n").is_err());
+    }
+
+    #[test]
+    fn java_wiring() {
+        let old = "package demo;\n\nclass Main {\n    void go() {}\n}\n";
+        assert!(wiring_only(Lang::Java, old, "package demo;\nimport java.util.List;\nimport static demo.Util.*;\n\nclass Main {\n    void go() {}\n}\n").is_ok());
+        assert!(wiring_only(Lang::Java, old, "package demo;\n\nclass Main {\n    void go2() {}\n}\n").is_err());
+        assert!(wiring_only(Lang::Java, old, "package demo;\nimport java.util.List; int x;\n\nclass Main {\n    void go() {}\n}\n").is_err());
+        assert!(wiring_only(Lang::Java, old, "package demo;\nuse foo::Bar;\n\nclass Main {\n    void go() {}\n}\n").is_err());
+    }
+
+    #[test]
+    fn detects_lang() {
+        let dir = std::env::temp_dir().join(format!("wish-lang-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(Lang::detect(&dir), Lang::Rust);
+        std::fs::write(dir.join("pom.xml"), "<project/>").unwrap();
+        assert_eq!(Lang::detect(&dir), Lang::Java);
+        assert!(Lang::Java.is_src("src/main/java/A.java") && !Lang::Java.is_src("src/a.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

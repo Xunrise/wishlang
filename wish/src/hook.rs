@@ -55,7 +55,7 @@ pub fn evaluate(v: &Value) -> Verdict {
 
     if project.is_protected(&rel) {
         let old = current.unwrap_or_default();
-        return match wiring_only(&old, &proposed) {
+        return match wiring_only(project.lang, &old, &proposed) {
             Ok(()) => Verdict::Allow,
             Err(why) => Verdict::Deny(format!(
                 "{rel} is the user's code and is protected; this edit {why}. Do not change the user's lines. \
@@ -82,7 +82,7 @@ pub fn evaluate(v: &Value) -> Verdict {
         return Verdict::Allow;
     }
     let names = adopted.iter().map(|(p, _)| format!("`{p}`")).collect::<Vec<_>>().join(", ");
-    let Ok(new_items) = items::parse(&proposed) else {
+    let Ok(new_items) = items::parse(project.lang, &proposed) else {
         return Verdict::Deny(format!("this edit would leave {rel} unparseable, and it contains adopted items ({names}). Make the edit in one complete step."));
     };
     for (path, hash) in adopted {
@@ -142,6 +142,7 @@ fn bash(cmd: &str, cwd: &Path) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::Lang;
     use std::fs;
 
     fn setup() -> std::path::PathBuf {
@@ -151,7 +152,7 @@ mod tests {
         fs::write(dir.join("src/main.rs"), "fn main() {\n    App::new(\"Demo\").run()\n}\n").unwrap();
         let lib = "pub struct App;\nimpl App {\n    /// New.\n    pub fn new(_: &str) -> Self { App }\n    pub fn run(self) {}\n}\n";
         fs::write(dir.join("src/app.rs"), lib).unwrap();
-        let hash = items::parse(lib).unwrap().into_iter().find(|i| i.path == "App::new").unwrap().hash;
+        let hash = items::parse(Lang::Rust, lib).unwrap().into_iter().find(|i| i.path == "App::new").unwrap().hash;
         fs::write(dir.join("wish.toml"), format!("[protected]\nfiles = [\"src/main.rs\"]\n\n[adopted]\n\"App::new\" = {{ file = \"src/app.rs\", hash = \"{hash}\" }}\n")).unwrap();
         dir
     }

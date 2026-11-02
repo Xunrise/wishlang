@@ -8,9 +8,9 @@ use crate::claude;
 use crate::events::{Event, Sink};
 use crate::git::{Git, Who};
 use crate::items;
-use crate::project::{Decision, Project, Status, Suggestion, wiring_only};
+use crate::project::{Decision, Lang, Project, Status, Suggestion, wiring_only};
 use crate::provenance;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
 
@@ -41,18 +41,23 @@ impl Default for Options {
     }
 }
 
-pub fn cargo_check(project: &Project) -> (bool, String) {
-    let out = Command::new("cargo").args(["check", "--quiet", "--message-format", "short"]).current_dir(&project.root).output();
-    match out {
-        Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) => (false, e.to_string()),
+/// Check that the project compiles. `Err` means the toolchain itself is
+/// missing: that is not something Claude can fix, so no cycle should start.
+pub fn check(project: &Project) -> Result<(bool, String)> {
+    match project.lang {
+        Lang::Rust => match Command::new("cargo").args(["check", "--quiet", "--message-format", "short"]).current_dir(&project.root).output() {
+            Ok(o) => Ok((o.status.success(), String::from_utf8_lossy(&o.stderr).trim().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("`cargo` was not found on PATH"),
+            Err(e) => Ok((false, e.to_string())),
+        },
+        Lang::Java => bail!("Java projects are not supported yet"),
     }
 }
 
-/// Item path -> hash for Claude-owned Rust files at a snapshot.
+/// Item path -> hash for Claude-owned source files at a snapshot.
 fn items_at(p: &Project, git: &Git, sha: &str, files: &[String]) -> BTreeMap<String, String> {
-    let srcs: BTreeMap<String, String> = files.iter().filter(|f| f.ends_with(".rs") && !p.is_protected(f)).filter_map(|f| git.show(sha, f).map(|s| (f.clone(), s))).collect();
-    items::hash_map(&srcs)
+    let srcs: BTreeMap<String, String> = files.iter().filter(|f| p.lang.is_src(f) && !p.is_protected(f)).filter_map(|f| git.show(sha, f).map(|s| (f.clone(), s))).collect();
+    items::hash_map(p.lang, &srcs)
 }
 
 fn numbered(src: &str) -> String {
@@ -95,7 +100,7 @@ pub fn ensure_journal(p: &Project, git: &Git) -> Result<String> {
     git.set_ref(&git.ref_name("journal"), &all)?;
     // Generated code already exists: treat it as the last green state, so the
     // next cycle regenerates for your edits instead of starting from scratch.
-    if git.last().is_none() && p.rust_files().iter().any(|f| !p.is_protected(f)) {
+    if git.last().is_none() && p.src_files().iter().any(|f| !p.is_protected(f)) {
         git.set_ref(&git.ref_name("last"), &all)?;
     }
     Ok(all)
@@ -157,10 +162,10 @@ pub fn record_save(git: &Git, tip: &str, msg: &str) -> Result<String> {
     Ok(save)
 }
 
-/// Your lines inside Claude-owned Rust files at snapshot `sha` (the journal tip).
+/// Your lines inside Claude-owned source files at snapshot `sha` (the journal tip).
 fn human_lines_in_owned(p: &Project, git: &Git, sha: &str) -> BTreeMap<String, Vec<String>> {
     let mut m = BTreeMap::new();
-    for f in p.rust_files().into_iter().filter(|f| !p.is_protected(f)) {
+    for f in p.src_files().into_iter().filter(|f| !p.is_protected(f)) {
         let Some(src) = git.show(sha, &f) else { continue };
         if let Some(whos) = provenance::of(git, &f, &src) {
             let lines = provenance::human_lines(&whos, &src);
@@ -234,7 +239,7 @@ fn build_prompt(p: &Project, i: &PromptInput) -> String {
     let mut s = String::new();
     s.push_str("# The user's code (protected)\n\n");
     for (f, src) in p.protected_files() {
-        s.push_str(&format!("## {f}\n```rust\n{}```\n\n", numbered(&src)));
+        s.push_str(&format!("## {f}\n```{}\n{}```\n\n", p.lang.name(), numbered(&src)));
     }
     match i.diff {
         None => s.push_str("# What changed\nFirst cycle: nothing has been generated yet. Build the vocabulary from scratch.\n\n"),
@@ -270,8 +275,8 @@ fn build_prompt(p: &Project, i: &PromptInput) -> String {
         let mocked: Vec<String> = p
             .owned_files()
             .iter()
-            .filter(|(f, _)| f.ends_with(".rs") && file.as_ref().is_none_or(|x| x == *f))
-            .flat_map(|(f, src)| items::parse(src).unwrap_or_default().into_iter().filter_map(move |it| it.mocked().map(|m| format!("- `{}` ({f}): {}", it.path, m.join("; ")))))
+            .filter(|(f, _)| p.lang.is_src(f) && file.as_ref().is_none_or(|x| x == *f))
+            .flat_map(|(f, src)| items::parse(p.lang, src).unwrap_or_default().into_iter().filter_map(move |it| it.mocked().map(|m| format!("- `{}` ({f}): {}", it.path, m.join("; ")))))
             .collect();
         if !mocked.is_empty() {
             s.push_str(&format!("# Prototype items still mocked\n{}\n\n", mocked.join("\n")));
@@ -283,7 +288,7 @@ fn build_prompt(p: &Project, i: &PromptInput) -> String {
     let owned: Vec<_> = p.owned_files().into_keys().collect();
     s.push_str(&format!("# Generated files\n{}\n\n", if owned.is_empty() { "(none yet)".into() } else { owned.join(", ") }));
     if !i.check_errors.is_empty() {
-        s.push_str(&format!("# Current `cargo check` output\n```\n{}\n```\n\n", truncate(i.check_errors, 6000)));
+        s.push_str(&format!("# Current `{}` output\n```\n{}\n```\n\n", p.lang.check_cmd(), truncate(i.check_errors, 6000)));
     }
     if !p.cfg.adopted.is_empty() {
         s.push_str("# Adopted items (protected; do not change)\n");
@@ -341,12 +346,18 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
         Some(l) => Some(git.diff(l, &pre, &p.cfg.protected.files)?),
         None => None,
     };
-    let owned_rs: Vec<String> = p.rust_files().into_iter().filter(|f| !p.is_protected(f)).collect();
+    let owned_src: Vec<String> = p.src_files().into_iter().filter(|f| !p.is_protected(f)).collect();
     // Only this save's edits: between the previous journal tip and now, only you edited.
-    let owned_edits = if owned_rs.is_empty() || pre == tip { String::new() } else { git.diff(&tip, &pre, &owned_rs)? };
+    let owned_edits = if owned_src.is_empty() || pre == tip { String::new() } else { git.diff(&tip, &pre, &owned_src)? };
 
     sink.emit(Event::Status { msg: "checking".into() });
-    let (ok, errors) = cargo_check(p);
+    let (ok, errors) = match check(p) {
+        Ok(r) => r,
+        Err(e) => {
+            sink.emit(Event::Done { ok: false, summary: format!("{e:#}") });
+            return Ok(false);
+        }
+    };
     let quiet = !opts.force && opts.note.is_none() && !implement;
     // You merged other branches' code (and with it, their wish history): if it
     // compiles, the merge is simply the new green state; nothing to regenerate.
@@ -372,7 +383,7 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
 
     let human_owned = human_lines_in_owned(p, &git, &pre);
     // Your edits in this save: recorded in the cycle commit as what triggered it.
-    let triggered_by = if pre == tip { vec![] } else { crate::journal::trigger_lines(&git.diff(&tip, &pre, &["*.rs".into()]).unwrap_or_default(), 20) };
+    let triggered_by = if pre == tip { vec![] } else { crate::journal::trigger_lines(&git.diff(&tip, &pre, &[format!("*.{}", p.lang.ext())]).unwrap_or_default(), 20) };
     let history = if implement {
         git.set_ref(&git.ref_name("prototype"), &pre)?;
         Some(history_story(&git, 20_000))
@@ -403,7 +414,7 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
     for f in &p.cfg.protected.files {
         let old = git.show(&pre, f).unwrap_or_default();
         let new = git.show(&post, f).unwrap_or_default();
-        match wiring_only(&old, &new) {
+        match wiring_only(p.lang, &old, &new) {
             Ok(()) => {
                 let added: Vec<String> = similar::TextDiff::from_lines(old.as_str(), new.as_str())
                     .iter_all_changes()
@@ -445,7 +456,7 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
     let added: Vec<String> = b.keys().filter(|k| !a.contains_key(*k)).cloned().collect();
     let removed: Vec<String> = a.keys().filter(|k| !b.contains_key(*k)).cloned().collect();
     let changed: Vec<String> = b.iter().filter(|(k, h)| a.get(*k).is_some_and(|x| x != *h)).map(|(k, _)| k.clone()).collect();
-    let total = items::hash_map(&p.owned_files().into_iter().filter(|(k, _)| k.ends_with(".rs")).collect::<BTreeMap<_, _>>()).len();
+    let total = items::hash_map(p.lang, &p.owned_files().into_iter().filter(|(k, _)| p.lang.is_src(k)).collect::<BTreeMap<_, _>>()).len();
     let untouched = total.saturating_sub(added.len() + changed.len());
     sink.emit(Event::Changes { added, changed, removed, untouched });
 
@@ -471,14 +482,14 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
         sink.emit(Event::Warning { msg: format!("dependency `{dep}` has no decision record") });
     }
     if implement {
-        for (f, src) in p.owned_files().iter().filter(|(f, _)| f.ends_with(".rs")) {
+        for (f, src) in p.owned_files().iter().filter(|(f, _)| p.lang.is_src(f)) {
             if let Mode::Implement { file: Some(only), .. } = &opts.mode {
                 if only != f {
                     continue;
                 }
             }
             let target = if let Mode::Implement { item: Some(t), .. } = &opts.mode { Some(t.clone()) } else { None };
-            for it in items::parse(src).unwrap_or_default().into_iter().filter(|i| i.mocked().is_some()) {
+            for it in items::parse(p.lang, src).unwrap_or_default().into_iter().filter(|i| i.mocked().is_some()) {
                 if target.as_ref().is_some_and(|t| &it.path != t && !it.path.starts_with(&format!("{t}::"))) {
                     continue;
                 }
@@ -487,7 +498,7 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
         }
     }
 
-    let (ok, errors) = cargo_check(p);
+    let (ok, errors) = check(p).unwrap_or_else(|e| (false, format!("{e:#}")));
     sink.emit(Event::Check { ok, errors });
     let label = match (&opts.mode, ok) {
         (Mode::Implement { .. }, true) => "implemented",
@@ -532,17 +543,17 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
 /// Public signatures and type definitions that changed between two snapshots.
 fn contract_changes(p: &Project, git: &Git, pre: &str, post: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for f in p.rust_files().into_iter().filter(|f| !p.is_protected(f)) {
+    for f in p.src_files().into_iter().filter(|f| !p.is_protected(f)) {
         let Some(old) = git.show(pre, &f) else { continue };
-        let new = git.show(post, &f).and_then(|s| items::parse(&s).ok()).unwrap_or_default();
-        for it in items::parse(&old).unwrap_or_default() {
+        let new = git.show(post, &f).and_then(|s| items::parse(p.lang, &s).ok()).unwrap_or_default();
+        for it in items::parse(p.lang, &old).unwrap_or_default() {
             let Some(sig) = &it.sig_hash else { continue };
             match new.iter().find(|n| n.path == it.path) {
                 Some(n) if n.sig_hash.as_ref() == Some(sig) => {}
                 Some(_) => out.push(format!("{f}: implementing changed the public contract of `{}`", it.path)),
                 None => {
                     // moved to another file is fine if the contract survived
-                    let elsewhere = p.rust_files().iter().filter_map(|g| git.show(post, g)).flat_map(|s| items::parse(&s).unwrap_or_default()).any(|n| n.path == it.path && n.sig_hash.as_ref() == Some(sig));
+                    let elsewhere = p.src_files().iter().filter_map(|g| git.show(post, g)).flat_map(|s| items::parse(p.lang, &s).unwrap_or_default()).any(|n| n.path == it.path && n.sig_hash.as_ref() == Some(sig));
                     if !elsewhere {
                         out.push(format!("{f}: implementing removed public `{}`", it.path));
                     }

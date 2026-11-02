@@ -18,7 +18,8 @@ pub fn init() -> Result<String> {
     if !in_git {
         std::process::Command::new("git").arg("init").arg("-q").current_dir(&cwd).status()?;
     }
-    let p = Project { root: cwd, cfg: Default::default() };
+    let lang = crate::project::Lang::detect(&cwd);
+    let p = Project { root: cwd, cfg: Default::default(), lang };
     p.save()?;
     crate::engine::ensure_journal(&p, &crate::git::Git::open(&p.root)?)?;
     let zed = p.root.join(".zed/settings.json");
@@ -59,11 +60,11 @@ pub fn unadopt(p: &mut Project, path: &str) -> Result<String> {
 
 pub fn items(p: &Project) -> Result<String> {
     let mut s = String::new();
-    for f in p.rust_files() {
+    for f in p.src_files() {
         let Some(src) = p.read(&f) else { continue };
         let owner = if p.is_protected(&f) { "yours" } else { "claude" };
         writeln!(s, "{f} ({owner})")?;
-        match items::parse(&src) {
+        match items::parse(p.lang, &src) {
             Ok(list) => {
                 for i in list {
                     let mark = if p.cfg.adopted.contains_key(&i.path) { "★ adopted" } else { "" };
@@ -104,7 +105,7 @@ pub fn decisions(p: &Project) -> Result<String> {
     writeln!(s, "\nLocal decisions (doc comments):")?;
     let mut any = false;
     for (f, src) in p.owned_files() {
-        let Ok(list) = items::parse(&src) else { continue };
+        let Ok(list) = items::parse(p.lang, &src) else { continue };
         for i in list {
             let local = items::local_decisions(&i.docs);
             if !local.is_empty() {
@@ -166,7 +167,7 @@ pub fn accept(p: &mut Project, id: u32) -> Result<String> {
     std::fs::write(p.root.join(&x.file), &new)?;
     // You approved this change, so re-lock any adopted items it touched.
     let mut relocked = Vec::new();
-    if let Ok(list) = items::parse(&new) {
+    if let Ok(list) = items::parse(p.lang, &new) {
         for (path, a) in p.cfg.adopted.iter_mut().filter(|(_, a)| a.file == x.file) {
             if let Some(i) = list.iter().find(|i| &i.path == path) {
                 if i.hash != a.hash {
@@ -269,13 +270,19 @@ pub fn check(p: &Project) -> (bool, String) {
         ok = false;
         let _ = writeln!(s, "✗ dependency `{d}` has no decision record");
     }
-    let (cargo_ok, errors) = crate::engine::cargo_check(p);
-    if !cargo_ok {
-        ok = false;
-        let _ = writeln!(s, "✗ cargo check failed\n{errors}");
+    match crate::engine::check(p) {
+        Ok((true, _)) => {}
+        Ok((false, errors)) => {
+            ok = false;
+            let _ = writeln!(s, "✗ check failed\n{errors}");
+        }
+        Err(e) => {
+            ok = false;
+            let _ = writeln!(s, "✗ {e:#}");
+        }
     }
     if ok {
-        s.push_str("✓ adopted items intact, every dependency decided, cargo check passes");
+        s.push_str("✓ adopted items intact, every dependency decided, check passes");
     }
     (ok, s)
 }
