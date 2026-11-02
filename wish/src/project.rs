@@ -22,6 +22,16 @@ pub struct Config {
     pub adopted: BTreeMap<String, Adopted>,
     #[serde(default)]
     pub constraints: Constraints,
+    /// Java settings; absent for Rust projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub java: Option<JavaCfg>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct JavaCfg {
+    /// The class `wish dev` launches, e.g. `demo.Main`.
+    #[serde(default)]
+    pub main_class: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -184,6 +194,15 @@ impl Project {
         let abs = if p.is_absolute() { p.to_path_buf() } else { self.root.join(p) };
         let abs = normalize(&abs);
         abs.strip_prefix(normalize(&self.root)).ok().map(|r| r.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// The class to launch: `[java] main_class`, else `<mainClass>` in pom.xml, else `Main`.
+    pub fn main_class(&self) -> String {
+        let from_pom = || {
+            let re = regex::Regex::new(r"<mainClass>\s*([^<\s]+)\s*</mainClass>").unwrap();
+            re.captures(&self.read("pom.xml")?).map(|c| c[1].to_string())
+        };
+        self.cfg.java.as_ref().and_then(|j| j.main_class.clone()).or_else(from_pom).unwrap_or_else(|| "Main".into())
     }
 
     pub fn is_protected(&self, rel: &str) -> bool {
@@ -397,6 +416,35 @@ mod tests {
         assert!(wiring_only(Lang::Java, old, "package demo;\n\nclass Main {\n    void go2() {}\n}\n").is_err());
         assert!(wiring_only(Lang::Java, old, "package demo;\nimport java.util.List; int x;\n\nclass Main {\n    void go() {}\n}\n").is_err());
         assert!(wiring_only(Lang::Java, old, "package demo;\nuse foo::Bar;\n\nclass Main {\n    void go() {}\n}\n").is_err());
+    }
+
+    fn java_project(name: &str, toml: &str, pom: &str) -> super::Project {
+        let dir = std::env::temp_dir().join(format!("wish-{name}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wish.toml"), toml).unwrap();
+        std::fs::write(dir.join("pom.xml"), pom).unwrap();
+        super::Project::load(&dir).unwrap()
+    }
+
+    #[test]
+    fn java_table_is_read_in_any_position() {
+        for toml in ["[java]\nmain_class = \"a.Main\"\n\n[protected]\nfiles = [\"x\"]\n", "[protected]\nfiles = [\"x\"]\n\n[java]\nmain_class = \"a.Main\"\n"] {
+            let p = java_project("java-table", toml, "<project/>");
+            assert_eq!(p.main_class(), "a.Main");
+            p.save().unwrap();
+            assert_eq!(super::Project::load(&p.root).unwrap().main_class(), "a.Main");
+            let _ = std::fs::remove_dir_all(&p.root);
+        }
+    }
+
+    #[test]
+    fn main_class_falls_back_to_pom_then_main() {
+        let p = java_project("main-class", "", "<project><properties><mainClass> demo.Pom </mainClass></properties></project>");
+        assert_eq!(p.main_class(), "demo.Pom");
+        std::fs::write(p.root.join("pom.xml"), "<project/>").unwrap();
+        assert_eq!(p.main_class(), "Main");
+        let _ = std::fs::remove_dir_all(&p.root);
     }
 
     #[test]

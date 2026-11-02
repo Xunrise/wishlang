@@ -45,13 +45,39 @@ impl Default for Options {
 /// missing: that is not something Claude can fix, so no cycle should start.
 pub fn check(project: &Project) -> Result<(bool, String)> {
     match project.lang {
-        Lang::Rust => match Command::new("cargo").args(["check", "--quiet", "--message-format", "short"]).current_dir(&project.root).output() {
-            Ok(o) => Ok((o.status.success(), String::from_utf8_lossy(&o.stderr).trim().to_string())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("`cargo` was not found on PATH"),
-            Err(e) => Ok((false, e.to_string())),
-        },
-        Lang::Java => bail!("Java projects are not supported yet"),
+        Lang::Rust => {
+            let o = run_tool(project, "cargo", &["check", "--quiet", "--message-format", "short"])?;
+            Ok((o.status.success(), String::from_utf8_lossy(&o.stderr).trim().to_string()))
+        }
+        Lang::Java => mvn_compile(project),
     }
+}
+
+/// Run a toolchain command in the project. `Err` only if the tool is not installed.
+fn run_tool(project: &Project, tool: &str, args: &[&str]) -> Result<std::process::Output> {
+    match Command::new(tool).args(args).current_dir(&project.root).output() {
+        Ok(o) => Ok(o),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("`{tool}` was not found on PATH"),
+        Err(e) => bail!("could not run `{tool}`: {e}"),
+    }
+}
+
+/// `mvn -q compile`. Maven reports compile errors on stdout with absolute
+/// paths; keep the useful lines, with paths relative to the project.
+fn mvn_compile(project: &Project) -> Result<(bool, String)> {
+    let o = run_tool(project, "mvn", &["-q", "compile"])?;
+    let all = format!("{}\n{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let roots: Vec<String> = [Some(project.root.clone()), project.root.canonicalize().ok()].into_iter().flatten().map(|r| format!("{}/", r.display())).collect();
+    // Maven prints javac's report twice (raw, then as `[ERROR]` lines) and pads it with help text.
+    let noise = ["[ERROR] [Help", "[ERROR] -> [Help", "[ERROR] For more", "[ERROR] Re-run", "[ERROR] To see", "[ERROR] Failed to execute goal", "[ERROR] COMPILATION ERROR", "[ERROR] -----"];
+    let mut seen = std::collections::HashSet::new();
+    let text: Vec<String> = all
+        .lines()
+        .filter(|l| l.starts_with('[') && l.trim_end() != "[ERROR]" && !noise.iter().any(|n| l.starts_with(n)))
+        .map(|l| roots.iter().fold(l.to_string(), |l, r| l.replace(r.as_str(), "")))
+        .filter(|l| seen.insert(l.clone()))
+        .collect();
+    Ok((o.status.success(), text.join("\n")))
 }
 
 /// Item path -> hash for Claude-owned source files at a snapshot.
@@ -399,7 +425,7 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
         _ => "your code changed: asking Claude to regenerate".into(),
     }});
     let prompt = build_prompt(p, &PromptInput { diff: &diff, owned_edits: &owned_edits, human_owned: &human_owned, check_errors: if ok { "" } else { &errors }, opts, history });
-    let rules = format!("{}\n\n{}", claude::RULES, if implement { claude::IMPLEMENT } else { claude::PROTOTYPE });
+    let rules = claude::rules(p.lang, implement);
     let report = match claude::run(p, &prompt, &rules, sink) {
         Ok(r) => r,
         Err(e) => {
@@ -565,19 +591,31 @@ fn contract_changes(p: &Project, git: &Git, pre: &str, post: &str) -> Vec<String
 }
 
 pub fn build(p: &Project) -> (bool, String) {
-    match Command::new("cargo").args(["build", "--quiet"]).current_dir(&p.root).output() {
-        Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stderr).to_string()),
-        Err(e) => (false, e.to_string()),
-    }
+    let built = match p.lang {
+        Lang::Rust => run_tool(p, "cargo", &["build", "--quiet"]).map(|o| (o.status.success(), String::from_utf8_lossy(&o.stderr).to_string())),
+        // Maven's compile is the build: the app runs from target/classes.
+        Lang::Java => mvn_compile(p),
+    };
+    built.unwrap_or_else(|e| (false, format!("{e:#}")))
 }
 
 /// Launch the app as the live preview.
 pub fn spawn_preview(p: &Project, piped: bool) -> std::io::Result<Child> {
-    // Run the built binary directly: killing it then really stops the app
-    // (killing `cargo run` would orphan it), and cargo's warnings stay out.
-    let name = p.read("Cargo.toml").and_then(|t| t.parse::<toml::Table>().ok()).and_then(|t| t.get("package")?.get("name")?.as_str().map(String::from)).unwrap_or_else(|| "main".into());
-    let target = std::env::var("CARGO_TARGET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| p.root.join("target"));
-    let mut c = Command::new(target.join("debug").join(&name));
+    // Run the built program directly: killing it then really stops the app
+    // (killing `cargo run` or `mvn exec` would orphan it), and the build
+    // tool's own output stays out.
+    let mut c = match p.lang {
+        Lang::Rust => {
+            let name = p.read("Cargo.toml").and_then(|t| t.parse::<toml::Table>().ok()).and_then(|t| t.get("package")?.get("name")?.as_str().map(String::from)).unwrap_or_else(|| "main".into());
+            let target = std::env::var("CARGO_TARGET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| p.root.join("target"));
+            Command::new(target.join("debug").join(&name))
+        }
+        Lang::Java => {
+            let mut c = Command::new("java");
+            c.args(["-cp", "target/classes", &p.main_class()]);
+            c
+        }
+    };
     c.current_dir(&p.root);
     if piped {
         c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());

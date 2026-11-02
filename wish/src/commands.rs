@@ -2,26 +2,33 @@
 //! show it. Claude is blocked from running any of these by the hook.
 
 use crate::items;
-use crate::project::{Adopted, Project, Status};
-use anyhow::{Result, bail};
+use crate::project::{Adopted, Lang, Project, Status};
+use anyhow::{Result, anyhow, bail};
 use std::fmt::Write;
 
 pub fn init() -> Result<String> {
     let cwd = std::env::current_dir()?;
-    if !cwd.join("Cargo.toml").is_file() {
-        bail!("run `wish init` inside a cargo project");
+    let lang = Lang::detect(&cwd);
+    if !cwd.join(lang.manifest()).is_file() {
+        bail!("run `wish init` inside a cargo project (Cargo.toml) or a Maven project (pom.xml)");
     }
     if cwd.join("wish.toml").exists() {
         bail!("wish.toml already exists");
     }
-    let in_git = std::process::Command::new("git").args(["rev-parse", "--git-dir"]).current_dir(&cwd).output().is_ok_and(|o| o.status.success());
-    if !in_git {
-        std::process::Command::new("git").arg("init").arg("-q").current_dir(&cwd).status()?;
+    let mut p = Project { root: cwd, cfg: Default::default(), lang };
+    if lang == Lang::Java {
+        p.cfg.protected.files = vec![java_entry_point(&p)?];
     }
-    let lang = crate::project::Lang::detect(&cwd);
-    let p = Project { root: cwd, cfg: Default::default(), lang };
+    let in_git = std::process::Command::new("git").args(["rev-parse", "--git-dir"]).current_dir(&p.root).output().is_ok_and(|o| o.status.success());
+    if !in_git {
+        std::process::Command::new("git").arg("init").arg("-q").current_dir(&p.root).status()?;
+    }
     p.save()?;
     crate::engine::ensure_journal(&p, &crate::git::Git::open(&p.root)?)?;
+    let entry = &p.cfg.protected.files[0];
+    if lang == Lang::Java {
+        return Ok(format!("created wish.toml: {entry} is protected. Write your wishes there, then run `wish dev`."));
+    }
     let zed = p.root.join(".zed/settings.json");
     if !zed.exists() {
         std::fs::create_dir_all(zed.parent().unwrap())?;
@@ -32,7 +39,15 @@ pub fn init() -> Result<String> {
     if !has_rule {
         println!("note: to see generated code in blue, add wishlang's `semantic_token_rules` (see README) to your Zed user settings");
     }
-    Ok("created wish.toml and .zed/settings.json: src/main.rs is protected. Write your wishes there, then run `wish dev`.".into())
+    Ok(format!("created wish.toml and .zed/settings.json: {entry} is protected. Write your wishes there, then run `wish dev`."))
+}
+
+/// The first Java file with a `main` method: the user's own, protected file.
+fn java_entry_point(p: &Project) -> Result<String> {
+    p.src_files()
+        .into_iter()
+        .find(|f| p.read(f).is_some_and(|s| s.contains("static void main(")))
+        .ok_or_else(|| anyhow!("no class with a `static void main(` under {}: write your entry point there first, it becomes the protected file", p.lang.src_dir()))
 }
 
 /// Project settings for Zed: run `wish lsp` next to rust-analyzer, let

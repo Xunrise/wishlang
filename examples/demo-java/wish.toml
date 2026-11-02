@@ -1,0 +1,13 @@
+# wishlang project file. Edit [protected] and [constraints] freely;
+# [adopted] is maintained by `wish adopt` / `wish unadopt`.
+
+[protected]
+files = ["src/main/java/demo/Main.java"]
+
+[java]
+main_class = "demo.Main"
+
+[adopted]
+
+[constraints]
+rules = []

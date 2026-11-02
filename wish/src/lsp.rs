@@ -641,7 +641,11 @@ impl Server {
                 None => false,
             };
             if let Some(errors) = sink.check.take() {
-                me.state.lock().unwrap().check = parse_cargo(&errors);
+                let diagnostics = match me.lang() {
+                    Lang::Rust => parse_cargo(&errors),
+                    Lang::Java => parse_mvn(&errors),
+                };
+                me.state.lock().unwrap().check = diagnostics;
             }
             if ok {
                 me.notify("$/progress", json!({"token": token, "value": {"kind": "report", "message": "building preview"}}));
@@ -774,6 +778,22 @@ fn parse_cargo(text: &str) -> BTreeMap<String, Vec<Value>> {
     m
 }
 
+/// Turn `mvn -q compile` output (`[ERROR] File.java:[line,col] message`, paths
+/// relative to the project) into diagnostics.
+fn parse_mvn(text: &str) -> BTreeMap<String, Vec<Value>> {
+    let re = regex::Regex::new(r"^\[(ERROR|WARNING)\]\s+(\S+\.java):\[(\d+),(\d+)\]\s+(.*)$").unwrap();
+    let mut m: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for l in text.lines() {
+        if let Some(c) = re.captures(l) {
+            let line = c[3].parse::<u32>().unwrap_or(1).saturating_sub(1);
+            let col = c[4].parse::<u32>().unwrap_or(1).saturating_sub(1);
+            let sev = if &c[1] == "ERROR" { 1 } else { 2 };
+            m.entry(c[2].to_string()).or_default().push(json!({"range": range(line, col, line, col + 1), "severity": sev, "source": "wishlang (mvn)", "message": c[5].to_string()}));
+        }
+    }
+    m
+}
+
 struct LspSink {
     server: Server,
     token: String,
@@ -831,6 +851,15 @@ mod tests {
         let whos = [Claude, Claude, Claude, Human, Claude];
         // line 0 len 1; blank line 1 skipped; line 2 len 2 (+2); line 3 yours; line 4 len 3 (+2, prototype)
         assert_eq!(encode_tokens(&whos, text, &[(5, 5)]), [0, 0, 1, 0, 0, 2, 0, 2, 0, 0, 2, 0, 3, 0, 1]);
+    }
+
+    #[test]
+    fn mvn_diagnostics() {
+        let m = parse_mvn("[ERROR] src/main/java/demo/Main.java:[7,42] cannot find symbol\n[ERROR]   symbol:   method open(int,int)\n[WARNING] src/main/java/demo/App.java:[3,1] unchecked call\n[ERROR] -> [Help 1]");
+        assert_eq!(m["src/main/java/demo/Main.java"].len(), 1);
+        assert_eq!(m["src/main/java/demo/Main.java"][0]["severity"], 1);
+        assert_eq!(m["src/main/java/demo/Main.java"][0]["range"]["start"]["character"], 41);
+        assert_eq!(m["src/main/java/demo/App.java"][0]["severity"], 2);
     }
 
     #[test]
