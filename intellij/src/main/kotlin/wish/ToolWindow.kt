@@ -26,17 +26,19 @@ import java.util.concurrent.CompletableFuture
 import javax.swing.JEditorPane
 import javax.swing.tree.DefaultMutableTreeNode
 
+internal const val WISH_TOOL_WINDOW = "Wish"
+
 class WishToolWindowFactory : ToolWindowFactory, DumbAware {
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
         val contents = ContentFactory.getInstance()
         val log = WishLogPanel(project)
         Disposer.register(toolWindow.disposable, log)
         toolWindow.contentManager.addContent(contents.createContent(log, "Log", false))
+        val ticket = TicketPanel(project)
+        Disposer.register(toolWindow.disposable, ticket)
+        toolWindow.contentManager.addContent(contents.createContent(ticket, "Ticket", false))
     }
 }
-
-/** Selects the problem in the Ticket tab. */
-internal fun showProblem(project: Project, id: String) {}
 
 /** Runs [ok] on the EDT with the response; a failed request (no server, no ticket) goes to [failed]. */
 internal fun <T> CompletableFuture<T>.onEdt(project: Project, failed: (Throwable) -> Unit = {}, ok: (T) -> Unit) {
