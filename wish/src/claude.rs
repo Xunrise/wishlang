@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 pub const RULES: &str = r#"You are the implementation engine of wishlang, a "create from usage" tool for Rust.
 
@@ -230,7 +230,7 @@ pub fn run(project: &Project, prompt: &str, rules: &str, ticket: bool, sink: &mu
         "hooks": [{"type": "command", "command": format!("'{}' hook", exe.display())}]
     }]}});
 
-    let mut cmd = Command::new(std::env::var("WISH_CLAUDE").unwrap_or_else(|_| "claude".into()));
+    let mut cmd = project.command(project.var("WISH_CLAUDE").unwrap_or_else(|| "claude".into()));
     cmd.current_dir(&project.root)
         .env(crate::session::IN_CYCLE, "1")
         .arg("-p")
@@ -239,7 +239,7 @@ pub fn run(project: &Project, prompt: &str, rules: &str, ticket: bool, sink: &mu
         .args(["--settings", &settings.to_string()])
         .args(["--append-system-prompt", rules])
         .args(["--allowedTools", allowed_tools(project.lang)]);
-    if let Ok(model) = std::env::var("WISH_MODEL") {
+    if let Some(model) = project.var("WISH_MODEL") {
         cmd.args(["--model", &model]);
     }
     let mut child = cmd

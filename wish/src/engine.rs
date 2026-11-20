@@ -13,7 +13,7 @@ use crate::provenance;
 use crate::ticket::{self, Ticket};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 
 /// Subject of the commit that keeps your reformatted lines yours.
 pub const REFORMAT: &str = "your lines, reformatted";
@@ -56,7 +56,7 @@ pub fn check(project: &Project) -> Result<(bool, String)> {
 
 /// Run a toolchain command in the project. `Err` only if the tool is not installed.
 fn run_tool(project: &Project, tool: &str, args: &[&str]) -> Result<std::process::Output> {
-    match Command::new(tool).args(args).current_dir(&project.root).output() {
+    match project.command(tool).args(args).current_dir(&project.root).output() {
         Ok(o) => Ok(o),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("`{tool}` was not found on PATH"),
         Err(e) => bail!("could not run `{tool}`: {e}"),
@@ -465,7 +465,7 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
         (_, Some(d)) if d.is_empty() && owned_edits.is_empty() => "asking Claude to fix the build".into(),
         _ => "your code changed: asking Claude to regenerate".into(),
     }});
-    let ticket = ticket::start(&p.root, git.branch(), sink);
+    let ticket = ticket::start(p, git.branch(), sink);
     let prompt = build_prompt(p, &PromptInput { diff: &diff, focus: &focus, owned_edits: &owned_edits, human_owned: &human_owned, check_errors: if ok { "" } else { &errors }, opts, history, ticket: &ticket });
     let rules = claude::rules(p.lang, implement);
     let report = match claude::run(p, &prompt, &rules, ticket.is_some(), sink) {
@@ -663,11 +663,11 @@ pub fn spawn_preview(p: &Project, piped: bool) -> std::io::Result<Child> {
     let mut c = match p.lang {
         Lang::Rust => {
             let name = p.read("Cargo.toml").and_then(|t| t.parse::<toml::Table>().ok()).and_then(|t| t.get("package")?.get("name")?.as_str().map(String::from)).unwrap_or_else(|| "main".into());
-            let target = std::env::var("CARGO_TARGET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| p.root.join("target"));
-            Command::new(target.join("debug").join(&name))
+            let target = p.var("CARGO_TARGET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| p.root.join("target"));
+            p.command(target.join("debug").join(&name))
         }
         Lang::Java => {
-            let mut c = Command::new("java");
+            let mut c = p.command("java");
             c.args(["-cp", "target/classes", &p.main_class()]);
             c
         }

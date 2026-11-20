@@ -15,7 +15,7 @@ pub fn init(protect_existing: bool) -> Result<String> {
     if cwd.join("wish.toml").exists() {
         bail!("wish.toml already exists");
     }
-    let mut p = Project { root: cwd, cfg: Default::default(), lang };
+    let mut p = Project { root: cwd, cfg: Default::default(), lang, env: Vec::new() };
     if protect_existing {
         p.cfg.protected.files = p.src_files();
         if p.cfg.protected.files.is_empty() {

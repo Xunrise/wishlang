@@ -157,6 +157,9 @@ pub struct Project {
     pub root: PathBuf,
     pub cfg: Config,
     pub lang: Lang,
+    /// Environment of the client this project is served for (empty: this process's own).
+    /// The daemon fills it from the client's handshake, so tools resolve on the user's PATH.
+    pub env: Vec<(String, String)>,
 }
 
 impl Project {
@@ -179,7 +182,7 @@ impl Project {
     pub fn load(root: &Path) -> Result<Self> {
         let text = fs::read_to_string(root.join("wish.toml"))?;
         let cfg = toml::from_str(&text).context("parsing wish.toml")?;
-        Ok(Self { root: root.to_path_buf(), cfg, lang: Lang::detect(root) })
+        Ok(Self { root: root.to_path_buf(), cfg, lang: Lang::detect(root), env: Vec::new() })
     }
 
     pub fn save(&self) -> Result<()> {
@@ -191,6 +194,22 @@ impl Project {
         text.push_str(&toml::to_string_pretty(&self.cfg)?);
         fs::write(self.root.join("wish.toml"), text)?;
         Ok(())
+    }
+
+    /// An environment variable as the client sees it.
+    pub fn var(&self, key: &str) -> Option<String> {
+        match self.env.iter().find(|(k, _)| k == key) {
+            Some((_, v)) => Some(v.clone()),
+            None => std::env::var(key).ok(),
+        }
+    }
+
+    /// A command for a tool (claude, cargo, mvn, java, the app) in the client's environment.
+    /// With PATH overridden, the program is also looked up on the client's PATH.
+    pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+        let mut c = std::process::Command::new(program);
+        c.envs(self.env.iter().map(|(k, v)| (k, v)));
+        c
     }
 
     pub fn state_dir(&self) -> PathBuf {

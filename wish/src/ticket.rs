@@ -112,10 +112,10 @@ fn notes(dir: &Path) -> Vec<(&'static str, String)> {
 /// notes by one Claude call if `problems.json` does not exist yet). None when
 /// the branch has no ticket or the notes aren't there; when the problems can't
 /// be had, a warning says why and the cycle runs without ticket mode.
-pub fn start(root: &Path, branch: &str, sink: &mut dyn Sink) -> Option<Ticket> {
+pub fn start(p: &Project, branch: &str, sink: &mut dyn Sink) -> Option<Ticket> {
     let key = key(branch)?;
-    let dir = notes_dir(root, &key)?;
-    match ensure_problems(root, &dir, &key) {
+    let dir = notes_dir(&p.root, &key)?;
+    match ensure_problems(p, &dir, &key) {
         Ok(problems) => Some(Ticket { key, problems }),
         Err(e) => {
             sink.emit(Event::Warning { msg: format!("ticket {key}: {e:#}; running without ticket mode") });
@@ -124,7 +124,7 @@ pub fn start(root: &Path, branch: &str, sink: &mut dyn Sink) -> Option<Ticket> {
     }
 }
 
-fn ensure_problems(root: &Path, dir: &Path, key: &str) -> Result<Vec<Problem>> {
+fn ensure_problems(p: &Project, dir: &Path, key: &str) -> Result<Vec<Problem>> {
     let existing = problems(dir)?;
     if !existing.is_empty() || dir.join("problems.json").exists() {
         validate(&existing).context("problems.json")?;
@@ -134,7 +134,7 @@ fn ensure_problems(root: &Path, dir: &Path, key: &str) -> Result<Vec<Problem>> {
     if notes.is_empty() {
         bail!("{} has neither intent.md nor spec.md to extract problems from", dir.display());
     }
-    let extracted = extract(&claude_json(root, &extraction_prompt(key, &notes))?)?;
+    let extracted = extract(&claude_json(p, &extraction_prompt(key, &notes))?)?;
     save_problems(dir, &extracted)?;
     Ok(extracted)
 }
@@ -166,10 +166,10 @@ fn extraction_schema() -> Value {
 }
 
 /// One structured Claude call; returns the CLI's JSON result.
-fn claude_json(root: &Path, prompt: &str) -> Result<Value> {
-    let mut cmd = Command::new(std::env::var("WISH_CLAUDE").unwrap_or_else(|_| "claude".into()));
-    cmd.current_dir(root).env(crate::session::IN_CYCLE, "1").args(["-p", "--output-format", "json"]).args(["--json-schema", &extraction_schema().to_string()]);
-    if let Ok(model) = std::env::var("WISH_MODEL") {
+fn claude_json(p: &Project, prompt: &str) -> Result<Value> {
+    let mut cmd = p.command(p.var("WISH_CLAUDE").unwrap_or_else(|| "claude".into()));
+    cmd.current_dir(&p.root).env(crate::session::IN_CYCLE, "1").args(["-p", "--output-format", "json"]).args(["--json-schema", &extraction_schema().to_string()]);
+    if let Some(model) = p.var("WISH_MODEL") {
         cmd.args(["--model", &model]);
     }
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("starting `claude` to extract the problems")?;
