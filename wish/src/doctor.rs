@@ -75,9 +75,11 @@ fn checks() -> Vec<Check> {
     } else {
         ok("build tool", build.join(", "))
     });
+    // `wish` is only an alias: macOS's /usr/bin/wish (Tk) is harmless, an old wishlang named `wish` is not.
     out.push(match which("wish") {
-        Some(p) => warn("wish on PATH", format!("{} (the Tk windowing shell, or an old wish binary)", p.display()), "use `wishlang`; remove the old binary if it is ours"),
-        None => ok("wish on PATH", "nothing shadows wishlang"),
+        Some(p) if p.starts_with("/usr/bin") || p.starts_with("/bin") => ok("wish alias", format!("{} is the Tk shell; use `wishlang`", p.display())),
+        Some(p) => warn("wish alias", format!("{} may be an old wishlang build", p.display()), "remove it if it is ours, and use `wishlang`"),
+        None => ok("wish alias", "nothing named wish on PATH"),
     });
     out.push(match (which("wishlang"), &exe) {
         (None, _) => warn("wishlang path", "not on PATH", "add its directory to PATH (installer: ~/.local/bin)"),
@@ -112,10 +114,12 @@ fn hooks_check(settings: Option<&Path>) -> Check {
         Some(rest) => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
         None => PathBuf::from(bin),
     };
-    if path.exists() {
-        ok("claude hooks", format!("installed, run {bin}"))
-    } else {
+    if !path.exists() {
         fail("claude hooks", format!("hook points at {bin}, which does not exist"), "run `wishlang setup`")
+    } else if !path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("wishlang")) {
+        warn("claude hooks", format!("installed, but run the old binary {bin}"), "run `wishlang setup`")
+    } else {
+        ok("claude hooks", format!("installed, run {bin}"))
     }
 }
 
