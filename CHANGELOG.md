@@ -4,6 +4,8 @@ All notable changes are listed here. Versions follow [semver](https://semver.org
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-20
+
 First public release.
 
 ### Added
