@@ -1,5 +1,12 @@
 # wishlang
 
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Release](https://img.shields.io/github/v/release/Xunrise/wishlang)](https://github.com/Xunrise/wishlang/releases/latest)
+[![JetBrains Marketplace](https://img.shields.io/badge/IntelliJ-Marketplace-orange)](https://plugins.jetbrains.com/plugin/io.wishlang.intellij)
+[![Zed extension](https://img.shields.io/badge/Zed-extension-blue)](https://zed.dev/extensions?query=wishlang)
+
+**Write the call you wish existed.** [xunrise.github.io/wishlang](https://xunrise.github.io/wishlang/)
+
 Create-from-usage for Rust and Java (Maven), in Zed and IntelliJ. You write the call sites you wish existed; Claude writes the vocabulary underneath, first as a skimmable **prototype**, then, once you're happy, as the real **implementation**. The app restarts on every save so you see each change.
 
 ```rust
@@ -51,13 +58,19 @@ Java editing is supported in IntelliJ only. In Zed, jdtls reports unresolved-sym
 
 ## IntelliJ
 
+Install **wishlang** from the JetBrains Marketplace (**Settings › Plugins › Marketplace**). If `wishlang` is not installed, the plugin says so on project open and offers to download the latest release for your platform into `~/.local/bin` (macOS and Linux).
+
+To build it yourself:
+
 ```sh
 cd intellij && ./gradlew buildPlugin     # add -PlocalIde="/Applications/IntelliJ IDEA.app" to build against an installed IDE
 ```
 
-Install `intellij/build/distributions/*.zip` via **Settings › Plugins › ⚙ › Install Plugin from Disk**. To try it in a sandbox IDE instead: `./gradlew runIde -PdemoProject=/path/to/project`.
+Install `intellij/build/distributions/*.zip` via **Settings › Plugins › ⚙ › Install Plugin from Disk**. To try it in a sandbox IDE instead: `./gradlew runIde -PdemoProject=/path/to/project`. `./gradlew verifyPlugin` runs the Plugin Verifier against the IntelliJ IDEA releases since `sinceBuild`.
 
-The plugin runs `wishlang lsp` from `$WISH_BIN`, else the first of `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `~/.cargo/bin` that has `wishlang`. It never runs a `wish` from PATH, because `/usr/bin/wish` on macOS is Tk.
+Publishing: `./gradlew publishPlugin` signs and uploads the plugin. It reads the signing certificate chain, private key and its password from `CERTIFICATE_CHAIN`, `PRIVATE_KEY` and `PRIVATE_KEY_PASSWORD`, and the Marketplace token from `PUBLISH_TOKEN`. Keep them out of the repository.
+
+The plugin runs `wishlang lsp` from `$WISH_BIN`, else the first of `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `~/.cargo/bin` and (Windows) `%LOCALAPPDATA%\wishlang\bin` that has `wishlang`. It never runs a `wish` from PATH, because `/usr/bin/wish` on macOS is Tk.
 
 **Windows IDE, project in WSL** (opened as `\\wsl.localhost\<distro>\…`): the plugin starts `wishlang lsp` inside that distro through `wsl.exe`, in an interactive login bash so `.bashrc`'s PATH (Java, Maven, `claude`) applies, and maps the IDE's UNC paths to Linux paths. Install wish in WSL (`cargo install --path wish`). `$WISH_BIN` is then read on the Linux side. From WSL, `intellij/deploy.sh` builds the plugin and publishes it to a custom plugin repository on the Windows side (`C:\Users\<you>\hexagonal-inspector-repo\updatePlugins.xml` by default, `WISH_DEPLOY_DIR` to override). After each deploy, update it under **Settings › Plugins › Updates**.
 
@@ -106,6 +119,8 @@ An ordinary Claude Code session ("change X") is recorded too, once `wishlang ses
 For code written before that, `wishlang import <since>` rebuilds the branch's journal: the code at `<since>` is yours, every commit since that touches the project is Claude's (one `imported` entry each, explained by its commit message), uncommitted changes are yours. `--report file.json` adds per-item reasons and problem tags: `{"<sha>": {"changes": [{"item", "why", "problems"}], "problems": [...]}}` (`problems` creates `problems.json` if it doesn't exist). In Zed, hovering an item says "Solves P#", the `◆ P1 · P2` lens opens `problems.json`, untraced code gets the red rule from the settings above, untraced warnings show in project diagnostics, and the task `wish: ticket` lists the tracing in the terminal.
 
 ## Working in Zed
+
+Install **wishlang** from Zed's extensions (**zed: extensions**). The extension runs `$WISH_BIN`, else `wishlang` from PATH, else downloads the latest release for your platform into its own folder and keeps it updated. To work on the extension, run **zed: install dev extension** and pick this repo's `zed/` folder.
 
 Open `examples/demo` (or any project after `wishlang init`) in Zed.
 
