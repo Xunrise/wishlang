@@ -7,7 +7,7 @@
 
 **Write the call you wish existed.** [xunrise.github.io/wishlang](https://xunrise.github.io/wishlang/)
 
-Create-from-usage for Rust and Java (Maven), in Zed and IntelliJ. You write the call sites you wish existed; Claude writes the vocabulary underneath, first as a skimmable **prototype**, then, once you're happy, as the real **implementation**. The app restarts on every save so you see each change.
+Create-from-usage for Rust and Java (Maven), in Zed, IntelliJ and Neovim. You write the call sites you wish existed; Claude writes the vocabulary underneath, first as a skimmable **prototype**, then, once you're happy, as the real **implementation**. The app restarts on every save so you see each change.
 
 ```rust
 fn main() {
@@ -147,6 +147,19 @@ wishlang setup
 It adds `UserPromptSubmit` and `Stop` hooks running this binary's absolute path with `session`, and the permission `Bash(<path> explain:*)`, to `~/.claude/settings.json`. It replaces older `wish` entries, keeps your other hooks, shows a diff and asks before writing (`--yes` skips the question, `--uninstall` removes the entries). When you send a prompt, what is on disk is recorded as yours. When Claude's turn ends, everything that changed during the turn is Claude's, however it was written (Edit, Write or a shell command). If the turn changed items, the hook first sends Claude back once to explain them, with the ticket's problems: Claude pipes `{"summary", "changes": [{"item", "why", "problems"}]}` into `wishlang explain`. The result is a `session` entry in the journal, like a cycle: blue code, hovers with the reason, `Triggered by` your prompt, and the ticket tab. The hook does nothing without a `wish.toml` in the session's directory, a parent, or a direct subdirectory, and nothing inside wish's own cycles. While one session's turn is running, a prompt in another session on the same project doesn't record the disk as yours: the running session's Stop records it as Claude's.
 
 For code written before that, `wishlang import <since>` rebuilds the branch's journal: the code at `<since>` is yours, every commit since that touches the project is Claude's (one `imported` entry each, explained by its commit message), uncommitted changes are yours. `--report file.json` adds per-item reasons and problem tags: `{"<sha>": {"changes": [{"item", "why", "problems"}], "problems": [...]}}` (`problems` creates `problems.json` if it doesn't exist). In Zed, hovering an item says "Solves P#", the `◆ P1 · P2` lens opens `problems.json`, untraced code gets the red rule from the settings above, untraced warnings show in project diagnostics, and the task `wish: ticket` lists the tracing in the terminal.
+
+## Working in Neovim
+
+The Lua plugin in `nvim/` starts `wishlang lsp` for Rust and Java, tints generated code, shows the reasons on hover, adds code lenses for Implement and Accept/Reject, and `:WishLog` / `:WishTicket`. With lazy.nvim:
+
+```lua
+{ "Xunrise/wishlang", ft = { "rust", "java" }, config = function(plugin)
+  vim.opt.rtp:append(plugin.dir .. "/nvim")
+  require("wishlang").setup()
+end }
+```
+
+Other plugin managers, options and commands: [nvim/README.md](nvim/README.md). `:checkhealth wishlang` verifies the installation.
 
 ## Working in Zed
 
