@@ -4,6 +4,9 @@ All notable changes are listed here. Versions follow [semver](https://semver.org
 
 ## [Unreleased]
 
+### Added
+- Neovim plugin (`nvim/`): starts `wishlang lsp` for Rust and Java, tints generated code, hover reasons, code lenses for Implement and Accept/Reject, `:WishLog` and `:WishTicket`, and `:checkhealth wishlang`.
+
 ## [0.1.1] - 2026-11-20
 
 First public release.

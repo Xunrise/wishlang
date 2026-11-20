@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>wishlang: write the call you wish existed</title>
-<meta name="description" content="Create-from-usage for Rust and Java. You write the call sites; Claude Code writes the code underneath, as a skimmable prototype first and then the real implementation, tinted and traced in IntelliJ and Zed.">
+<meta name="description" content="Create-from-usage for Rust and Java. You write the call sites; Claude Code writes the code underneath, as a skimmable prototype first and then the real implementation, tinted and traced in IntelliJ, Zed and Neovim.">
 <meta property="og:title" content="wishlang: write the call you wish existed">
-<meta property="og:description" content="Create-from-usage for Rust and Java, in IntelliJ and Zed.">
+<meta property="og:description" content="Create-from-usage for Rust and Java, in IntelliJ, Zed and Neovim.">
 <meta name="theme-color" content="#14120f" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#f2ede3" media="(prefers-color-scheme: light)">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -36,7 +36,7 @@
       <p class="lead">You write the call sites. Claude Code writes the code underneath: a skimmable prototype first, the real implementation once you like it. Every generated line is tinted in your editor, with the reason on hover.</p>
       <div class="actions">
         <a class="btn primary" href="#install">Install wishlang</a>
-        <a class="btn" href="#editors">IntelliJ and Zed plugins</a>
+        <a class="btn" href="#editors">IntelliJ, Zed and Neovim plugins</a>
       </div>
       <p class="fine">MIT OR Apache-2.0 · needs Claude Code · no telemetry</p>
     </div>
@@ -102,7 +102,7 @@
   <div class="wrap">
     <div style="display:flex;flex-direction:column;gap:10px;max-width:40em">
       <h2>You always know who wrote a line, and why.</h2>
-      <p class="dim">The IntelliJ plugin and the Zed extension tint everything Claude generated. Hover for the reason and the edit that triggered it. On a ticket branch, every change is traced to a problem of the ticket.</p>
+      <p class="dim">The IntelliJ plugin, the Zed extension and the Neovim plugin tint everything Claude generated. Hover for the reason and the edit that triggered it. On a ticket branch, every change is traced to a problem of the ticket.</p>
     </div>
     <div class="grid legend">
       <div><span class="mark" style="background:var(--info)" aria-hidden="true"></span><p><b>Tinted</b><span class="dim">Gutter bar and a faint tint on generated code, stronger and italic while mocked.</span></p></div>
@@ -120,6 +120,11 @@
         <div class="head"><h3>Zed</h3><span class="ok">✓ Rust</span></div>
         <p class="dim">Runs next to rust-analyzer and colours generated code through semantic tokens. Downloads the wishlang binary itself when it is not on PATH.</p>
         <a class="btn" href="https://zed.dev/extensions?query=wishlang">Install from Zed extensions</a>
+      </div>
+      <div class="card">
+        <div class="head"><h3>Neovim</h3><span class="ok">✓ Rust · Java</span></div>
+        <p class="dim">Lua plugin: semantic-token tint, hover reasons, code lenses for Implement and Accept/Reject, <span class="mono">:WishLog</span> and <span class="mono">:WishTicket</span>. Add the repo's <span class="mono">nvim/</span> folder to your runtimepath.</p>
+        <a class="btn" href="https://github.com/Xunrise/wishlang/tree/master/nvim#install">Install the Neovim plugin</a>
       </div>
     </div>
   </div>
