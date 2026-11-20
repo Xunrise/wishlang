@@ -144,14 +144,13 @@ impl Git {
     fn migrate(&self) {
         for name in PER_BRANCH {
             let old = format!("refs/wish/{}{name}", self.prefix);
-            if let Ok(sha) = self.git(&["rev-parse", "--verify", "--quiet", &format!("{old}^{{commit}}")]) {
-                let sha = sha.trim().to_string();
+            if let Some(sha) = self.resolve(&old) {
                 let _ = self.git(&["update-ref", "-d", &old]);
                 let _ = self.git(&["update-ref", &self.ref_name(name), &sha]);
             }
         }
         let old_log = format!("refs/heads/wish/{}log", self.prefix);
-        if let Ok(sha) = self.git(&["rev-parse", "--verify", "--quiet", &old_log]) {
+        if let Some(sha) = self.resolve(&old_log) {
             let _ = self.git(&["update-ref", "-d", &old_log]);
             let _ = self.git(&["update-ref", &self.journal_branch(), sha.trim()]);
         }
@@ -167,10 +166,15 @@ impl Git {
     }
 
     fn run(&self, args: &[&str], temp_index: bool, who: Who, stdin: Option<&str>) -> Result<String> {
+        self.run_in(args, temp_index.then_some(self.index.as_path()), who, stdin)
+    }
+
+    /// Run git, with `index` as its index file if given.
+    fn run_in(&self, args: &[&str], index: Option<&Path>, who: Who, stdin: Option<&str>) -> Result<String> {
         let mut c = Command::new("git");
         c.args(args).current_dir(&self.root);
-        if temp_index {
-            c.env("GIT_INDEX_FILE", &self.index);
+        if let Some(i) = index {
+            c.env("GIT_INDEX_FILE", i);
         }
         let (name, mail) = who.ident();
         c.env("GIT_AUTHOR_NAME", name).env("GIT_AUTHOR_EMAIL", mail);
@@ -194,26 +198,39 @@ impl Git {
     /// Tree of the project directory as on disk (honouring .gitignore),
     /// optionally limited to some paths.
     pub fn tree(&self, only: Option<&[String]>) -> Result<String> {
+        let Some(paths) = only else { return self.full_tree() };
         let _ = std::fs::remove_file(&self.index);
         let mut args: Vec<&str> = vec!["add", "-A", "--"];
-        match only {
-            Some(paths) => args.extend(paths.iter().map(String::as_str).filter(|p| self.root.join(p).exists())),
-            None => {
-                args.push(".");
-                // Build output never belongs in a snapshot, even without a
-                // .gitignore. (Git errors on an exclude pathspec naming an
-                // already-ignored path, so only add it when needed.)
-                if self.git(&["check-ignore", "-q", "target"]).is_err() {
-                    args.push(":(exclude)target");
-                }
-            }
-        }
+        args.extend(paths.iter().map(String::as_str).filter(|p| self.root.join(p).exists()));
         if args.len() > 3 {
             self.run(&args, true, Who::Human, None)?;
         }
         let tree = self.run(&["write-tree"], true, Who::Human, None)?;
         let _ = std::fs::remove_file(&self.index);
         Ok(tree.trim().to_string())
+    }
+
+    /// Tree of the whole project directory. Its index is kept between snapshots, so git
+    /// only re-reads files whose stat changed (a fresh index hashes every file, every time).
+    fn full_tree(&self) -> Result<String> {
+        let index = self.index.with_file_name("wish-snapshot-index");
+        let idx = Some(index.as_path());
+        // Files that became ignored since the last snapshot leave it, as with a fresh index.
+        let ignored = self.run_in(&["ls-files", "-z", "--cached", "--ignored", "--exclude-standard", "--", "."], idx, Who::Human, None)?;
+        let ignored: Vec<&str> = ignored.split('\0').filter(|f| !f.is_empty()).collect();
+        if !ignored.is_empty() {
+            let mut rm = vec!["rm", "--cached", "-q", "--ignore-unmatch", "--"];
+            rm.extend(ignored);
+            self.run_in(&rm, idx, Who::Human, None)?;
+        }
+        let mut args = vec!["add", "-A", "--", "."];
+        // Build output never belongs in a snapshot, even without a .gitignore. (Git errors on
+        // an exclude pathspec naming an already-ignored path, so only add it when needed.)
+        if self.git(&["check-ignore", "-q", "target"]).is_err() {
+            args.push(":(exclude)target");
+        }
+        self.run_in(&args, idx, Who::Human, None)?;
+        Ok(self.run_in(&["write-tree"], idx, Who::Human, None)?.trim().to_string())
     }
 
     /// Tree of commit `base` with some files (relative paths) replaced.
@@ -440,7 +457,10 @@ impl Git {
         }
         let dir = if r == "HEAD" { &self.git_dir } else { &self.common_dir };
         let is_sha = |t: &str| (t.len() == 40 || t.len() == 64) && t.bytes().all(|b| b.is_ascii_hexdigit());
-        match std::fs::read_to_string(dir.join(r)) {
+        // A directory (`refs/wish/journal/` holding per-branch refs) is no loose ref of that name.
+        let loose = dir.join(r);
+        let read = if loose.is_dir() { Err(std::io::ErrorKind::NotFound.into()) } else { std::fs::read_to_string(loose) };
+        match read {
             Ok(text) => {
                 let t = text.trim();
                 if let Some(target) = t.strip_prefix("ref: ") {

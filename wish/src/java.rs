@@ -301,6 +301,53 @@ impl V<'_> {
         sups.is_some_and(|sups| sups.iter().map(|s| s.strip_prefix("import:").unwrap_or(s)).any(|s| !self.known.is_type(s) || self.foreign.contains(s)))
     }
 
+    /// The declared type of local variable or parameter `n`, from its declaration in the enclosing
+    /// method, constructor or lambda (`var x = new T()` counts as `T`). ponytail: the last declaration
+    /// before `n` wins, so a shadowing name in a sibling block can mislead it; javac stays the backstop.
+    fn local_type(&self, n: Node) -> Option<String> {
+        let name = self.text(n);
+        let mut scope = n.parent();
+        while let Some(s) = scope {
+            if matches!(s.kind(), "method_declaration" | "constructor_declaration" | "lambda_expression" | "static_initializer" | "compact_constructor_declaration") {
+                break;
+            }
+            scope = s.parent();
+        }
+        let mut found = None;
+        let mut stack = vec![scope?];
+        while let Some(d) = stack.pop() {
+            if d.start_byte() >= n.start_byte() {
+                continue;
+            }
+            let ty = match d.kind() {
+                "local_variable_declaration" => {
+                    let mut cur = d.walk();
+                    let decl = d.children_by_field_name("declarator", &mut cur).find(|x| x.child_by_field_name("name").is_some_and(|nm| self.text(nm) == name));
+                    decl.and_then(|x| {
+                        let t = d.child_by_field_name("type")?;
+                        if self.text(t) != "var" {
+                            return Some(type_head(t, self.src));
+                        }
+                        let v = x.child_by_field_name("value").filter(|v| v.kind() == "object_creation_expression")?;
+                        Some(type_head(v.child_by_field_name("type")?, self.src))
+                    })
+                }
+                "formal_parameter" | "catch_formal_parameter" | "enhanced_for_statement" => {
+                    d.child_by_field_name("name").filter(|nm| self.text(*nm) == name).and_then(|_| d.child_by_field_name("type")).map(|t| type_head(t, self.src))
+                }
+                _ => None,
+            };
+            if let Some(t) = ty.filter(|t| t != "var") {
+                if found.as_ref().is_none_or(|(at, _)| d.start_byte() > *at) {
+                    found = Some((d.start_byte(), t));
+                }
+            }
+            let mut cur = d.walk();
+            stack.extend(d.named_children(&mut cur));
+        }
+        found.map(|(_, t)| t)
+    }
+
     /// Paths of the type declarations around `n`, innermost first (`Outer.Inner`, `Outer`).
     fn enclosing(&self, n: Node) -> Vec<String> {
         let mut names = Vec::new();
@@ -330,6 +377,9 @@ impl V<'_> {
         match n.kind() {
             "identifier" => {
                 let t = self.text(n);
+                if let Some(ty) = self.local_type(n) {
+                    return Some([ty].into());
+                }
                 if self.known.is_type(t) {
                     return Some([t.to_string()].into());
                 }
@@ -386,7 +436,8 @@ impl V<'_> {
                 let member = n.child_by_field_name(if n.kind() == "field_access" { "field" } else { "name" });
                 // A member the project doesn't declare, on a type with a library supertype, is the library's.
                 let inherited = object.zip(member).is_some_and(|(o, m)| !self.known.has_name(self.text(m)) && self.open(o));
-                object.is_some_and(|o| self.rooted(o)) && !inherited && member.is_some_and(|m| self.yields_ours(m, object))
+                let object_method = member.is_some_and(|m| OBJECT_METHODS.contains(&self.text(m)));
+                object.is_some_and(|o| self.rooted(o)) && !inherited && !object_method && member.is_some_and(|m| self.yields_ours(m, object))
             }
             "parenthesized_expression" => n.named_child(0).is_some_and(|c| self.rooted(c)),
             "object_creation_expression" => n.child_by_field_name("type").is_some_and(|t| {
@@ -399,9 +450,13 @@ impl V<'_> {
                 if self.foreign.contains(t) {
                     return false;
                 }
+                if let Some(ty) = self.local_type(n) {
+                    let head = ty.split('.').next().unwrap_or(&ty);
+                    return !self.foreign.contains(head) && self.ours(&ty);
+                }
                 if (upper(t) && self.value(t)) || self.own.types_of(t).is_some() {
                     // a constant like `LOGGER`, or a field this file declares (`stagingPort`); other
-                    // lowercase names are locals and parameters, which we can't type
+                    // lowercase names we can't type (inherited fields, `var` without `new`)
                     self.yields_ours(n, None)
                 } else {
                     self.known.has_path_or_tail(t) || (upper(t) && !self.external(t))
@@ -678,8 +733,11 @@ public class App {
                 static class DetailsBuilder { DetailsBuilder pets(List<Integer> p) { return this; } }\n\
             }\n\
             class Section implements Map<String, String> { java.util.Set<Entry<String, String>> entries() { return null; } }\n\
-            class C { Cache<String, String> cache; WebClient.Builder web; Object f(Object o) { web.build().get().uri(\"/\"); return cache.getAndRemove(\"k\") + o.getClass().getName(); } }";
+            class C { Cache<String, String> cache; WebClient.Builder web; Object f(Object o) { web.build().get().uri(\"/\"); return cache.getAndRemove(\"k\") + o.getClass().getName() + this.getClass().getSimpleName(); } }";
         assert_eq!(n(more), Vec::<String>::new());
+        let locals = "package app.web;\nimport java.util.List;\nimport javax.cache.Cache;\n\
+            class M { void f(Cache<String, String> c, List<String> xs) { Ledger ledger = Ledger.inMemory(); ledger.post(1); var l2 = new Ledger(); l2.close(); c.getAndRemove(\"k\"); xs.stream(); } }";
+        assert_eq!(n(locals), ["Ledger", "Ledger.inMemory", ".post()", "Ledger", ".close()"]);
         // wishes still show next to all that
         assert_eq!(n("package app.web;\nimport app.model.*;\nclass W { void f(OwnerRepository o) { new Dunning(o).run(); } }"), ["Dunning", ".run()"]);
     }
