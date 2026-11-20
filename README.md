@@ -2,7 +2,7 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Release](https://img.shields.io/github/v/release/Xunrise/wishlang)](https://github.com/Xunrise/wishlang/releases/latest)
-[![JetBrains Marketplace](https://img.shields.io/badge/IntelliJ-Marketplace-orange)](https://plugins.jetbrains.com/plugin/io.wishlang.intellij)
+[![JetBrains Marketplace](https://img.shields.io/badge/IntelliJ-Marketplace-orange)](https://plugins.jetbrains.com/search?search=wishlang)
 [![Zed extension](https://img.shields.io/badge/Zed-extension-blue)](https://zed.dev/extensions?query=wishlang)
 
 **Write the call you wish existed.** [xunrise.github.io/wishlang](https://xunrise.github.io/wishlang/)

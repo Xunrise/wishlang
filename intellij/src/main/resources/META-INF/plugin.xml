@@ -1,5 +1,5 @@
 <idea-plugin>
-  <id>io.wishlang.intellij</id>
+  <id>io.wishlang</id>
   <name>wishlang</name>
   <vendor url="https://github.com/Xunrise/wishlang">wishlang</vendor>
   <description><![CDATA[

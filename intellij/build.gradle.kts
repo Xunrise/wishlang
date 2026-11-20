@@ -103,7 +103,7 @@ val deploy by tasks.registering {
         val target = File(dir.get()).apply { mkdirs() }
         val zipName = "wish.zip"
         zip.get().asFile.copyTo(File(target, zipName), overwrite = true)
-        val id = "io.wishlang.intellij"
+        val id = "io.wishlang"
         val entry = """  <plugin id="$id" url="${url.get().trimEnd('/')}/$zipName" version="$pluginVersion">
             |    <name>wishlang</name>
             |    <idea-version since-build="$since"/>
