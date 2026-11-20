@@ -3,8 +3,8 @@ name = "wishlang"
 version = "0.1.0"
 schema_version = 1
 authors = ["Martin Galusinski <16625871+Xunrise@users.noreply.github.com>"]
-description = "Create-from-usage for Rust: write the call sites, Claude prototypes and implements the rest."
-repository = "https://github.com/example/wishlang"
+description = "Create-from-usage for Rust: write the call sites you wish existed, Claude Code writes the code underneath, tinted and traced. Java is supported in IntelliJ."
+repository = "https://github.com/Xunrise/wishlang"
 
 [language_servers.wish]
 name = "wishlang"
