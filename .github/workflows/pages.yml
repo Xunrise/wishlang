@@ -1,5 +1,7 @@
 name: Pages
 
+# Deploys site/ to https://xunrise.github.io/wishlang/ on changes to the site (or run it by hand).
+
 on:
   push:
     branches: [master]
