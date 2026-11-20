@@ -12,7 +12,7 @@ use crate::items::Item;
 use crate::pending::{Known, Pending, utf16_col_from_bytes};
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tree_sitter::{Node, Parser, Tree};
 
 /// The syntax tree, or None if the source has errors.
@@ -47,6 +47,15 @@ fn javadoc(n: Node, src: &str) -> String {
         .to_string()
 }
 
+/// Is type `t` (maybe qualified, `WebClient.Builder`) named through an import or `java.lang`?
+fn from_outside(t: &str, imported: &BTreeSet<String>) -> bool {
+    let head = t.split('.').next().unwrap_or(t);
+    imported.contains(head) || JAVA_LANG.contains(&head)
+}
+
+/// Methods every object has.
+const OBJECT_METHODS: &[&str] = &["getClass", "hashCode", "equals", "toString", "wait", "notify", "notifyAll", "clone", "finalize"];
+
 /// Parse a Java source file into its adoptable items.
 pub fn parse(src: &str) -> Result<Vec<Item>> {
     let Some(tree) = parse_tree(src) else { bail!("parsing Java source") };
@@ -55,7 +64,7 @@ pub fn parse(src: &str) -> Result<Vec<Item>> {
     let imported = declared_names(root, src);
     walk(members(root), "", false, src, &mut out);
     for i in &mut out {
-        if let Some(t) = i.ty.as_mut().filter(|t| imported.contains(t.as_str()) || JAVA_LANG.contains(&t.as_str())) {
+        if let Some(t) = i.ty.as_mut().filter(|t| from_outside(t, &imported)) {
             *t = format!("import:{t}");
         }
     }
@@ -109,12 +118,12 @@ fn walk(nodes: Vec<Node>, prefix: &str, in_interface: bool, src: &str, out: &mut
     for n in nodes {
         let kind: &'static str = match n.kind() {
             "class_declaration" => "class",
-            "interface_declaration" => "interface",
+            "interface_declaration" | "annotation_type_declaration" => "interface",
             "enum_declaration" => "enum",
             "record_declaration" => "record",
             "method_declaration" => "method",
             "constructor_declaration" => "constructor",
-            "field_declaration" => "field",
+            "field_declaration" | "constant_declaration" => "field",
             "enum_constant" => "variant",
             _ => continue,
         };
@@ -146,7 +155,7 @@ fn walk(nodes: Vec<Node>, prefix: &str, in_interface: bool, src: &str, out: &mut
                 ty: ty.clone(),
             });
             if let (true, Some(b)) = (is_type, body) {
-                walk(members(b), &format!("{path}."), n.kind() == "interface_declaration", src, out);
+                walk(members(b), &format!("{path}."), matches!(n.kind(), "interface_declaration" | "annotation_type_declaration"), src, out);
             }
         }
     }
@@ -158,11 +167,14 @@ fn walk(nodes: Vec<Node>, prefix: &str, in_interface: bool, src: &str, out: &mut
     }
 }
 
-/// The outermost type name of a type node: `List` for `List<Code>`, `Entry` for `Map.Entry`, `[]` for arrays.
+/// The type name of a type node without its arguments: `List` for `List<Code>`, `Map.Entry` for `Map.Entry<K, V>`, `[]` for arrays.
 fn type_head(n: Node, src: &str) -> String {
     match n.kind() {
         "generic_type" => n.named_child(0).map_or_else(String::new, |t| type_head(t, src)),
-        "scoped_type_identifier" => n.named_child(n.named_child_count().saturating_sub(1)).map_or_else(String::new, |t| text(t, src).to_string()),
+        "scoped_type_identifier" => {
+            let mut cur = n.walk();
+            n.named_children(&mut cur).map(|c| type_head(c, src)).collect::<Vec<_>>().join(".")
+        }
         "array_type" => "[]".into(),
         _ => text(n, src).to_string(),
     }
@@ -177,14 +189,29 @@ fn callable_name(n: Node, src: &str) -> Option<String> {
     }
 }
 
-/// Names that need no import or definition: `java.lang` plus a few JDK
-/// types that are common enough that flagging them would only be noise.
+/// Names that need no import or definition: every public top-level type of `java.lang`
+/// (as of JDK 25), plus a few JDK types common enough that flagging them would only be noise.
 const JAVA_LANG: &[&str] = &[
-    "String", "System", "Math", "Integer", "Long", "Double", "Float", "Boolean", "Character", "Byte", "Short", "Object", "Thread", "Runnable",
-    "Exception", "RuntimeException", "Error", "Throwable", "StringBuilder", "Iterable", "Comparable", "Override", "Deprecated", "Record", "Enum",
-    "Class", "Number", "Void", "List", "Map", "Set", "Optional", "Arrays", "Collections", "Objects", "ArrayList", "HashMap", "HashSet",
-    "IllegalArgumentException", "IllegalStateException", "AutoCloseable", "CharSequence", "Process", "Runtime", "StackWalker", "SafeVarargs",
-    "FunctionalInterface", "SuppressWarnings", "Collectors", "Stream", "Files", "Paths", "Path", "Duration", "Instant", "LocalDate", "LocalDateTime",
+    "AbstractMethodError", "Appendable", "ArithmeticException", "ArrayIndexOutOfBoundsException", "ArrayStoreException", "AssertionError",
+    "AutoCloseable", "Boolean", "BootstrapMethodError", "Byte", "CharSequence", "Character", "Class", "ClassCastException",
+    "ClassCircularityError", "ClassFormatError", "ClassLoader", "ClassNotFoundException", "ClassValue", "CloneNotSupportedException",
+    "Cloneable", "Comparable", "Deprecated", "Double", "Enum", "EnumConstantNotPresentException", "Error", "Exception",
+    "ExceptionInInitializerError", "Float", "FunctionalInterface", "IO", "IllegalAccessError", "IllegalAccessException",
+    "IllegalArgumentException", "IllegalCallerException", "IllegalMonitorStateException", "IllegalStateException",
+    "IllegalThreadStateException", "IncompatibleClassChangeError", "IndexOutOfBoundsException", "InheritableThreadLocal",
+    "InstantiationError", "InstantiationException", "Integer", "InternalError", "InterruptedException", "Iterable",
+    "LayerInstantiationException", "LinkageError", "Long", "MatchException", "Math", "Module", "ModuleLayer", "NegativeArraySizeException",
+    "NoClassDefFoundError", "NoSuchFieldError", "NoSuchFieldException", "NoSuchMethodError", "NoSuchMethodException",
+    "NullPointerException", "Number", "NumberFormatException", "Object", "OutOfMemoryError", "Override", "Package", "Process",
+    "ProcessBuilder", "ProcessHandle", "Readable", "Record", "ReflectiveOperationException", "Runnable", "Runtime", "RuntimeException",
+    "RuntimePermission", "SafeVarargs", "ScopedValue", "SecurityException", "SecurityManager", "Short", "StableValue", "StackOverflowError",
+    "StackTraceElement", "StackWalker", "StrictMath", "String", "StringBuffer", "StringBuilder", "StringIndexOutOfBoundsException",
+    "SuppressWarnings", "System", "Thread", "ThreadDeath", "ThreadGroup", "ThreadLocal", "Throwable", "TypeNotPresentException",
+    "UnknownError", "UnsatisfiedLinkError", "UnsupportedClassVersionError", "UnsupportedOperationException", "VerifyError",
+    "VirtualMachineError", "Void", "WrongThreadException",
+    // not java.lang, but too common to flag
+    "List", "Map", "Set", "Optional", "Arrays", "Collections", "Objects", "ArrayList", "HashMap", "HashSet", "Collectors", "Stream",
+    "Files", "Paths", "Path", "Duration", "Instant", "LocalDate", "LocalDateTime",
 ];
 
 fn upper(s: &str) -> bool {
@@ -216,8 +243,32 @@ fn declared_names(root: Node, src: &str) -> BTreeSet<String> {
     out
 }
 
+/// Single-type imports (simple name -> package) and wildcard-imported packages, static ones aside.
+fn imports(root: Node, src: &str) -> (BTreeMap<String, String>, Vec<String>) {
+    let (mut named, mut wild) = (BTreeMap::new(), Vec::new());
+    let mut cur = root.walk();
+    for n in root.named_children(&mut cur).filter(|n| n.kind() == "import_declaration") {
+        let t = text(n, src).trim().trim_start_matches("import").trim().trim_end_matches(';').trim();
+        if t.starts_with("static ") {
+            continue;
+        }
+        match t.rsplit_once('.') {
+            Some((pkg, "*")) => wild.push(pkg.trim().to_string()),
+            Some((pkg, name)) => {
+                named.insert(name.trim().to_string(), pkg.trim().to_string());
+            }
+            None => {}
+        }
+    }
+    (named, wild)
+}
+
 struct V<'a> {
     src: &'a str,
+    /// Simple names imported from libraries (not from the project's own packages).
+    foreign: BTreeSet<String>,
+    /// A wildcard import from a library: any unknown name may come from it.
+    foreign_wildcard: bool,
     lines: Vec<&'a str>,
     known: &'a Known,
     /// What this buffer itself declares: its own fields win over same-named ones elsewhere.
@@ -239,7 +290,60 @@ impl V<'_> {
     }
 
     fn external(&self, t: &str) -> bool {
-        JAVA_LANG.contains(&t) || self.declared.contains(t)
+        JAVA_LANG.contains(&t) || self.declared.contains(t) || (self.foreign_wildcard && !self.known.is_type(t) && !self.known.has_path(t))
+    }
+
+    /// Does type `t` extend or implement something that isn't the project's? Then it has members
+    /// no project file declares.
+    fn inherits_foreign(&self, t: &str) -> bool {
+        let t = t.strip_prefix("import:").unwrap_or(t);
+        let sups = self.known.types_at(&format!("{t}.{}", crate::pending::SUPER));
+        sups.is_some_and(|sups| sups.iter().map(|s| s.strip_prefix("import:").unwrap_or(s)).any(|s| !self.known.is_type(s) || self.foreign.contains(s)))
+    }
+
+    /// Paths of the type declarations around `n`, innermost first (`Outer.Inner`, `Outer`).
+    fn enclosing(&self, n: Node) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut at = n.parent();
+        while let Some(p) = at {
+            if matches!(p.kind(), "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration") {
+                names.extend(p.child_by_field_name("name").map(|nm| self.text(nm).to_string()));
+            }
+            at = p.parent();
+        }
+        (0..names.len()).map(|i| names[i..].iter().rev().cloned().collect::<Vec<_>>().join(".")).collect()
+    }
+
+    /// Is the expression of a type that may have members from a library?
+    fn open(&self, n: Node) -> bool {
+        self.types_of_expr(n).is_some_and(|ts| ts.iter().any(|t| self.inherits_foreign(t)))
+    }
+
+    /// Does `t` have supertypes at all (so a member may be inherited)?
+    fn has_supers(&self, t: &str) -> bool {
+        let t = t.strip_prefix("import:").unwrap_or(t);
+        self.known.types_at(&format!("{t}.{}", crate::pending::SUPER)).is_some()
+    }
+
+    /// The declared types an expression may have, where the project tells.
+    fn types_of_expr(&self, n: Node) -> Option<BTreeSet<String>> {
+        match n.kind() {
+            "identifier" => {
+                let t = self.text(n);
+                if self.known.is_type(t) {
+                    return Some([t.to_string()].into());
+                }
+                self.own.types_of(t).or_else(|| self.known.types_of(t)).cloned()
+            }
+            "method_invocation" | "field_access" => {
+                let m = self.text(n.child_by_field_name(if n.kind() == "field_access" { "field" } else { "name" })?);
+                let at = n.child_by_field_name("object").filter(|o| o.kind() == "identifier").and_then(|o| self.known.types_at(&format!("{}.{m}", self.text(o))));
+                at.or_else(|| self.own.types_of(m)).or_else(|| self.known.types_of(m)).cloned()
+            }
+            "object_creation_expression" => n.child_by_field_name("type").map(|t| [type_head(t, self.src)].into()),
+            "parenthesized_expression" => self.types_of_expr(n.named_child(0)?),
+            _ => None,
+        }
     }
 
     /// A capitalised name that is neither external nor already defined: a
@@ -256,8 +360,8 @@ impl V<'_> {
     /// Is `t` one of our types, existing or wished (not java.lang, not imported from a library)?
     fn ours(&self, t: &str) -> bool {
         match t.strip_prefix("import:") {
-            Some(head) => self.known.has_path_or_tail(head),
-            None => self.known.has_path_or_tail(t) || (upper(t) && !self.external(t)),
+            Some(name) => !self.foreign.contains(name.split('.').next().unwrap_or(name)) && self.known.has_path_or_tail(name),
+            None => self.known.has_path_or_tail(t) || (upper(t) && !self.external(t.split('.').next().unwrap_or(t))),
         }
     }
 
@@ -267,7 +371,10 @@ impl V<'_> {
     /// `Codes.ALL.stream()` stops at `ALL`'s `List`, while `App.create().window()` stays on our types.
     fn yields_ours(&self, name: Node, object: Option<Node>) -> bool {
         let m = self.text(name);
-        let at = object.filter(|o| o.kind() == "identifier").and_then(|o| self.known.types_at(&format!("{}.{m}", self.text(o))));
+        let at = match object {
+            Some(o) => (o.kind() == "identifier").then(|| self.known.types_at(&format!("{}.{m}", self.text(o)))).flatten(),
+            None => self.enclosing(name).iter().find_map(|t| self.own.types_at(&format!("{t}.{m}"))),
+        };
         at.or_else(|| self.own.types_of(m)).or_else(|| self.known.types_of(m)).is_none_or(|ts| ts.iter().any(|t| self.ours(t)))
     }
 
@@ -277,15 +384,21 @@ impl V<'_> {
             "method_invocation" | "field_access" => {
                 let object = n.child_by_field_name("object");
                 let member = n.child_by_field_name(if n.kind() == "field_access" { "field" } else { "name" });
-                object.is_some_and(|o| self.rooted(o)) && member.is_some_and(|m| self.yields_ours(m, object))
+                // A member the project doesn't declare, on a type with a library supertype, is the library's.
+                let inherited = object.zip(member).is_some_and(|(o, m)| !self.known.has_name(self.text(m)) && self.open(o));
+                object.is_some_and(|o| self.rooted(o)) && !inherited && member.is_some_and(|m| self.yields_ours(m, object))
             }
             "parenthesized_expression" => n.named_child(0).is_some_and(|c| self.rooted(c)),
             "object_creation_expression" => n.child_by_field_name("type").is_some_and(|t| {
-                let name = self.text(t);
-                upper(name) && !self.external(name)
+                let name = type_head(t, self.src);
+                let head = name.split('.').next().unwrap_or(&name);
+                upper(head) && !self.external(head) && !self.foreign.contains(head)
             }),
             "identifier" => {
                 let t = self.text(n);
+                if self.foreign.contains(t) {
+                    return false;
+                }
                 if (upper(t) && self.value(t)) || self.own.types_of(t).is_some() {
                     // a constant like `LOGGER`, or a field this file declares (`stagingPort`); other
                     // lowercase names are locals and parameters, which we can't type
@@ -298,11 +411,16 @@ impl V<'_> {
         }
     }
 
+    /// `T.m` that `T` may inherit: from a library supertype, or from a project one declaring an `m`.
+    fn maybe_inherited(&self, t: &str, m: &str) -> bool {
+        self.inherits_foreign(t) || (self.has_supers(t) && self.known.has_name(m))
+    }
+
     /// `X` in `X.y`: a capitalised identifier that is not external.
     /// A project type stays ours when imported from another package.
     fn type_ref(&self, n: Node) -> bool {
         let t = self.text(n);
-        n.kind() == "identifier" && upper(t) && (self.known.is_type(t) || !self.external(t)) && !self.value(t)
+        n.kind() == "identifier" && upper(t) && !self.foreign.contains(t) && (self.known.is_type(t) || !self.external(t)) && !self.value(t)
     }
 
     fn visit(&mut self, n: Node) {
@@ -312,7 +430,9 @@ impl V<'_> {
                 // The tail of a qualified name (`Map.Entry`, `java.awt.Frame`) is judged with its head.
                 let qualified_tail = n.parent().is_some_and(|p| p.kind() == "scoped_type_identifier") && n.prev_named_sibling().is_some();
                 let t = self.text(n);
-                if !qualified_tail && self.wished_type(t) {
+                // Inside a type with a library supertype, a name may be its nested type (`Map.Entry` as `Entry`).
+                let inherited = || self.enclosing(n).iter().any(|e| self.inherits_foreign(e.rsplit('.').next().unwrap_or(e)));
+                if !qualified_tail && self.wished_type(t) && !inherited() {
                     self.push(t.to_string(), n, n);
                 }
             }
@@ -321,13 +441,13 @@ impl V<'_> {
                     match n.child_by_field_name("object") {
                         Some(o) if self.type_ref(o) => {
                             let full = format!("{}.{}", self.text(o), self.text(name));
-                            if !self.known.has_path_or_tail(&full) {
+                            if !self.known.has_path_or_tail(&full) && !self.maybe_inherited(self.text(o), self.text(name)) {
                                 self.push(full, o, name);
                             }
                         }
                         Some(o) if self.rooted(o) => {
                             let m = self.text(name);
-                            if !self.known.has_name(m) {
+                            if !self.known.has_name(m) && !self.open(o) && !OBJECT_METHODS.contains(&m) {
                                 self.push(format!(".{m}()"), name, name);
                             }
                         }
@@ -338,7 +458,8 @@ impl V<'_> {
             "field_access" => {
                 if let (Some(o), Some(f)) = (n.child_by_field_name("object"), n.child_by_field_name("field")) {
                     let full = format!("{}.{}", self.text(o), self.text(f));
-                    if self.type_ref(o) && !self.known.has_path_or_tail(&full) {
+                    let special = matches!(self.text(f), "this" | "class" | "super");
+                    if !special && self.type_ref(o) && !self.known.has_path_or_tail(&full) && !self.maybe_inherited(self.text(o), self.text(f)) {
                         self.push(full, o, f);
                     }
                 }
@@ -352,6 +473,34 @@ impl V<'_> {
     }
 }
 
+/// The file's `package`, if it declares one.
+fn package_of(root: Node, src: &str) -> Option<String> {
+    let mut cur = root.walk();
+    let decl = root.named_children(&mut cur).find(|n| n.kind() == "package_declaration")?;
+    Some(text(decl, src).trim().trim_start_matches("package").trim().trim_end_matches(';').trim().to_string())
+}
+
+/// Simple names of what a type declaration extends and implements.
+fn supertypes(decl: Node, src: &str) -> Vec<String> {
+    fn heads(n: Node, src: &str, out: &mut Vec<String>) {
+        match n.kind() {
+            "type_identifier" | "generic_type" | "scoped_type_identifier" => out.push(type_head(n, src)),
+            _ => {
+                let mut cur = n.walk();
+                for c in n.named_children(&mut cur) {
+                    heads(c, src, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut cur = decl.walk();
+    for c in decl.named_children(&mut cur).filter(|c| matches!(c.kind(), "superclass" | "super_interfaces" | "extends_interfaces")) {
+        heads(c, src, &mut out);
+    }
+    out
+}
+
 /// Members Java declares without an item of their own: a record's component accessors and an
 /// enum's `values()` / `valueOf(String)`, as (path, declared type).
 pub fn implicit_members(src: &str) -> Vec<(String, Option<String>)> {
@@ -359,11 +508,14 @@ pub fn implicit_members(src: &str) -> Vec<(String, Option<String>)> {
         let mut cur = n.walk();
         for c in n.named_children(&mut cur) {
             let kind = c.kind();
-            if !matches!(kind, "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration") {
+            if !matches!(kind, "class_declaration" | "interface_declaration" | "annotation_type_declaration" | "enum_declaration" | "record_declaration") {
                 continue;
             }
             let Some(name) = c.child_by_field_name("name").map(|nm| text(nm, src).to_string()) else { continue };
             let path = format!("{prefix}{name}");
+            for sup in supertypes(c, src) {
+                out.push((format!("{path}.{}", crate::pending::SUPER), Some(sup)));
+            }
             if kind == "enum_declaration" {
                 out.push((format!("{path}.values"), Some("[]".into())));
                 out.push((format!("{path}.valueOf"), Some(name.clone())));
@@ -386,9 +538,12 @@ pub fn implicit_members(src: &str) -> Vec<(String, Option<String>)> {
     }
     let mut out = Vec::new();
     if let Some(tree) = parse_tree(src) {
+        if let Some(pkg) = package_of(tree.root_node(), src) {
+            out.push((crate::pending::PACKAGE.to_string(), Some(pkg)));
+        }
         go(tree.root_node(), "", src, &mut out);
         let imported = declared_names(tree.root_node(), src);
-        for t in out.iter_mut().filter_map(|(_, t)| t.as_mut()).filter(|t| imported.contains(t.as_str()) || JAVA_LANG.contains(&t.as_str())) {
+        for t in out.iter_mut().filter_map(|(_, t)| t.as_mut()).filter(|t| from_outside(t, &imported)) {
             *t = format!("import:{t}");
         }
     }
@@ -406,7 +561,11 @@ pub fn find_pending(src: &str, known: &Known) -> Option<Vec<Pending>> {
     }
     let mut k = known.clone();
     k.merge(&own);
-    let mut v = V { src, lines: src.lines().collect(), known: &k, own, declared: declared_names(root, src), out: Vec::new() };
+    let (named, wild) = imports(root, src);
+    let library = |pkg: &str| k.is_project_package(pkg) == Some(false);
+    let foreign = named.into_iter().filter(|(_, pkg)| library(pkg)).map(|(n, _)| n).collect();
+    let foreign_wildcard = wild.iter().any(|pkg| library(pkg));
+    let mut v = V { src, foreign, foreign_wildcard, lines: src.lines().collect(), known: &k, own, declared: declared_names(root, src), out: Vec::new() };
     v.visit(root);
     v.out.sort_by_key(|p| p.start);
     let mut seen = BTreeSet::new();
@@ -479,6 +638,50 @@ public class App {
     fn unparseable_has_no_items() {
         assert!(parse("public class App { void f( }").is_err());
         assert!(find_pending("public class App { void f( }", &Known::default()).is_none());
+    }
+
+    /// Shapes from real codebases (Spring, Shiro, commons-lang) that exist and must not show as wished.
+    #[test]
+    fn existing_library_and_inherited_code_is_not_wished() {
+        let files = [
+            "package app.model;\nimport org.springframework.data.jpa.repository.JpaRepository;\npublic interface OwnerRepository extends JpaRepository<Owner, Integer> { }",
+            "package app.model;\npublic class Owner { }",
+            "package app.codec;\npublic class Base64 { public static byte[] decode(String s) { return null; } }",
+            "package app.fmt;\npublic interface ModularCryptFormat { String TOKEN_DELIMITER = \"$\"; }",
+            "package app.aop;\npublic class Handler { public static final class Policy { public static boolean isStrict() { return false; } } }",
+            "package app.ann;\nimport java.lang.annotation.*;\n@Retention(RetentionPolicy.RUNTIME)\npublic @interface Exclude { }",
+            "package app.cache;\npublic interface Cache<K, V> { V get(K k); }",
+            "package app.cfg;\npublic class Builder { public Builder build() { return this; } public Builder get() { return this; } }",
+        ];
+        let mut k = Known::default();
+        for f in files {
+            k.add(&parse(f).unwrap());
+            for (path, ty) in implicit_members(f) {
+                k.add_member(&path, ty.as_deref());
+            }
+        }
+        let n = |src: &str| find_pending(src, &k).unwrap().into_iter().map(|p| p.name).collect::<Vec<_>>();
+        let web = "package app.web;\nimport app.model.OwnerRepository;\nimport app.model.Owner;\nimport java.util.Base64;\nimport java.util.*;\nimport app.ann.Exclude;\nimport app.aop.Handler.Policy;\n\
+            class R implements Collector<String, String, String> {\n\
+                private final OwnerRepository owners;\n\
+                @Exclude Owner find(int id) { return owners.findById(id).orElseThrow(); }\n\
+                boolean skip(java.lang.reflect.Field f) { return f.isAnnotationPresent(Exclude.class); }\n\
+                String enc() { return Base64.getEncoder().encodeToString(new byte[0]) + app.fmt.ModularCryptFormat.TOKEN_DELIMITER; }\n\
+                boolean strict() { return Policy.isStrict(); }\n\
+                Set<Characteristics> characteristics() { Map<String, LinkedHashMap<String, String>> m = null; return null; }\n\
+                Object self() { return R.this; }\n\
+            }";
+        assert_eq!(n(web), Vec::<String>::new());
+        let more = "package app.web;\nimport java.util.List;\nimport java.util.Map;\nimport javax.cache.Cache;\nimport org.springframework.web.reactive.function.client.WebClient;\n\
+            public record Details(List<Integer> pets) {\n\
+                List<Integer> ids() { return pets.stream().map(x -> x).toList(); }\n\
+                static class DetailsBuilder { DetailsBuilder pets(List<Integer> p) { return this; } }\n\
+            }\n\
+            class Section implements Map<String, String> { java.util.Set<Entry<String, String>> entries() { return null; } }\n\
+            class C { Cache<String, String> cache; WebClient.Builder web; Object f(Object o) { web.build().get().uri(\"/\"); return cache.getAndRemove(\"k\") + o.getClass().getName(); } }";
+        assert_eq!(n(more), Vec::<String>::new());
+        // wishes still show next to all that
+        assert_eq!(n("package app.web;\nimport app.model.*;\nclass W { void f(OwnerRepository o) { new Dunning(o).run(); } }"), ["Dunning", ".run()"]);
     }
 
     fn known(src: &str) -> Known {

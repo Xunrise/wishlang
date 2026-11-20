@@ -128,7 +128,9 @@ fn bash(cmd: &str, cwd: &Path) -> Verdict {
     }
     let Some(project) = Project::discover_from(cwd) else { return Verdict::Allow };
     let writes = regex::Regex::new(r"(>|\btee\b|\bsed\s+-i|\bmv\b|\brm\b|\bcp\b|\btruncate\b|\bperl\s+-[a-z]*i)").unwrap();
-    if writes.is_match(cmd) {
+    // Discarding output or merging streams writes no file: `2>/dev/null`, `&>/dev/null`, `2>&1`.
+    let harmless = regex::Regex::new(r"(&|\d)?>>?\s*(/dev/null\b|&\d)").unwrap();
+    if writes.is_match(&harmless.replace_all(cmd, " ")) {
         let mut guarded: Vec<String> = project.cfg.protected.files.clone();
         guarded.extend(project.cfg.adopted.values().map(|a| a.file.clone()));
         guarded.extend(["wish.toml".into(), "DECISIONS.md".into(), ".wish".into()]);
@@ -185,6 +187,9 @@ mod tests {
         assert!(denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "wish adopt App::run"}})));
         assert!(denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "sed -i s/run/go/ src/main.rs"}})));
         assert!(!denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "cargo check"}})));
+        // Reading a protected file while discarding errors is not a write.
+        assert!(!denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "cat CLAUDE.md 2>/dev/null | head; cat src/main.rs 2>&1"}})));
+        assert!(denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "cat x 2>/dev/null > src/main.rs"}})));
         let _ = fs::remove_dir_all(&d);
     }
 

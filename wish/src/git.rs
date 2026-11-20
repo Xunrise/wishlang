@@ -283,6 +283,11 @@ impl Git {
         self.index.with_file_name(format!("wish-{}{name}", self.prefix.replace('/', "_")))
     }
 
+    /// The oldest root commit reachable from `rev` (where a journal began).
+    pub fn root_commit(&self, rev: &str) -> Option<String> {
+        self.git(&["rev-list", "--max-parents=0", rev]).ok()?.lines().last().map(str::to_string)
+    }
+
     pub fn tree_of(&self, sha: &str) -> Option<String> {
         self.resolve(&format!("{sha}^{{tree}}"))
     }

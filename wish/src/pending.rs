@@ -17,6 +17,11 @@ pub struct Pending {
     pub end: (u32, u32),
 }
 
+/// The implicit-member path that carries a file's package (`ty` is the package name).
+pub const PACKAGE: &str = "<package>";
+/// The member suffix that carries a type's supertypes (`Owner.<super>` -> `BaseEntity`).
+pub const SUPER: &str = "<super>";
+
 /// What the project already defines.
 #[derive(Default, Clone)]
 pub struct Known {
@@ -32,6 +37,8 @@ pub struct Known {
     type_names: BTreeSet<String>,
     /// Path (and each multi-segment tail of it) -> declared types, for `Codes.VALUES`-style lookups.
     path_types: std::collections::BTreeMap<String, BTreeSet<String>>,
+    /// Java packages the project declares: imports from any other package are libraries.
+    packages: BTreeSet<String>,
 }
 
 impl Known {
@@ -54,6 +61,10 @@ impl Known {
 
     /// A member that is not an item of its own, e.g. a Java record's accessor or an enum's `values()`.
     pub fn add_member(&mut self, path: &str, ty: Option<&str>) {
+        if path == PACKAGE {
+            self.packages.extend(ty.map(str::to_string));
+            return;
+        }
         // An overload (`Window.open(int)`) also defines the bare `Window.open`.
         let bare = path.split('(').next().unwrap_or(path);
         self.paths.insert(path.to_string());
@@ -85,6 +96,7 @@ impl Known {
         self.names.extend(other.names.iter().cloned());
         self.tails.extend(other.tails.iter().cloned());
         self.type_names.extend(other.type_names.iter().cloned());
+        self.packages.extend(other.packages.iter().cloned());
         for (k, v) in &other.types {
             self.types.entry(k.clone()).or_default().extend(v.iter().cloned());
         }
@@ -114,6 +126,11 @@ impl Known {
     /// The declared types of the member at `path` (`Codes.VALUES`, or a nested `Inner.f`), if known.
     pub fn types_at(&self, path: &str) -> Option<&BTreeSet<String>> {
         self.path_types.get(path)
+    }
+
+    /// Is `pkg` one of the project's packages? None while no package is known (nothing to judge by).
+    pub fn is_project_package(&self, pkg: &str) -> Option<bool> {
+        (!self.packages.is_empty()).then(|| self.packages.contains(pkg))
     }
 
     /// The declared types of the members named `n`, if any are known.
