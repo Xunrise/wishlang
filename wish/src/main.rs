@@ -22,7 +22,7 @@ use clap::{Parser, Subcommand};
 use project::Project;
 
 #[derive(Parser)]
-#[command(name = "wish", about = "Create-from-usage for Rust: you write the call sites, Claude writes the vocabulary.")]
+#[command(name = "wishlang", version, about = "Create-from-usage for Rust and Java: you write the call sites, Claude writes the code underneath.")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

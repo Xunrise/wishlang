@@ -174,7 +174,7 @@ fn after_turn(p: &Project, session: &str, asked: bool, transcript: Option<&str>)
 
 /// What the Stop hook asks Claude: one line per changed item, the problems, and the command to report with.
 fn ask(p: &Project, session: &str, changed: &[(String, String)], ticket: Option<&Ticket>) -> String {
-    let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "wish".into());
+    let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "wishlang".into());
     let mut s = format!(
         "wish records the code Claude writes in {} (shown as generated, with your reasons, in the editor and `wish log`). \
          Before you finish, explain the items this turn changed:\n",

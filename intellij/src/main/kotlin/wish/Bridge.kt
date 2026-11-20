@@ -55,7 +55,7 @@ sealed interface Bridge {
              * No double quotes: Java on Windows wraps an argument in them without escaping embedded ones.
              */
             const val LAUNCH =
-                "exec 3>&1 1>&2; exec bash -lic 'exec 1>&3 3>&-; exec \${WISH_BIN:-\$HOME/.cargo/bin/wish} lsp'"
+                "exec 3>&1 1>&2; exec bash -lic 'exec 1>&3 3>&-; exec \${WISH_BIN:-\$(command -v wishlang || echo \$HOME/.cargo/bin/wishlang)} lsp'"
         }
     }
 

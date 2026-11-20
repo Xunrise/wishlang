@@ -1,7 +1,7 @@
 //! Zed extension for wishlang: launches `wish lsp` next to rust-analyzer.
 //!
 //! All behaviour lives in the language server (the `wish` binary); this
-//! extension only finds it on PATH (or via the WISH_BIN environment variable).
+//! extension only finds `wishlang` on PATH (or via the WISH_BIN environment variable).
 
 use zed_extension_api::{self as zed, LanguageServerId, Result, Worktree};
 
@@ -16,8 +16,8 @@ impl zed::Extension for Wishlang {
         let env = worktree.shell_env();
         let explicit = env.iter().find(|(k, _)| k == "WISH_BIN").map(|(_, v)| v.clone());
         let command = explicit
-            .or_else(|| worktree.which("wish"))
-            .ok_or("wishlang: `wish` not found on PATH (install it with `cargo install --path wish`)")?;
+            .or_else(|| worktree.which("wishlang"))
+            .ok_or("wishlang: `wishlang` not found on PATH (install it with `cargo install --path wish`)")?;
         Ok(zed::Command { command, args: vec!["lsp".into()], env })
     }
 }

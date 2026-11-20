@@ -13,7 +13,7 @@ The project stays normal, clean Rust (or Java). The only extra files are `wish.t
 ## Install
 
 ```sh
-cargo install --path wish        # puts `wish` on PATH (Zed looks for it there, or in $WISH_BIN)
+cargo install --path wish        # puts `wishlang` on PATH (Zed looks for it there, or in $WISH_BIN)
 ```
 
 Then, in Zed, open the command palette, run **zed: install dev extension**, and pick the `zed/` folder of this repo.
@@ -30,9 +30,9 @@ The colors come from three semantic token rules in your Zed **user** settings (Z
 }
 ```
 
-Zed applies the first rule that matches, so the more specific ones come first (untraced beats prototype). They only match the token type `generated`, which only `wish lsp` emits. The project's `.zed/settings.json` turns on `"semantic_tokens": "combined"` for Rust. After changing settings, run `editor: restart language server` once.
+Zed applies the first rule that matches, so the more specific ones come first (untraced beats prototype). They only match the token type `generated`, which only `wishlang lsp` emits. The project's `.zed/settings.json` turns on `"semantic_tokens": "combined"` for Rust. After changing settings, run `editor: restart language server` once.
 
-Requires Claude Code (`claude`) on PATH and a git repository (`wish init` creates one). Set `WISH_MODEL=sonnet` for faster cycles.
+Requires Claude Code (`claude`) on PATH and a git repository (`wishlang init` creates one). Set `WISH_MODEL=sonnet` for faster cycles.
 
 ## Java
 
@@ -42,8 +42,8 @@ A project with a `pom.xml` is a Java project; otherwise `Cargo.toml` makes it a 
 - **Run:** the app is started as `java -cp target/classes <main class>`. The class is `[java] main_class` in `wish.toml`, else `<mainClass>` in `pom.xml`, else `Main`.
 - **Prototypes:** a Javadoc `<h2>Mocked</h2>` section marks an item as mocked (the counterpart of `# Mocked`).
 - **Protected files** (`[protected]` in `wish.toml`) may only gain `import` lines.
-- **Multi-module builds:** a root `pom.xml` with `<modules>` (nested ones too) is one wish project. Sources come from every module's `src/main/java`, Claude may edit every module's `pom.xml`, and `mvn -q compile` runs at the root. `wish init` sets `[java] preview = false` there, because `java -cp target/classes` can't start a reactor module. Set `preview = false` yourself to stop any app from being run after cycles.
-- **Existing codebases:** `wish init --protect-existing` protects every source file that exists, so Claude writes what you wish into new files and only adds imports to yours. Remove a file from `[protected]` to let Claude change it. Protection binds only wish's cycles; ordinary Claude Code sessions edit any file.
+- **Multi-module builds:** a root `pom.xml` with `<modules>` (nested ones too) is one wish project. Sources come from every module's `src/main/java`, Claude may edit every module's `pom.xml`, and `mvn -q compile` runs at the root. `wishlang init` sets `[java] preview = false` there, because `java -cp target/classes` can't start a reactor module. Set `preview = false` yourself to stop any app from being run after cycles.
+- **Existing codebases:** `wishlang init --protect-existing` protects every source file that exists, so Claude writes what you wish into new files and only adds imports to yours. Remove a file from `[protected]` to let Claude change it. Protection binds only wish's cycles; ordinary Claude Code sessions edit any file.
 - **Large codebases:** above 150 kB of protected code, a cycle's prompt shows only the protected files you changed, and Claude reads the rest itself (Glob, Grep, Read).
 - `examples/demo-java` is the Java demo.
 
@@ -57,9 +57,9 @@ cd intellij && ./gradlew buildPlugin     # add -PlocalIde="/Applications/Intelli
 
 Install `intellij/build/distributions/*.zip` via **Settings › Plugins › ⚙ › Install Plugin from Disk**. To try it in a sandbox IDE instead: `./gradlew runIde -PdemoProject=/path/to/project`.
 
-The plugin runs `wish lsp` from `$WISH_BIN`, else `~/.cargo/bin/wish`. It does not search PATH, because `/usr/bin/wish` on macOS is Tk.
+The plugin runs `wishlang lsp` from `$WISH_BIN`, else the first of `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `~/.cargo/bin` that has `wishlang`. It never runs a `wish` from PATH, because `/usr/bin/wish` on macOS is Tk.
 
-**Windows IDE, project in WSL** (opened as `\\wsl.localhost\<distro>\…`): the plugin starts `wish lsp` inside that distro through `wsl.exe`, in an interactive login bash so `.bashrc`'s PATH (Java, Maven, `claude`) applies, and maps the IDE's UNC paths to Linux paths. Install wish in WSL (`cargo install --path wish`). `$WISH_BIN` is then read on the Linux side. From WSL, `intellij/deploy.sh` builds the plugin and publishes it to a custom plugin repository on the Windows side (`C:\Users\<you>\hexagonal-inspector-repo\updatePlugins.xml` by default, `WISH_DEPLOY_DIR` to override). After each deploy, update it under **Settings › Plugins › Updates**.
+**Windows IDE, project in WSL** (opened as `\\wsl.localhost\<distro>\…`): the plugin starts `wishlang lsp` inside that distro through `wsl.exe`, in an interactive login bash so `.bashrc`'s PATH (Java, Maven, `claude`) applies, and maps the IDE's UNC paths to Linux paths. Install wish in WSL (`cargo install --path wish`). `$WISH_BIN` is then read on the Linux side. From WSL, `intellij/deploy.sh` builds the plugin and publishes it to a custom plugin repository on the Windows side (`C:\Users\<you>\hexagonal-inspector-repo\updatePlugins.xml` by default, `WISH_DEPLOY_DIR` to override). After each deploy, update it under **Settings › Plugins › Updates**.
 
 | You see | Meaning |
 |---|---|
@@ -87,27 +87,27 @@ When the branch belongs to a ticket, wish traces generated code back to the tick
 - **Journal:** every item line is `- Item [P1,P3]: why`, and the commit has a `Ticket: <KEY>` trailer.
 - **Untraced:** generated in a ticket cycle but serving no problem.
 
-`wish ticket [--json]` prints problems with their files and items.
+`wishlang ticket [--json]` prints problems with their files and items.
 
 ### Code Claude writes outside wish
 
-An ordinary Claude Code session ("change X") is recorded too, once `wish session` is a hook in your **user** settings (`~/.claude/settings.json`, so it covers every checkout and worktree):
+An ordinary Claude Code session ("change X") is recorded too, once `wishlang session` is a hook in your **user** settings (`~/.claude/settings.json`, so it covers every checkout and worktree):
 
 ```json
 "hooks": {
-  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.cargo/bin/wish session"}]}],
-  "Stop": [{"hooks": [{"type": "command", "command": "~/.cargo/bin/wish session"}]}]
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.cargo/bin/wishlang session"}]}],
+  "Stop": [{"hooks": [{"type": "command", "command": "~/.cargo/bin/wishlang session"}]}]
 },
-"permissions": {"allow": ["Bash(~/.cargo/bin/wish explain:*)"]}
+"permissions": {"allow": ["Bash(~/.cargo/bin/wishlang explain:*)"]}
 ```
 
-(Write the full path of `wish`.) When you send a prompt, what is on disk is recorded as yours. When Claude's turn ends, everything that changed during the turn is Claude's, however it was written (Edit, Write or a shell command). If the turn changed items, the hook first sends Claude back once to explain them, with the ticket's problems: Claude pipes `{"summary", "changes": [{"item", "why", "problems"}]}` into `wish explain`. The result is a `session` entry in the journal, like a cycle: blue code, hovers with the reason, `Triggered by` your prompt, and the ticket tab. The hook does nothing without a `wish.toml` in the session's directory, a parent, or a direct subdirectory, and nothing inside wish's own cycles. While one session's turn is running, a prompt in another session on the same project doesn't record the disk as yours: the running session's Stop records it as Claude's.
+(Write the full path of `wish`.) When you send a prompt, what is on disk is recorded as yours. When Claude's turn ends, everything that changed during the turn is Claude's, however it was written (Edit, Write or a shell command). If the turn changed items, the hook first sends Claude back once to explain them, with the ticket's problems: Claude pipes `{"summary", "changes": [{"item", "why", "problems"}]}` into `wishlang explain`. The result is a `session` entry in the journal, like a cycle: blue code, hovers with the reason, `Triggered by` your prompt, and the ticket tab. The hook does nothing without a `wish.toml` in the session's directory, a parent, or a direct subdirectory, and nothing inside wish's own cycles. While one session's turn is running, a prompt in another session on the same project doesn't record the disk as yours: the running session's Stop records it as Claude's.
 
-For code written before that, `wish import <since>` rebuilds the branch's journal: the code at `<since>` is yours, every commit since that touches the project is Claude's (one `imported` entry each, explained by its commit message), uncommitted changes are yours. `--report file.json` adds per-item reasons and problem tags: `{"<sha>": {"changes": [{"item", "why", "problems"}], "problems": [...]}}` (`problems` creates `problems.json` if it doesn't exist). In Zed, hovering an item says "Solves P#", the `◆ P1 · P2` lens opens `problems.json`, untraced code gets the red rule from the settings above, untraced warnings show in project diagnostics, and the task `wish: ticket` lists the tracing in the terminal.
+For code written before that, `wishlang import <since>` rebuilds the branch's journal: the code at `<since>` is yours, every commit since that touches the project is Claude's (one `imported` entry each, explained by its commit message), uncommitted changes are yours. `--report file.json` adds per-item reasons and problem tags: `{"<sha>": {"changes": [{"item", "why", "problems"}], "problems": [...]}}` (`problems` creates `problems.json` if it doesn't exist). In Zed, hovering an item says "Solves P#", the `◆ P1 · P2` lens opens `problems.json`, untraced code gets the red rule from the settings above, untraced warnings show in project diagnostics, and the task `wish: ticket` lists the tracing in the terminal.
 
 ## Working in Zed
 
-Open `examples/demo` (or any project after `wish init`) in Zed.
+Open `examples/demo` (or any project after `wishlang init`) in Zed.
 
 | You see | Meaning |
 |---|---|
@@ -134,11 +134,11 @@ Open `examples/demo` (or any project after `wish init`) in Zed.
   - *next generated block ↓* / *next block written by you ↓*
 - **New decisions** (for example a new crate) pop up with Accept / Reject buttons.
 
-The terminal alternative is `wish dev`, which offers the same loop, with keys.
+The terminal alternative is `wishlang dev`, which offers the same loop, with keys.
 
 ### Panels (reusing Zed's built-in views)
 
-- **What wish did:** the journal is mirrored to a local branch, `wish/<project>/log` (`wish/examples/demo/log` for the demo). Open **git graph** in Zed and select it: every save and cycle, Claude's "Why" per item, changed files and diffs. lazygit works too. In the terminal (or the Zed task `wish: log`), use `wish log` (`--patch` for diffs).
+- **What wish did:** the journal is mirrored to a local branch, `wish/<project>/log` (`wish/examples/demo/log` for the demo). Open **git graph** in Zed and select it: every save and cycle, Claude's "Why" per item, changed files and diffs. lazygit works too. In the terminal (or the Zed task `wish: log`), use `wishlang log` (`--patch` for diffs).
 - **All suggestions:** pending suggestions are published as warnings for every file, so Zed's **project diagnostics** (`ctrl-shift-m`) lists them all. Accept or reject them with the lens or `ctrl-.`. The Zed task `wish: suggestions` lists them in the terminal.
 
 ### Your lines inside generated files
@@ -154,7 +154,7 @@ They are wishes. Claude keeps them and makes them true. Formatting may change, a
 
 You iterate by editing your lines. You can also edit **inside generated files**: a line you add there (e.g. `/// The title shows the current mode`) is a wish too. Claude keeps it verbatim and makes it true. Whatever you don't specify, Claude infers from context.
 
-**Implement** (`wish implement [file]`, the code action, or `I` in `wish dev`). Claude turns the prototype into the real thing, in place:
+**Implement** (`wishlang implement [file]`, the code action, or `I` in `wishlang dev`). Claude turns the prototype into the real thing, in place:
 - Public signatures and type definitions must stay identical (verified; any change reverts the cycle).
 - Public bodies stay at intent level. Details go into private helpers or submodules (e.g. `src/window/paint.rs`), so each file still reads top-down at one flight level.
 - Claude gets the full **history** of how the prototype came about: every save, every cycle, and what you undid or abandoned.
@@ -162,13 +162,13 @@ You iterate by editing your lines. You can also edit **inside generated files**:
 
 ## Provenance and protection
 
-Every line is either yours or generated, and both can live in one file. Provenance comes from git blame on the journal (below), so it needs no state of its own, persists across sessions, and covers unsaved buffers: lines you're typing are yours. `wish lsp` turns it into semantic tokens (blue) and hovers.
+Every line is either yours or generated, and both can live in one file. Provenance comes from git blame on the journal (below), so it needs no state of its own, persists across sessions, and covers unsaved buffers: lines you're typing are yours. `wishlang lsp` turns it into semantic tokens (blue) and hovers.
 
 | What | Protection |
 |---|---|
 | your protected files (`[protected]` in `wish.toml`, default `src/main.rs`) | Claude may only *add* single-line `mod`/`use` wiring |
 | your lines inside generated files | must survive every cycle verbatim; Claude restructures around them |
-| adopted items (`wish adopt Mode`) | hashed; any code or doc change is refused |
+| adopted items (`wishlang adopt Mode`) | hashed; any code or doc change is refused |
 | `wish.toml`, `DECISIONS.md`, `.wish/` | tool-owned; Claude can't touch them |
 
 Protection is enforced twice:
@@ -203,7 +203,7 @@ wish's history has the same shape as yours: **one journal per code branch**, mer
 - `refs/wish/<project>/last/<branch>`: the last green cycle. Your edits since then (`git diff`) are the regeneration scope.
 - `refs/wish/<project>/prototype/<branch>`: the prototype frozen by implement mode.
 - `refs/wish/<project>/attic/…`: reverted attempts. Implement mode still sees them in the history, but they stay out of blame.
-- `refs/heads/wish/<project>/log/<branch>`: a branch mirror for Zed's git graph and lazygit. `wish log` prints the same story.
+- `refs/heads/wish/<project>/log/<branch>`: a branch mirror for Zed's git graph and lazygit. `wishlang log` prints the same story.
 - **Undo** reverse-applies exactly the changes Claude made in the last cycle. Your lines and later edits stay, and `last` moves back.
 - **Revert on violation** restores the before-snapshot. The failed attempt goes to the attic.
 - Journals from older wishlang versions (a single `refs/wish/<project>/journal`) migrate to the current branch automatically.
@@ -213,11 +213,11 @@ wish's history has the same shape as yours: **one journal per code branch**, mer
 The journals are plain git refs, but `git push` and `git clone` skip custom refs, so:
 
 ```sh
-wish share          # push this project's journals (all branches) to origin
-wish sync           # fetch others' journals: new ones adopted, behind ones fast-forwarded
+wishlang share          # push this project's journals (all branches) to origin
+wishlang sync           # fetch others' journals: new ones adopted, behind ones fast-forwarded
 ```
 
-After `wish sync`, a teammate sees exactly what you see: blue generated blocks, yours versus Claude's per line, and hovers with the reasoning. If journals diverge (you both generated on the same branch), they merge on the next save once your code contains theirs.
+After `wishlang sync`, a teammate sees exactly what you see: blue generated blocks, yours versus Claude's per line, and hovers with the reasoning. If journals diverge (you both generated on the same branch), they merge on the next save once your code contains theirs.
 
 Adopted items are pinned by token hashes in `wish.toml`, because adoption is per item and must survive `rustfmt`.
 
@@ -225,29 +225,29 @@ Adopted items are pinned by token hashes in `wish.toml`, because adoption is per
 
 - **Local choices** your line didn't force go in the item's doc comment under `# Decisions`.
 - **Dependencies and architecture** come back as structured decisions, recorded in `DECISIONS.md` as *proposed*:
-  - accept or reject them in Zed's prompt, or with `wish decide N accept|reject [reason]`;
+  - accept or reject them in Zed's prompt, or with `wishlang decide N accept|reject [reason]`;
   - rejected options are forbidden in later cycles;
-  - `wish check` fails for any crate without a decision;
+  - `wishlang check` fails for any crate without a decision;
   - `[constraints] rules = [...]` in `wish.toml` steers decisions up front.
 
 ## Commands
 
 ```
-wish lsp                     language server (Zed launches it via the extension)
-wish log [--patch]           the journal: saves and cycles with Claude's reasoning
-wish ticket [--json]         this branch's ticket: problems, and the files and items serving each
-wish share [REMOTE]          push wish journals (default: origin)
-wish sync [REMOTE]           fetch others' wish journals
-wish dev                     terminal loop: c compile · f force · w compile-on-save · r restart · u undo · I implement
+wishlang lsp                     language server (Zed launches it via the extension)
+wishlang log [--patch]           the journal: saves and cycles with Claude's reasoning
+wishlang ticket [--json]         this branch's ticket: problems, and the files and items serving each
+wishlang share [REMOTE]          push wish journals (default: origin)
+wishlang sync [REMOTE]           fetch others' wish journals
+wishlang dev                     terminal loop: c compile · f force · w compile-on-save · r restart · u undo · I implement
                              d decisions · s suggestions · i items · :<command> · q quit
-wish compile [--json] [--force] [--no-run] [--note TEXT]
-wish implement [FILE] [--item PATH] [--json]
-wish undo
-wish adopt|unadopt <item>    e.g. Mode, Window::open, Mode::Maximized (see `wish items`)
-wish decisions | wish decide <id> accept|reject [reason]
-wish suggestions | wish accept <id> | wish reject <id>
-wish check                   adopted intact + dependencies decided + cargo check
-wish init                    wish.toml (+ .zed/settings.json) + git journal for a cargo or Maven project
+wishlang compile [--json] [--force] [--no-run] [--note TEXT]
+wishlang implement [FILE] [--item PATH] [--json]
+wishlang undo
+wishlang adopt|unadopt <item>    e.g. Mode, Window::open, Mode::Maximized (see `wishlang items`)
+wishlang decisions | wishlang decide <id> accept|reject [reason]
+wishlang suggestions | wishlang accept <id> | wishlang reject <id>
+wishlang check                   adopted intact + dependencies decided + cargo check
+wishlang init                    wish.toml (+ .zed/settings.json) + git journal for a cargo or Maven project
 ```
 
 ## Layout
@@ -265,6 +265,6 @@ wish/src/
   items.rs       syn items, token/signature hashes, doc sections (# Decisions, # Mocked)
   project.rs     wish.toml, ownership, decisions/suggestions state
   commands.rs  dev.rs  preview.rs  events.rs
-zed/             Zed extension (launches `wish lsp`)
+zed/             Zed extension (launches `wishlang lsp`)
 examples/demo    demo project (+ .zed/settings.json)
 ```

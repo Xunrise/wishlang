@@ -73,11 +73,15 @@ fun interface WishListener {
 fun uriOf(file: VirtualFile): String = serverUri(file.path)
 
 /**
- * The `wish` binary: `$WISH_BIN`, else `~/.cargo/bin/wish`. PATH is deliberately not searched,
- * because `/usr/bin/wish` on macOS is an unrelated Tk shell.
+ * The `wishlang` binary: `$WISH_BIN`, else the first of the usual install locations that exists
+ * (the old `~/.cargo/bin/wish` last). PATH is deliberately not searched for `wish`, because
+ * `/usr/bin/wish` on macOS is an unrelated Tk shell.
  */
-fun wishBinary(env: Map<String, String> = System.getenv(), home: String = System.getProperty("user.home")): File =
-    File(env["WISH_BIN"]?.takeIf { it.isNotBlank() } ?: "$home/.cargo/bin/wish")
+fun wishBinary(env: Map<String, String> = System.getenv(), home: String = System.getProperty("user.home")): File {
+    env["WISH_BIN"]?.takeIf { it.isNotBlank() }?.let { return File(it) }
+    val candidates = listOf("$home/.local/bin/wishlang", "/opt/homebrew/bin/wishlang", "/usr/local/bin/wishlang", "$home/.cargo/bin/wishlang", "$home/.cargo/bin/wish")
+    return candidates.map(::File).firstOrNull { it.canExecute() } ?: File(candidates[0])
+}
 
 /** One `wish lsp` per project; everything the editor and the tool window show comes from it. */
 @Service(Service.Level.PROJECT)
@@ -123,9 +127,9 @@ class WishService(private val project: Project) : Disposable {
                 MessageType.Error,
                 if (bridge is Bridge.Wsl) {
                     "Could not start wish in WSL (${bridge.distro}): ${e.message}. Install it there with " +
-                        "`cargo install --path wish` (~/.cargo/bin/wish), or set \$WISH_BIN in its ~/.bashrc."
+                        "`cargo install --path wish` (~/.cargo/bin/wishlang), or set \$WISH_BIN in its ~/.bashrc."
                 } else {
-                    "Could not start `$bin`: ${e.message}. Set \$WISH_BIN or install wish to ~/.cargo/bin/wish; " +
+                    "Could not start `$bin`: ${e.message}. Set \$WISH_BIN or install wishlang (~/.local/bin, Homebrew or ~/.cargo/bin); " +
                         "PATH is not searched because /usr/bin/wish is the Tk shell."
                 },
             )
