@@ -52,10 +52,23 @@ struct State {
     published: std::collections::BTreeSet<String>,
     /// Items of each file's last successful parse, so markers survive a buffer with a syntax error.
     last_items: BTreeMap<String, Vec<Item>>,
+    /// Parsed items and implicit members of files on disk, keyed by path and checked against
+    /// size and mtime, so "will be generated" doesn't reparse the whole project per keystroke.
+    index: HashMap<String, Indexed>,
+    /// The last file state and its key (file, text, journal, HEAD): an editor asks for several
+    /// projections of the same state per keystroke. Cleared whenever wish changes anything.
+    last_state: Option<(String, Arc<FileState>)>,
     /// The ticket trace of the branch's journal tip, keyed by "branch@journal".
     trace: Option<(String, Option<Arc<Trace>>)>,
     next_id: i32,
     pending: HashMap<RequestId, Callback>,
+}
+
+/// A file on disk as last parsed for the project index.
+struct Indexed {
+    stamp: (u64, Option<std::time::SystemTime>),
+    items: Arc<Vec<Item>>,
+    implicit: Arc<Vec<(String, Option<String>)>>,
 }
 
 #[derive(Clone)]
@@ -99,6 +112,8 @@ struct FileState {
     generated: Vec<usize>,
     prototype: Vec<usize>,
     pending: Vec<Pending>,
+    /// Whether `pending` was computed (it's the expensive part).
+    with_pending: bool,
     lenses: Vec<Lens>,
     blocks: Vec<FileBlock>,
 }
@@ -215,7 +230,7 @@ fn run_with(conn: Connection) -> Result<()> {
     });
     conn.initialize_finish(id, caps)?;
     let server = Server {
-        state: Arc::new(Mutex::new(State { root, docs: BTreeMap::new(), busy: false, queued: None, checked_head: None, preview: Preview::default(), check: BTreeMap::new(), published: Default::default(), last_items: BTreeMap::new(), trace: None, next_id: 1, pending: HashMap::new() })),
+        state: Arc::new(Mutex::new(State { root, docs: BTreeMap::new(), busy: false, queued: None, checked_head: None, preview: Preview::default(), check: BTreeMap::new(), published: Default::default(), last_items: BTreeMap::new(), index: HashMap::new(), last_state: None, trace: None, next_id: 1, pending: HashMap::new() })),
         out: crossbeam_sender::Sender(conn.sender.clone()),
     };
     // Start the journal now, before any edits, so provenance is right from the first keystroke.
@@ -457,35 +472,86 @@ impl Server {
         }
     }
 
-    fn file_state(&self, rel: &str) -> Option<FileState> {
+    /// A file on disk, parsed once per change: its items and (Java) implicit members.
+    fn indexed(&self, p: &Project, f: &str) -> Option<(Arc<Vec<Item>>, Arc<Vec<(String, Option<String>)>>)> {
+        let meta = std::fs::metadata(p.root.join(f)).ok()?;
+        let stamp = (meta.len(), meta.modified().ok());
+        let cached = self.state.lock().unwrap().index.get(f).filter(|i| i.stamp == stamp).map(|i| (i.items.clone(), i.implicit.clone()));
+        if cached.is_some() {
+            return cached;
+        }
+        let src = p.read(f)?;
+        let items = Arc::new(items::parse(p.lang, &src).unwrap_or_default());
+        let members = Arc::new(if p.lang == Lang::Java { crate::java::implicit_members(&src) } else { vec![] });
+        self.state.lock().unwrap().index.insert(f.to_string(), Indexed { stamp, items: items.clone(), implicit: members.clone() });
+        Some((items, members))
+    }
+
+    /// Where each item is (path -> file, 1-based line), like [`Project::item_locations`] but from the index.
+    fn item_locations(&self, p: &Project) -> HashMap<String, (String, usize)> {
+        let mut locations = HashMap::new();
+        for f in p.src_files() {
+            let open = self.state.lock().unwrap().docs.get(&f).cloned();
+            let items = match open {
+                Some(src) => Arc::new(self.items_of(p.lang, &f, &src)),
+                None => match self.indexed(p, &f) {
+                    Some((items, _)) => items,
+                    None => continue,
+                },
+            };
+            for it in items.iter() {
+                locations.entry(it.path.clone()).or_insert((f.clone(), it.line));
+            }
+        }
+        locations
+    }
+
+    /// Uses of things the rest of the project doesn't define yet (open buffers win over disk).
+    fn pending_in(&self, p: &Project, rel: &str, text: &str) -> Vec<Pending> {
+        let mut all: Vec<Arc<Vec<Item>>> = Vec::new();
+        let mut implicit: Vec<Arc<Vec<(String, Option<String>)>>> = Vec::new();
+        for f in p.src_files().iter().filter(|f| f.as_str() != rel) {
+            let open = self.state.lock().unwrap().docs.get(f).cloned();
+            if let Some(src) = open {
+                all.push(Arc::new(self.items_of(p.lang, f, &src)));
+                if p.lang == Lang::Java {
+                    implicit.push(Arc::new(crate::java::implicit_members(&src)));
+                }
+                continue;
+            }
+            let Some((items, members)) = self.indexed(p, f) else { continue };
+            all.push(items);
+            implicit.push(members);
+        }
+        let mut known = pending::Known::from_items(all.iter().flat_map(|v| v.iter()));
+        for (path, ty) in implicit.iter().flat_map(|v| v.iter()) {
+            known.add_member(path, ty.as_deref());
+        }
+        pending::find(p.lang, text, &known).unwrap_or_default()
+    }
+
+    /// Everything an editor shows for one file; `with_pending` also finds what will be generated.
+    fn file_state(&self, rel: &str, with_pending: bool) -> Option<Arc<FileState>> {
         let p = self.project()?;
         let text = self.text(rel)?;
         let git = self.git();
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut h);
+            let refs = git.as_ref().map(|g| (g.branch().to_string(), g.journal(), g.code_head()));
+            format!("{rel}\0{:x}\0{refs:?}", h.finish())
+        };
+        let cached = self.state.lock().unwrap().last_state.clone().filter(|(k, fs)| *k == key && (fs.with_pending || !with_pending));
+        if let Some((_, fs)) = cached {
+            return Some(fs);
+        }
         let (whos, shas): (Vec<Who>, Vec<Option<String>>) = git.as_ref().and_then(|g| g.blame_lines(rel, &text)).unwrap_or_default().into_iter().unzip();
         let src = p.lang.is_src(rel) && !p.is_build_output(rel);
         let items = if src { self.items_of(p.lang, rel, &text) } else { vec![] };
         let mocked: Vec<(usize, usize)> = items.iter().filter(|i| i.mocked().is_some()).map(|i| (i.line, i.end_line)).collect();
         let (generated, prototype) = paint_lines(&whos, &text, &mocked);
-        let pending = if src {
-            // Everything the rest of the project defines, using open buffers where they exist.
-            let mut all = Vec::new();
-            let mut implicit = Vec::new();
-            for f in p.src_files().iter().filter(|f| f.as_str() != rel) {
-                if let Some(src) = self.text(f) {
-                    all.extend(self.items_of(p.lang, f, &src));
-                    if p.lang == Lang::Java {
-                        implicit.extend(crate::java::implicit_members(&src));
-                    }
-                }
-            }
-            let mut known = pending::Known::from_items(&all);
-            for (path, ty) in &implicit {
-                known.add_member(path, ty.as_deref());
-            }
-            pending::find(p.lang, &text, &known).unwrap_or_default()
-        } else {
-            vec![]
-        };
+        let pending = if src && with_pending { self.pending_in(&p, rel, &text) } else { vec![] };
         let lenses = lenses(&p, rel, &text, &items);
         let mut blocks = item_blocks(&whos, &text, &items);
         let ticket = git.as_ref().and_then(|g| self.ticket_trace(&p, g));
@@ -503,17 +569,19 @@ impl Server {
                 lenses.push(Lens { line: b.start, title: format!("◆ {}", b.problems.join(" · ")), command: "wish.ticket.open".into(), arguments: json!([b.problems[0]]) });
             }
         }
-        Some(FileState { git, ticket, text, items, whos, shas, generated, prototype, pending, lenses, blocks })
+        let fs = Arc::new(FileState { git, ticket, text, items, whos, shas, generated, prototype, pending, with_pending, lenses, blocks });
+        self.state.lock().unwrap().last_state = Some((key, fs.clone()));
+        Some(fs)
     }
 
-    fn file_state_of_uri(&self, params: &Value) -> Option<FileState> {
-        self.file_state(&params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u))?)
+    fn file_state_of_uri(&self, params: &Value, with_pending: bool) -> Option<Arc<FileState>> {
+        self.file_state(&params["textDocument"]["uri"].as_str().and_then(|u| self.rel_of_uri(u))?, with_pending)
     }
 
     /// `wish/fileState`: everything an editor needs to decorate one file.
     fn wire_file_state(&self, params: &Value) -> Value {
         let line_range = |l: &usize, text: &str| range(*l as u32, 0, *l as u32, line_len(text, *l));
-        let Some(fs) = self.file_state_of_uri(params) else {
+        let Some(fs) = self.file_state_of_uri(params, true) else {
             return serde_json::to_value(WireFileState { generated: vec![], prototype: vec![], pending: vec![], lenses: vec![], blocks: vec![] }).unwrap_or_default();
         };
         let lang = self.lang();
@@ -619,7 +687,7 @@ impl Server {
         let p = self.project().context("no wishlang project")?;
         let git = self.git().context("no wishlang project")?;
         let journal = git.journal().context("no journal yet")?;
-        let locs = p.item_locations();
+        let locs = self.item_locations(&p);
         let entries = git
             .history(&journal)
             .into_iter()
@@ -646,7 +714,7 @@ impl Server {
     fn diagnostics(&self, rel: &str) -> Vec<Value> {
         let Some(p) = self.project() else { return vec![] };
         let mut out = Vec::new();
-        if let Some(fs) = self.file_state(rel).filter(|_| p.lang.is_src(rel)) {
+        if let Some(fs) = self.file_state(rel, true).filter(|_| p.lang.is_src(rel)) {
             for pnd in &fs.pending {
                 out.push(json!({
                     "range": range(pnd.start.0, pnd.start.1, pnd.end.0, pnd.end.1),
@@ -685,6 +753,7 @@ impl Server {
 
     /// Republish everything open or previously published, and refresh hints.
     fn publish_all(&self) {
+        self.state.lock().unwrap().last_state = None;
         let rels: std::collections::BTreeSet<String> = {
             let st = self.state.lock().unwrap();
             st.docs.keys().chain(st.published.iter()).chain(st.check.keys()).cloned().collect::<std::collections::BTreeSet<_>>()
@@ -738,14 +807,14 @@ impl Server {
     /// Every generated line as a `generated` semantic token; Zed's token rule
     /// paints it blue. Lines inside a still-mocked item also get `prototype`.
     fn semantic_tokens(&self, params: &Value) -> Value {
-        let Some(fs) = self.file_state_of_uri(params) else { return json!({"data": []}) };
+        let Some(fs) = self.file_state_of_uri(params, false) else { return json!({"data": []}) };
         let untraced: Vec<usize> = fs.blocks.iter().filter(|b| b.untraced).flat_map(|b| b.start..=b.end).collect();
         json!({"data": encode_tokens(&fs.text, &fs.generated, &fs.prototype, &untraced)})
     }
 
     /// Blame the hovered line and show the reasoning recorded in its journal commit.
     fn hover(&self, params: &Value) -> Value {
-        let Some(fs) = self.file_state_of_uri(params) else { return Value::Null };
+        let Some(fs) = self.file_state_of_uri(params, false) else { return Value::Null };
         let line = params["position"]["line"].as_u64().unwrap_or(0) as usize;
         if fs.whos.get(line).is_none() || fs.text.lines().nth(line).is_none_or(|l| l.trim().is_empty()) {
             return Value::Null;
@@ -757,7 +826,7 @@ impl Server {
     /// Always-visible annotations: `✎` on your lines inside generated files,
     /// and a `◇ prototype` tag after the signature of every still-mocked item.
     fn inlay_hints(&self, params: &Value) -> Value {
-        let Some(fs) = self.file_state_of_uri(params) else { return json!([]) };
+        let Some(fs) = self.file_state_of_uri(params, false) else { return json!([]) };
         let text = &fs.text;
         let mut hints = Vec::new();
         // One marker per block of your lines, only where they mix with generated code.
@@ -784,7 +853,7 @@ impl Server {
     /// Clickable actions above code: implement a prototype item, and accept or
     /// reject Claude's suggestions in place.
     fn code_lenses(&self, params: &Value) -> Value {
-        let Some(fs) = self.file_state_of_uri(params) else { return json!([]) };
+        let Some(fs) = self.file_state_of_uri(params, false) else { return json!([]) };
         let lens = |l: &Lens| json!({"range": range(l.line as u32, 0, l.line as u32, 0), "command": {"title": l.title, "command": l.command, "arguments": l.arguments}});
         json!(fs.lenses.iter().map(lens).collect::<Vec<_>>())
     }
@@ -844,6 +913,7 @@ impl Server {
     }
 
     fn execute(&self, params: &Value) {
+        self.state.lock().unwrap().last_state = None;
         let Some(mut p) = self.project() else { return };
         let args = params["arguments"].as_array().cloned().unwrap_or_default();
         let s = |i: usize| args.get(i).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -904,7 +974,7 @@ impl Server {
     }
 
     fn next_block(&self, uri: &str, line: usize, human: bool) {
-        let Some(fs) = self.rel_of_uri(uri).and_then(|rel| self.file_state(&rel)) else { return };
+        let Some(fs) = self.rel_of_uri(uri).and_then(|rel| self.file_state(&rel, false)) else { return };
         let blocks = provenance::blocks(&fs.whos, &fs.text);
         let want = if human { Who::Human } else { Who::Claude };
         let target = blocks.iter().find(|b| b.who == want && b.start > line).or_else(|| blocks.iter().find(|b| b.who == want));

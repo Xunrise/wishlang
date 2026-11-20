@@ -183,7 +183,11 @@ impl Project {
     }
 
     pub fn save(&self) -> Result<()> {
-        let mut text = String::from("# wishlang project file. Edit [protected] and [constraints] freely;\n# [adopted] is maintained by `wish adopt` / `wish unadopt`.\n\n");
+        let mut text = String::from(
+            "# wishlang project file. Edit [protected] and [constraints] freely;\n# [adopted] is maintained by `wish adopt` / `wish unadopt`.\n\
+             #\n# [protected] binds only wish's own cycles (code generated from usage on save). In an ordinary\n\
+             # Claude Code session, every file may be edited as usual; wish records those edits as Claude's.\n\n",
+        );
         text.push_str(&toml::to_string_pretty(&self.cfg)?);
         fs::write(self.root.join("wish.toml"), text)?;
         Ok(())

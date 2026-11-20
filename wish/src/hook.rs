@@ -31,6 +31,14 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 pub fn evaluate(v: &Value) -> Verdict {
+    evaluate_in(v, std::env::var_os(crate::session::IN_CYCLE).is_some())
+}
+
+/// `in_cycle`: the hook guards a wish cycle, which saved the user's edits to the journal before
+/// Claude started; lines not in the journal yet are then Claude's own draft from this cycle.
+/// ponytail: a file the user saves while the cycle runs counts as Claude's until the cycle ends;
+/// the verification after the cycle still checks the lines the user had before it.
+fn evaluate_in(v: &Value, in_cycle: bool) -> Verdict {
     let tool = v["tool_name"].as_str().unwrap_or("");
     let input = &v["tool_input"];
     let cwd = v["cwd"].as_str().map(Path::new).unwrap_or(Path::new("."));
@@ -66,7 +74,10 @@ pub fn evaluate(v: &Value) -> Verdict {
 
     // Lines you wrote inside a generated file must survive (provenance from the git journal).
     if let (Some(cur), Ok(git)) = (current.as_deref(), crate::git::Git::open(&project.root)) {
-        if let Some(whos) = crate::provenance::of(&git, &rel, cur) {
+        let whos = git.blame_lines(&rel, cur).map(|lines| {
+            lines.into_iter().map(|(who, sha)| if in_cycle && sha.is_none() { crate::git::Who::Claude } else { who }).collect::<Vec<_>>()
+        });
+        if let Some(whos) = whos {
             let missing = crate::provenance::missing(&crate::provenance::human_lines(&whos, cur), &proposed);
             if let Some(l) = missing.first() {
                 return Verdict::Deny(format!(
@@ -128,7 +139,9 @@ fn bash(cmd: &str, cwd: &Path) -> Verdict {
     }
     let Some(project) = Project::discover_from(cwd) else { return Verdict::Allow };
     let writes = regex::Regex::new(r"(>|\btee\b|\bsed\s+-i|\bmv\b|\brm\b|\bcp\b|\btruncate\b|\bperl\s+-[a-z]*i)").unwrap();
-    if writes.is_match(cmd) {
+    // Discarding output or merging streams writes no file: `2>/dev/null`, `&>/dev/null`, `2>&1`.
+    let harmless = regex::Regex::new(r"(&|\d)?>>?\s*(/dev/null\b|&\d)").unwrap();
+    if writes.is_match(&harmless.replace_all(cmd, " ")) {
         let mut guarded: Vec<String> = project.cfg.protected.files.clone();
         guarded.extend(project.cfg.adopted.values().map(|a| a.file.clone()));
         guarded.extend(["wish.toml".into(), "DECISIONS.md".into(), ".wish".into()]);
@@ -146,7 +159,11 @@ mod tests {
     use std::fs;
 
     fn setup() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("wish-hook-test-{}", std::process::id()));
+        setup_in("guards")
+    }
+
+    fn setup_in(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wish-hook-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(dir.join("src/main.rs"), "fn main() {\n    App::new(\"Demo\").run()\n}\n").unwrap();
@@ -163,6 +180,22 @@ mod tests {
 
     fn denied(v: &Value) -> bool {
         matches!(evaluate(v), Verdict::Deny(_))
+    }
+
+    #[test]
+    fn claude_may_rework_its_own_draft_within_a_cycle() {
+        let d = setup_in("draft");
+        let _ = std::process::Command::new("git").args(["init", "-q"]).current_dir(&d).status();
+        let p = Project::load(&d).unwrap();
+        let g = crate::git::Git::open(&d).unwrap();
+        crate::engine::ensure_journal(&p, &g).unwrap();
+        // written by Claude during this cycle: not in the journal yet
+        fs::write(d.join("src/draft.rs"), "pub struct Draft;\npub fn first() {}\n").unwrap();
+        let v = edit(&d, "src/draft.rs", "pub fn first() {}", "pub fn second() {}");
+        assert!(matches!(evaluate_in(&v, true), Verdict::Allow));
+        // outside a cycle, unsaved lines are the user's typing
+        assert!(matches!(evaluate_in(&v, false), Verdict::Deny(_)));
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -185,6 +218,9 @@ mod tests {
         assert!(denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "wish adopt App::run"}})));
         assert!(denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "sed -i s/run/go/ src/main.rs"}})));
         assert!(!denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "cargo check"}})));
+        // Reading a protected file while discarding errors is not a write.
+        assert!(!denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "cat CLAUDE.md 2>/dev/null | head; cat src/main.rs 2>&1"}})));
+        assert!(denied(&json!({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "cat x 2>/dev/null > src/main.rs"}})));
         let _ = fs::remove_dir_all(&d);
     }
 

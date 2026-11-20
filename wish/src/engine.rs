@@ -253,8 +253,18 @@ pub fn history_story(git: &Git, budget: usize) -> String {
     out
 }
 
+/// Protected files that differ between two snapshots (one git call, however many files are protected).
+fn changed_protected(p: &Project, git: &Git, a: &str, b: &str) -> Result<Vec<String>> {
+    Ok(git.changed(a, b)?.into_iter().map(|(_, f)| f).filter(|f| p.is_protected(f)).collect())
+}
+
+/// Above this many bytes of protected code, the prompt shows only the files in focus.
+const PROTECTED_INLINE_BYTES: usize = 150_000;
+
 struct PromptInput<'a> {
     diff: &'a Option<String>,
+    /// Protected files the user changed: what a large codebase's prompt shows in full.
+    focus: &'a [String],
     owned_edits: &'a str,
     human_owned: &'a BTreeMap<String, Vec<String>>,
     check_errors: &'a str,
@@ -265,9 +275,18 @@ struct PromptInput<'a> {
 
 fn build_prompt(p: &Project, i: &PromptInput) -> String {
     let mut s = String::new();
+    let protected = p.protected_files();
+    let total: usize = protected.values().map(String::len).sum();
     s.push_str("# The user's code (protected)\n\n");
-    for (f, src) in p.protected_files() {
-        s.push_str(&format!("## {f}\n```{}\n{}```\n\n", p.lang.name(), numbered(&src)));
+    if total > PROTECTED_INLINE_BYTES {
+        s.push_str(&format!(
+            "This is a large codebase ({} protected files). Only the files the user changed are shown below; \
+             Glob, Grep and Read the rest as you need it. Follow the conventions and architecture you find there.\n\n",
+            protected.len()
+        ));
+    }
+    for (f, src) in protected.iter().filter(|(f, _)| total <= PROTECTED_INLINE_BYTES || i.focus.contains(f)) {
+        s.push_str(&format!("## {f}\n```{}\n{}```\n\n", p.lang.name(), numbered(src)));
     }
     match i.diff {
         None => s.push_str("# What changed\nFirst cycle: nothing has been generated yet. Build the vocabulary from scratch.\n\n"),
@@ -384,8 +403,15 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
 
     // What you changed since the last green cycle: in your files, and inside generated files.
     let diff = match &last {
-        Some(l) => Some(git.diff(l, &pre, &p.cfg.protected.files)?),
+        Some(l) => Some(git.diff(l, &pre, &changed_protected(p, &git, l, &pre)?)?),
         None => None,
+    };
+    // In a large codebase Claude sees only the protected files you changed (since the last cycle,
+    // or since the journal began) and reads the rest itself.
+    let base = last.clone().or_else(|| git.root_commit(&pre));
+    let focus = match &base {
+        Some(b) => changed_protected(p, &git, b, &pre)?,
+        None => vec![],
     };
     let owned_src: Vec<String> = p.src_files().into_iter().filter(|f| !p.is_protected(f)).collect();
     // Only this save's edits: between the previous journal tip and now, only you edited.
@@ -440,7 +466,7 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
         _ => "your code changed: asking Claude to regenerate".into(),
     }});
     let ticket = ticket::start(&p.root, git.branch(), sink);
-    let prompt = build_prompt(p, &PromptInput { diff: &diff, owned_edits: &owned_edits, human_owned: &human_owned, check_errors: if ok { "" } else { &errors }, opts, history, ticket: &ticket });
+    let prompt = build_prompt(p, &PromptInput { diff: &diff, focus: &focus, owned_edits: &owned_edits, human_owned: &human_owned, check_errors: if ok { "" } else { &errors }, opts, history, ticket: &ticket });
     let rules = claude::rules(p.lang, implement);
     let report = match claude::run(p, &prompt, &rules, ticket.is_some(), sink) {
         Ok(r) => r,
@@ -453,7 +479,7 @@ pub fn compile(p: &mut Project, sink: &mut dyn Sink, opts: &Options) -> Result<b
 
     // ---- verify (backstop for the hook) ----
     let mut violations = p.verify_adopted();
-    for f in &p.cfg.protected.files {
+    for f in &changed_protected(p, &git, &pre, &post)? {
         let old = git.show(&pre, f).unwrap_or_default();
         let new = git.show(&post, f).unwrap_or_default();
         match wiring_only(p.lang, &old, &new) {

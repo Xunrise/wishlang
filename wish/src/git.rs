@@ -25,6 +25,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,11 @@ pub struct Git {
     index: PathBuf,
     /// The checked-out code branch ("detached" without one).
     branch: String,
+    /// The journal tip, resolved at most once per `Git` (`set_ref` keeps it current).
+    journal: Mutex<Option<Option<String>>>,
+    /// This worktree's git dir (HEAD) and the repository's common dir (refs).
+    git_dir: PathBuf,
+    common_dir: PathBuf,
 }
 
 /// Wish's per-branch ref kinds.
@@ -103,24 +109,33 @@ const PER_BRANCH: [&str; 3] = ["journal", "last", "prototype"];
 
 impl Git {
     pub fn open(root: &Path) -> Result<Self> {
-        let out = Command::new("git").args(["rev-parse", "--show-prefix", "--git-path", "wish-index"]).current_dir(root).output().context("running git")?;
-        if !out.status.success() {
-            bail!("wishlang uses git to track changes: {} is not in a git repository (run `git init`)", root.display());
+        // The editor opens git on every request: ask git about the repository once per
+        // process and root, and read the branch from HEAD directly.
+        static REPOS: Mutex<BTreeMap<PathBuf, (String, PathBuf, PathBuf, PathBuf)>> = Mutex::new(BTreeMap::new());
+        let known = REPOS.lock().unwrap().get(root).cloned();
+        let (prefix, index, git_dir, common_dir, fresh) = match known {
+            Some((prefix, index, git_dir, common_dir)) => (prefix, index, git_dir, common_dir, false),
+            None => {
+                let out = Command::new("git").args(["rev-parse", "--show-prefix", "--git-path", "wish-index", "--absolute-git-dir", "--path-format=absolute", "--git-common-dir"]).current_dir(root).output().context("running git")?;
+                if !out.status.success() {
+                    bail!("wishlang uses git to track changes: {} is not in a git repository (run `git init`)", root.display());
+                }
+                let text = String::from_utf8_lossy(&out.stdout);
+                let mut lines = text.lines();
+                let prefix = lines.next().unwrap_or("").to_string();
+                let index = root.join(lines.next().unwrap_or(".git/wish-index"));
+                let git_dir = PathBuf::from(lines.next().unwrap_or(".git"));
+                let common_dir = lines.next().map_or_else(|| git_dir.clone(), PathBuf::from);
+                REPOS.lock().unwrap().insert(root.to_path_buf(), (prefix.clone(), index.clone(), git_dir.clone(), common_dir.clone()));
+                (prefix, index, git_dir, common_dir, true)
+            }
+        };
+        let head = std::fs::read_to_string(git_dir.join("HEAD")).unwrap_or_default();
+        let branch = head.trim().strip_prefix("ref: refs/heads/").map_or_else(|| "detached".to_string(), str::to_string);
+        let g = Self { root: root.to_path_buf(), prefix, index, branch, journal: Mutex::new(None), git_dir, common_dir };
+        if fresh {
+            g.migrate();
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut lines = text.lines();
-        let prefix = lines.next().unwrap_or("").to_string();
-        let index = root.join(lines.next().unwrap_or(".git/wish-index"));
-        let branch = Command::new("git")
-            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .current_dir(root)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "detached".into());
-        let g = Self { root: root.to_path_buf(), prefix, index, branch };
-        g.migrate();
         Ok(g)
     }
 
@@ -129,14 +144,13 @@ impl Git {
     fn migrate(&self) {
         for name in PER_BRANCH {
             let old = format!("refs/wish/{}{name}", self.prefix);
-            if let Ok(sha) = self.git(&["rev-parse", "--verify", "--quiet", &format!("{old}^{{commit}}")]) {
-                let sha = sha.trim().to_string();
+            if let Some(sha) = self.resolve(&old) {
                 let _ = self.git(&["update-ref", "-d", &old]);
                 let _ = self.git(&["update-ref", &self.ref_name(name), &sha]);
             }
         }
         let old_log = format!("refs/heads/wish/{}log", self.prefix);
-        if let Ok(sha) = self.git(&["rev-parse", "--verify", "--quiet", &old_log]) {
+        if let Some(sha) = self.resolve(&old_log) {
             let _ = self.git(&["update-ref", "-d", &old_log]);
             let _ = self.git(&["update-ref", &self.journal_branch(), sha.trim()]);
         }
@@ -152,10 +166,15 @@ impl Git {
     }
 
     fn run(&self, args: &[&str], temp_index: bool, who: Who, stdin: Option<&str>) -> Result<String> {
+        self.run_in(args, temp_index.then_some(self.index.as_path()), who, stdin)
+    }
+
+    /// Run git, with `index` as its index file if given.
+    fn run_in(&self, args: &[&str], index: Option<&Path>, who: Who, stdin: Option<&str>) -> Result<String> {
         let mut c = Command::new("git");
         c.args(args).current_dir(&self.root);
-        if temp_index {
-            c.env("GIT_INDEX_FILE", &self.index);
+        if let Some(i) = index {
+            c.env("GIT_INDEX_FILE", i);
         }
         let (name, mail) = who.ident();
         c.env("GIT_AUTHOR_NAME", name).env("GIT_AUTHOR_EMAIL", mail);
@@ -179,26 +198,39 @@ impl Git {
     /// Tree of the project directory as on disk (honouring .gitignore),
     /// optionally limited to some paths.
     pub fn tree(&self, only: Option<&[String]>) -> Result<String> {
+        let Some(paths) = only else { return self.full_tree() };
         let _ = std::fs::remove_file(&self.index);
         let mut args: Vec<&str> = vec!["add", "-A", "--"];
-        match only {
-            Some(paths) => args.extend(paths.iter().map(String::as_str).filter(|p| self.root.join(p).exists())),
-            None => {
-                args.push(".");
-                // Build output never belongs in a snapshot, even without a
-                // .gitignore. (Git errors on an exclude pathspec naming an
-                // already-ignored path, so only add it when needed.)
-                if self.git(&["check-ignore", "-q", "target"]).is_err() {
-                    args.push(":(exclude)target");
-                }
-            }
-        }
+        args.extend(paths.iter().map(String::as_str).filter(|p| self.root.join(p).exists()));
         if args.len() > 3 {
             self.run(&args, true, Who::Human, None)?;
         }
         let tree = self.run(&["write-tree"], true, Who::Human, None)?;
         let _ = std::fs::remove_file(&self.index);
         Ok(tree.trim().to_string())
+    }
+
+    /// Tree of the whole project directory. Its index is kept between snapshots, so git
+    /// only re-reads files whose stat changed (a fresh index hashes every file, every time).
+    fn full_tree(&self) -> Result<String> {
+        let index = self.index.with_file_name("wish-snapshot-index");
+        let idx = Some(index.as_path());
+        // Files that became ignored since the last snapshot leave it, as with a fresh index.
+        let ignored = self.run_in(&["ls-files", "-z", "--cached", "--ignored", "--exclude-standard", "--", "."], idx, Who::Human, None)?;
+        let ignored: Vec<&str> = ignored.split('\0').filter(|f| !f.is_empty()).collect();
+        if !ignored.is_empty() {
+            let mut rm = vec!["rm", "--cached", "-q", "--ignore-unmatch", "--"];
+            rm.extend(ignored);
+            self.run_in(&rm, idx, Who::Human, None)?;
+        }
+        let mut args = vec!["add", "-A", "--", "."];
+        // Build output never belongs in a snapshot, even without a .gitignore. (Git errors on
+        // an exclude pathspec naming an already-ignored path, so only add it when needed.)
+        if self.git(&["check-ignore", "-q", "target"]).is_err() {
+            args.push(":(exclude)target");
+        }
+        self.run_in(&args, idx, Who::Human, None)?;
+        Ok(self.run_in(&["write-tree"], idx, Who::Human, None)?.trim().to_string())
     }
 
     /// Tree of commit `base` with some files (relative paths) replaced.
@@ -266,6 +298,11 @@ impl Git {
     /// A file of wish's own in the git directory (never in a snapshot), per project.
     pub fn private_file(&self, name: &str) -> PathBuf {
         self.index.with_file_name(format!("wish-{}{name}", self.prefix.replace('/', "_")))
+    }
+
+    /// The oldest root commit reachable from `rev` (where a journal began).
+    pub fn root_commit(&self, rev: &str) -> Option<String> {
+        self.git(&["rev-list", "--max-parents=0", rev]).ok()?.lines().last().map(str::to_string)
     }
 
     pub fn tree_of(&self, sha: &str) -> Option<String> {
@@ -377,6 +414,9 @@ impl Git {
     /// Point another branch's journal at `sha` (and its log mirror).
     pub fn set_branch_journal(&self, branch: &str, sha: &str) -> Result<()> {
         self.git(&["update-ref", &self.ref_for("journal", branch), sha])?;
+        if branch == self.branch {
+            *self.journal.lock().unwrap() = Some(Some(sha.to_string()));
+        }
         self.git(&["update-ref", &format!("refs/heads/wish/{}log/{branch}", self.prefix), sha]).map(|_| ())
     }
 
@@ -402,11 +442,49 @@ impl Git {
     }
 
     pub fn resolve(&self, r: &str) -> Option<String> {
+        if let Some(found) = self.read_ref(r, 0) {
+            return found;
+        }
         self.git(&["rev-parse", "--verify", "--quiet", r]).ok().map(|s| s.trim().to_string())
+    }
+
+    /// Resolve `HEAD` or a full ref name from the ref files, without running git (editors
+    /// ask on every keystroke). `Some(None)` is a ref that doesn't exist; `None` means ask git.
+    fn read_ref(&self, r: &str, depth: u8) -> Option<Option<String>> {
+        let is_name = r == "HEAD" || (r.starts_with("refs/") && !r.contains(['^', '~', ':', '@', '{', '\\']) && !r.contains(".."));
+        if !is_name || depth > 4 || self.common_dir.join("reftable").exists() {
+            return None;
+        }
+        let dir = if r == "HEAD" { &self.git_dir } else { &self.common_dir };
+        let is_sha = |t: &str| (t.len() == 40 || t.len() == 64) && t.bytes().all(|b| b.is_ascii_hexdigit());
+        // A directory (`refs/wish/journal/` holding per-branch refs) is no loose ref of that name.
+        let loose = dir.join(r);
+        let read = if loose.is_dir() { Err(std::io::ErrorKind::NotFound.into()) } else { std::fs::read_to_string(loose) };
+        match read {
+            Ok(text) => {
+                let t = text.trim();
+                if let Some(target) = t.strip_prefix("ref: ") {
+                    return self.read_ref(target.trim(), depth + 1);
+                }
+                is_sha(t).then(|| Some(t.to_string()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if r == "HEAD" {
+                    return None;
+                }
+                let packed = std::fs::read_to_string(self.common_dir.join("packed-refs")).unwrap_or_default();
+                let sha = packed.lines().filter(|l| !l.starts_with(['#', '^'])).find_map(|l| l.split_once(' ').filter(|(_, name)| *name == r).map(|(sha, _)| sha.to_string()));
+                Some(sha.filter(|s| is_sha(s)))
+            }
+            Err(_) => None,
+        }
     }
 
     pub fn set_ref(&self, r: &str, sha: &str) -> Result<()> {
         self.git(&["update-ref", r, sha])?;
+        if r == self.ref_name("journal") {
+            *self.journal.lock().unwrap() = Some(Some(sha.to_string()));
+        }
         // Mirror the journal to a local branch so ordinary git tooling (Zed's
         // git graph, lazygit, `git log`) can browse what wish did.
         if r == self.ref_name("journal") {
@@ -422,7 +500,8 @@ impl Git {
     }
 
     pub fn journal(&self) -> Option<String> {
-        self.resolve(&self.ref_name("journal"))
+        let mut memo = self.journal.lock().unwrap();
+        memo.get_or_insert_with(|| self.resolve(&self.ref_name("journal"))).clone()
     }
 
     pub fn last(&self) -> Option<String> {
@@ -470,10 +549,9 @@ impl Git {
     pub fn blame_lines(&self, rel: &str, contents: &str) -> Option<Vec<(Who, Option<String>)>> {
         let journal = self.journal()?;
         let lines = contents.lines().count();
-        if self.show(&journal, rel).is_none() {
+        let Ok(out) = self.run(&["blame", "--porcelain", "--contents", "-", &journal, "--", rel], false, Who::Human, Some(contents)) else {
             return Some(vec![(Who::Human, None); lines]); // a file you created since the last save
-        }
-        let out = self.run(&["blame", "--porcelain", "--contents", "-", &journal, "--", rel], false, Who::Human, Some(contents)).ok()?;
+        };
         // Blame follows lines through journal merges, so a line generated on a
         // feature branch stays Claude's (with that cycle's reasoning) after merging.
         let mut whos = std::collections::HashMap::new();

@@ -104,11 +104,33 @@ fn before_turn(p: &Project, session: &str, prompt: &str) -> Result<()> {
     let git = Git::open(&p.root)?;
     let Some(_lock) = git.try_lock() else { return Ok(()) }; // a wish cycle is running and records itself
     let tip = crate::engine::ensure_journal(p, &git)?;
-    crate::engine::record_save(&git, &tip, "save: before a Claude Code turn")?;
+    // While another session's turn is open, what is on disk may be its half-done work: don't claim it
+    // as the user's. That session's Stop records it as Claude's (with any edits of yours in between,
+    // erring towards showing code as generated rather than hiding generated code as yours).
+    if !other_turn_open(&git, session) {
+        crate::engine::record_save(&git, &tip, "save: before a Claude Code turn")?;
+    }
     let path = turn_file(&git, session, "turn.json");
     let mut turn: Turn = read_json(&path).unwrap_or_default();
     turn.prompts.push(prompt.trim().to_string());
     write_json(&path, &turn)
+}
+
+/// Turns older than this are from sessions that ended without their Stop hook.
+const STALE_TURN: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Is a turn of another session open on this project (its prompt seen, its Stop not yet)?
+fn other_turn_open(git: &Git, session: &str) -> bool {
+    let mine = turn_file(git, session, "turn.json");
+    let probe = turn_file(git, "", "turn.json");
+    let (Some(dir), Some(name)) = (probe.parent(), probe.file_name().and_then(|n| n.to_str())) else { return false };
+    let (prefix, suffix) = name.split_once("session-").map(|(a, _)| (format!("{a}session-"), ".turn.json")).unwrap_or_default();
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    rd.flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().to_string();
+        let fresh = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age < STALE_TURN);
+        n.starts_with(&prefix) && n.ends_with(suffix) && e.path() != mine && fresh
+    })
 }
 
 /// Record the turn, or (once) ask Claude to explain it first. Returns what to ask.
@@ -449,6 +471,21 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_in_another_session_does_not_claim_a_running_turns_code() {
+        let (dir, p) = repo("concurrent");
+        crate::engine::ensure_journal(&p, &Git::open(&p.root).unwrap()).unwrap();
+        before_turn(&p, "busy", "build App").unwrap();
+        // session "busy" is mid-turn and has written App; another session gets a prompt now
+        std::fs::write(p.root.join("src/main/java/demo/App.java"), APP).unwrap();
+        before_turn(&p, "other", "unrelated question").unwrap();
+        let _ = after_turn(&p, "other", true, None).unwrap();
+        let _ = after_turn(&p, "busy", true, None).unwrap();
+        let g = Git::open(&p.root).unwrap();
+        assert!(whos(&g, "src/main/java/demo/App.java", APP).iter().all(|w| *w == Who::Claude));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn import_records_each_commit_touching_the_project_as_claudes() {
         let (dir, p) = repo("import");
         let base = git(&dir, &["rev-parse", "HEAD"]).trim().to_string();
@@ -515,7 +552,8 @@ mod tests {
         let items: Vec<(&str, &str, usize)> = t.problems[0].items.iter().map(|i| (i.item.as_str(), i.file.as_str(), i.line)).collect();
         assert_eq!(items, [("Bye.say", "src/main/java/demo/Bye.java", 4)]);
         assert_eq!(t.checkout.as_deref().map(|c| c.ends_with("backend")), Some(true));
-        assert!(t.checkout.unwrap().starts_with(&wt));
+        // Canonical: on macOS the temp dir is a symlink (/var -> /private/var).
+        assert!(t.checkout.unwrap().canonicalize().unwrap().starts_with(wt.canonicalize().unwrap()));
         // ... and this branch's own ticket is unaffected.
         assert_eq!(ticket::trace(&p, &g).unwrap().problems[0].items.iter().map(|i| i.item.as_str()).collect::<Vec<_>>(), ["App.create"]);
         let _ = std::fs::remove_dir_all(&wt);
