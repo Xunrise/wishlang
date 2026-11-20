@@ -12,9 +12,43 @@ The project stays normal, clean Rust (or Java). The only extra files are `wish.t
 
 ## Install
 
+**macOS and Linux**
+
 ```sh
-cargo install --path wish        # puts `wishlang` on PATH (Zed looks for it there, or in $WISH_BIN)
+curl -fsSL https://raw.githubusercontent.com/Xunrise/wishlang/master/install.sh | sh
 ```
+
+It downloads the release for your platform, verifies its SHA-256, and installs `wishlang` to `~/.local/bin` (`WISHLANG_INSTALL_DIR` to change it, `| sh -s -- --system` for `/usr/local/bin`). It also links a `wish` alias, but only when the install directory comes before `/usr/bin` on your PATH, because macOS ships its own `/usr/bin/wish` (Tk). Re-run it to upgrade; `--version 0.2.0` pins a version.
+
+**Windows** (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/Xunrise/wishlang/master/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\wishlang\bin` and adds it to your user PATH.
+
+**Homebrew**
+
+```sh
+brew install Xunrise/tap/wishlang
+```
+
+**Cargo**
+
+```sh
+cargo install wishlang
+```
+
+**From source**
+
+```sh
+cargo install --path wish
+```
+
+Prebuilt archives (macOS and Linux on arm64 and x86_64, Windows x86_64) and `wishlang-<version>-checksums.txt` are on the [releases page](https://github.com/Xunrise/wishlang/releases). Linux builds are static (musl) and run on any distribution.
+
+Zed looks for `wishlang` on PATH (or in `$WISH_BIN`).
 
 Then, in Zed, open the command palette, run **zed: install dev extension**, and pick the `zed/` folder of this repo.
 
@@ -300,3 +334,7 @@ wish/src/
 zed/             Zed extension (launches `wishlang lsp`)
 examples/demo    demo project (+ .zed/settings.json)
 ```
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
