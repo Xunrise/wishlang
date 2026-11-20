@@ -91,17 +91,13 @@ When the branch belongs to a ticket, wish traces generated code back to the tick
 
 ### Code Claude writes outside wish
 
-An ordinary Claude Code session ("change X") is recorded too, once `wishlang session` is a hook in your **user** settings (`~/.claude/settings.json`, so it covers every checkout and worktree):
+An ordinary Claude Code session ("change X") is recorded too, once `wishlang session` is a hook in your **user** settings (so it covers every checkout and worktree). Run:
 
-```json
-"hooks": {
-  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.cargo/bin/wishlang session"}]}],
-  "Stop": [{"hooks": [{"type": "command", "command": "~/.cargo/bin/wishlang session"}]}]
-},
-"permissions": {"allow": ["Bash(~/.cargo/bin/wishlang explain:*)"]}
+```sh
+wishlang setup
 ```
 
-(Write the full path of `wish`.) When you send a prompt, what is on disk is recorded as yours. When Claude's turn ends, everything that changed during the turn is Claude's, however it was written (Edit, Write or a shell command). If the turn changed items, the hook first sends Claude back once to explain them, with the ticket's problems: Claude pipes `{"summary", "changes": [{"item", "why", "problems"}]}` into `wishlang explain`. The result is a `session` entry in the journal, like a cycle: blue code, hovers with the reason, `Triggered by` your prompt, and the ticket tab. The hook does nothing without a `wish.toml` in the session's directory, a parent, or a direct subdirectory, and nothing inside wish's own cycles. While one session's turn is running, a prompt in another session on the same project doesn't record the disk as yours: the running session's Stop records it as Claude's.
+It adds `UserPromptSubmit` and `Stop` hooks running this binary's absolute path with `session`, and the permission `Bash(<path> explain:*)`, to `~/.claude/settings.json`. It replaces older `wish` entries, keeps your other hooks, shows a diff and asks before writing (`--yes` skips the question, `--uninstall` removes the entries). When you send a prompt, what is on disk is recorded as yours. When Claude's turn ends, everything that changed during the turn is Claude's, however it was written (Edit, Write or a shell command). If the turn changed items, the hook first sends Claude back once to explain them, with the ticket's problems: Claude pipes `{"summary", "changes": [{"item", "why", "problems"}]}` into `wishlang explain`. The result is a `session` entry in the journal, like a cycle: blue code, hovers with the reason, `Triggered by` your prompt, and the ticket tab. The hook does nothing without a `wish.toml` in the session's directory, a parent, or a direct subdirectory, and nothing inside wish's own cycles. While one session's turn is running, a prompt in another session on the same project doesn't record the disk as yours: the running session's Stop records it as Claude's.
 
 For code written before that, `wishlang import <since>` rebuilds the branch's journal: the code at `<since>` is yours, every commit since that touches the project is Claude's (one `imported` entry each, explained by its commit message), uncommitted changes are yours. `--report file.json` adds per-item reasons and problem tags: `{"<sha>": {"changes": [{"item", "why", "problems"}], "problems": [...]}}` (`problems` creates `problems.json` if it doesn't exist). In Zed, hovering an item says "Solves P#", the `◆ P1 · P2` lens opens `problems.json`, untraced code gets the red rule from the settings above, untraced warnings show in project diagnostics, and the task `wish: ticket` lists the tracing in the terminal.
 
@@ -233,22 +229,44 @@ Adopted items are pinned by token hashes in `wish.toml`, because adoption is per
 ## Commands
 
 ```
-wishlang lsp                     language server (Zed launches it via the extension)
-wishlang log [--patch]           the journal: saves and cycles with Claude's reasoning
-wishlang ticket [--json]         this branch's ticket: problems, and the files and items serving each
-wishlang share [REMOTE]          push wish journals (default: origin)
-wishlang sync [REMOTE]           fetch others' wish journals
-wishlang dev                     terminal loop: c compile · f force · w compile-on-save · r restart · u undo · I implement
-                             d decisions · s suggestions · i items · :<command> · q quit
-wishlang compile [--json] [--force] [--no-run] [--note TEXT]
-wishlang implement [FILE] [--item PATH] [--json]
-wishlang undo
-wishlang adopt|unadopt <item>    e.g. Mode, Window::open, Mode::Maximized (see `wishlang items`)
-wishlang decisions | wishlang decide <id> accept|reject [reason]
-wishlang suggestions | wishlang accept <id> | wishlang reject <id>
-wishlang check                   adopted intact + dependencies decided + cargo check
-wishlang init                    wish.toml (+ .zed/settings.json) + git journal for a cargo or Maven project
+Project
+  wishlang init [--protect-existing]   wish.toml (+ .zed/settings.json) + git journal for a cargo or Maven project
+  wishlang items                       items per file and their owner
+  wishlang adopt|unadopt <item>        e.g. Mode, Window::open, Mode::Maximized (see `wishlang items`)
+  wishlang check                       adopted intact + dependencies decided + build
+
+Cycles
+  wishlang compile [--json] [--force] [--no-run] [--note TEXT]
+  wishlang implement [FILE] [--item PATH] [--json]
+  wishlang undo
+  wishlang dev                         terminal loop: c compile · f force · w compile-on-save · r restart · u undo · I implement
+                                       d decisions · s suggestions · i items · :<command> · q quit
+
+Claude's proposals
+  wishlang suggestions | wishlang accept <id> | wishlang reject <id>
+  wishlang decisions | wishlang decide <id> accept|reject [reason]
+
+History and tickets
+  wishlang log [--patch]               the journal: saves and cycles with Claude's reasoning
+  wishlang ticket [--json]             this branch's ticket: problems, and the files and items serving each
+  wishlang import <since> [--report F] rebuild the journal from commits (see above)
+  wishlang share [REMOTE]              push wish journals (default: origin)
+  wishlang sync [REMOTE]               fetch others' wish journals
+
+Editors and Claude Code
+  wishlang lsp                         language server (Zed launches it via the extension)
+  wishlang session | explain           Claude Code hook and its helper (installed by setup)
+  wishlang setup [--uninstall] [--yes] write the hooks and permission into ~/.claude/settings.json
+
+Runtime
+  wishlang daemon, service             shared background daemon and its start at login
+  wishlang doctor [--json]             check tools, install, hooks and editor plugins; exit 1 on failures
+  wishlang update [--check] [--json] [--version X]   self-update (brew/cargo installs print their command)
+  wishlang completions <shell>         bash, zsh, fish, powershell or elvish
+  wishlang man                         man page (roff) on stdout
 ```
+
+Every command has `--help` with examples. Exit codes: 0 ok, 1 failure (a failed cycle or check, doctor problems, `update --check` with an update available, any error), 2 usage error.
 
 ## Layout
 
