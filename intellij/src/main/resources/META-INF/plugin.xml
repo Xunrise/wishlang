@@ -1,8 +1,22 @@
 <idea-plugin>
   <id>io.wishlang.intellij</id>
-  <name>Wish</name>
-  <vendor>wishlang</vendor>
-  <description>Shows what wish generated, and why, next to your Java code.</description>
+  <name>wishlang</name>
+  <vendor url="https://github.com/Xunrise/wishlang">wishlang</vendor>
+  <description><![CDATA[
+<p><b>Create-from-usage for Java.</b> Write the call sites you wish existed; Claude Code writes the code underneath,
+first as a skimmable prototype, then, once you are happy, as the real implementation.</p>
+<ul>
+  <li><b>Tinted code:</b> everything Claude generated gets a gutter bar and a faint tint, stronger while it is still mocked.</li>
+  <li><b>Reasons on hover:</b> who wrote a line and, for generated code, why and which of your edits triggered it.</li>
+  <li><b>Ticket tracing:</b> generated code is traced to the problems of the branch's ticket; code that serves none is flagged red.</li>
+  <li><b>No false errors:</b> <code>Cannot resolve symbol</code> is hidden for symbols you wished for; they show as <i>will be generated</i>.</li>
+  <li><b>Wish tool window:</b> the journal of every cycle with diffs and Claude's reasoning, and the ticket as a problem tree.</li>
+</ul>
+<p>Requires the <code>wishlang</code> command-line tool and <a href="https://claude.com/claude-code">Claude Code</a>.
+If <code>wishlang</code> is missing, the plugin offers to download it.
+See <a href="https://xunrise.github.io/wishlang/">xunrise.github.io/wishlang</a> for install instructions and a demo.
+Rust is supported in Zed through the wishlang extension.</p>
+]]></description>
   <depends>com.intellij.modules.platform</depends>
   <depends>com.intellij.java</depends>
 
