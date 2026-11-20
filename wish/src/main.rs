@@ -2,6 +2,8 @@
 
 mod claude;
 mod commands;
+mod daemon;
+mod service;
 mod dev;
 mod engine;
 mod events;
@@ -127,9 +129,46 @@ enum Cmd {
     },
     /// Language server for editors (Zed): blue markers, provenance hints, compile on save.
     Lsp,
+    /// Keep the daemon running as a login service.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+    /// The per-user daemon that serves editors (started automatically by `wishlang lsp`).
+    Daemon {
+        #[command(subcommand)]
+        cmd: Option<DaemonCmd>,
+        /// Keep running when idle (for `wishlang service`).
+        #[arg(long)]
+        no_idle_exit: bool,
+    },
     /// Claude Code PreToolUse hook (internal).
     #[command(hide = true)]
     Hook,
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Run the daemon from login on (launchd on macOS, systemd --user on Linux).
+    Install,
+    /// Remove the service; editors start the daemon on demand again.
+    Uninstall,
+    /// Whether the service is installed and which binary it runs.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Show whether the daemon runs, its version and the projects it serves.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the daemon after its running cycles finish; editors reconnect to a new one.
+    Stop,
 }
 
 fn main() {
@@ -177,7 +216,47 @@ fn run() -> anyhow::Result<()> {
         Cmd::Accept { id } => print(commands::accept(&mut Project::discover()?, id)),
         Cmd::Reject { id } => print(commands::reject(&Project::discover()?, id)),
         Cmd::Ticket { json } => print(commands::ticket(&Project::discover()?, json)),
-        Cmd::Lsp => lsp::run(),
+        Cmd::Lsp => daemon::lsp(),
+        Cmd::Daemon { cmd: None, no_idle_exit } => daemon::run(!no_idle_exit),
+        Cmd::Daemon { cmd: Some(DaemonCmd::Status { json }), .. } => {
+            let st = daemon::status();
+            if json {
+                println!("{}", st.clone().unwrap_or(serde_json::json!({"running": false})));
+            } else {
+                match &st {
+                    Some(s) => {
+                        println!("wishlang daemon {} (pid {}, up {}s, {} editor connection(s))", s["version"].as_str().unwrap_or("?"), s["pid"], s["uptime_s"], s["connections"]);
+                        for p in s["projects"].as_array().into_iter().flatten() {
+                            println!("  {}  {} editor(s){}", p["root"].as_str().unwrap_or("?"), p["clients"], if p["busy"] == true { ", cycle running" } else { "" });
+                        }
+                    }
+                    None => println!("no daemon running ({})", daemon::home().display()),
+                }
+            }
+            if st.is_none() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Service { cmd: ServiceCmd::Install } => print(service::install()),
+        Cmd::Service { cmd: ServiceCmd::Uninstall } => print(service::uninstall()),
+        Cmd::Service { cmd: ServiceCmd::Status { json } } => {
+            let s = service::status()?;
+            if json {
+                println!("{s}");
+            } else {
+                println!("service: {}", if s["installed"] == true { format!("installed ({})", s["unit"].as_str().unwrap_or("")) } else { "not installed".into() });
+                if s["installed"] == true && s["runs_this_binary"] != true {
+                    println!("  note: the unit runs another binary; run `wishlang service install` again");
+                }
+                println!("daemon: {}", if s["daemon"].is_null() { "not running" } else { "running" });
+            }
+            Ok(())
+        }
+        Cmd::Daemon { cmd: Some(DaemonCmd::Stop), .. } => {
+            println!("{}", if daemon::stop() { "daemon stopping (after running cycles finish)" } else { "no daemon running" });
+            Ok(())
+        }
         Cmd::Share { remote } => print(commands::share(&Project::discover()?, &remote)),
         Cmd::Sync { remote } => print(commands::sync(&Project::discover()?, &remote)),
         Cmd::Log { patch } => {

@@ -72,7 +72,7 @@ pub fn hook() -> Result<()> {
         };
         match r {
             Ok(Some(ask)) => asks.push(ask),
-            Ok(None) => {}
+            Ok(None) => crate::daemon::notify_changed(&p.root),
             // A hook must never break the session: say what went wrong, carry on.
             Err(e) => eprintln!("wish: {}: {e:#}", p.root.display()),
         }

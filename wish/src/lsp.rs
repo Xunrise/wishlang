@@ -36,10 +36,30 @@ use std::sync::{Arc, Mutex};
 
 type Callback = Box<dyn FnOnce(Value) + Send>;
 
+/// One editor connection.
 struct State {
     root: Option<PathBuf>,
+    /// The project's shared state; a private one until the root is known.
+    hub: Arc<Hub>,
+    /// The client's environment (PATH, ...), applied to the project's tools.
+    env: Vec<(String, String)>,
     /// Open buffers: relative path -> text.
     docs: BTreeMap<String, String>,
+    /// Files we published diagnostics for (to clear them later).
+    published: std::collections::BTreeSet<String>,
+    next_id: i32,
+    pending: HashMap<RequestId, Callback>,
+}
+
+/// A project as every editor connected to it sees it. In the daemon several clients share one;
+/// it outlives them, so an editor that reconnects finds the index warm.
+struct Hub {
+    shared: Mutex<Shared>,
+    clients: Mutex<Vec<Server>>,
+}
+
+#[derive(Default)]
+struct Shared {
     busy: bool,
     /// A cycle requested while one was running; runs next.
     queued: Option<Options>,
@@ -48,8 +68,6 @@ struct State {
     preview: Preview,
     /// Diagnostics from the last check, by relative path.
     check: BTreeMap<String, Vec<Value>>,
-    /// Files we published diagnostics for (to clear them later).
-    published: std::collections::BTreeSet<String>,
     /// Items of each file's last successful parse, so markers survive a buffer with a syntax error.
     last_items: BTreeMap<String, Vec<Item>>,
     /// Parsed items and implicit members of files on disk, keyed by path and checked against
@@ -60,9 +78,20 @@ struct State {
     last_state: Option<(String, Arc<FileState>)>,
     /// The ticket trace of the branch's journal tip, keyed by "branch@journal".
     trace: Option<(String, Option<Arc<Trace>>)>,
-    next_id: i32,
-    pending: HashMap<RequestId, Callback>,
+    /// Environment of the latest client that connected.
+    env: Vec<(String, String)>,
+    /// When the last client left (None while one is connected).
+    idle_since: Option<std::time::Instant>,
 }
+
+impl Hub {
+    fn new() -> Arc<Hub> {
+        Arc::new(Hub { shared: Mutex::new(Shared::default()), clients: Mutex::new(Vec::new()) })
+    }
+}
+
+/// Projects by root, shared by every client in this process.
+static HUBS: Mutex<BTreeMap<PathBuf, Arc<Hub>>> = Mutex::new(BTreeMap::new());
 
 /// A file on disk as last parsed for the project index.
 struct Indexed {
@@ -73,6 +102,7 @@ struct Indexed {
 
 #[derive(Clone)]
 struct Server {
+    id: u64,
     state: Arc<Mutex<State>>,
     out: crossbeam_sender::Sender,
 }
@@ -206,14 +236,15 @@ mod crossbeam_sender {
 
 pub fn run() -> Result<()> {
     let (conn, io) = Connection::stdio();
-    let result = run_with(conn);
+    let result = run_with(conn, Vec::new());
     // Worker threads may still hold sender clones, so don't wait for the IO threads.
     drop(io);
     result
 }
 
-/// Serve one client over `conn` until it shuts down.
-fn run_with(conn: Connection) -> Result<()> {
+/// Serve one client over `conn` until it shuts down. `env` is the client's environment
+/// (empty in-process: the tools then run in this process's own).
+pub fn run_with(conn: Connection, env: Vec<(String, String)>) -> Result<()> {
     let (id, params) = conn.initialize_start()?;
     let root = root_from_init(&params).and_then(|r| Project::discover_from(&r)).map(|p| p.root);
     let caps = json!({
@@ -229,10 +260,15 @@ fn run_with(conn: Connection) -> Result<()> {
         "serverInfo": {"name": "wishlang", "version": env!("CARGO_PKG_VERSION")}
     });
     conn.initialize_finish(id, caps)?;
+    static NEXT_CLIENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let server = Server {
-        state: Arc::new(Mutex::new(State { root, docs: BTreeMap::new(), busy: false, queued: None, checked_head: None, preview: Preview::default(), check: BTreeMap::new(), published: Default::default(), last_items: BTreeMap::new(), index: HashMap::new(), last_state: None, trace: None, next_id: 1, pending: HashMap::new() })),
+        id: NEXT_CLIENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        state: Arc::new(Mutex::new(State { root: None, hub: Hub::new(), env, docs: BTreeMap::new(), published: Default::default(), next_id: 1, pending: HashMap::new() })),
         out: crossbeam_sender::Sender(conn.sender.clone()),
     };
+    if let Some(r) = root {
+        server.attach(r);
+    }
     // Start the journal now, before any edits, so provenance is right from the first keystroke.
     if let Some(p) = server.project() {
         if let Err(e) = Git::open(&p.root).and_then(|g| engine::ensure_journal(&p, &g)) {
@@ -269,8 +305,35 @@ fn run_with(conn: Connection) -> Result<()> {
             }
         }
     }
-    server.state.lock().unwrap().preview.stop();
+    server.detach();
     Ok(())
+}
+
+/// The project at `root` changed outside this process (a hook or a CLI command wrote the
+/// journal): drop its caches and let every editor of it republish.
+pub fn project_changed(root: &Path) {
+    let Some(hub) = HUBS.lock().unwrap().get(root).cloned() else { return };
+    {
+        let mut sh = hub.shared.lock().unwrap();
+        sh.last_state = None;
+        sh.trace = None;
+        sh.checked_head = None;
+    }
+    let clients = hub.clients.lock().unwrap().clone();
+    std::thread::spawn(move || clients.iter().for_each(Server::publish_all));
+}
+
+/// One line per served project: root, connected clients, whether a cycle runs.
+pub fn projects() -> Vec<(PathBuf, usize, bool)> {
+    HUBS.lock().unwrap().iter().map(|(r, h)| (r.clone(), h.clients.lock().unwrap().len(), h.shared.lock().unwrap().busy)).collect()
+}
+
+/// Forget projects nobody has used for `after` (their caches and preview go with them).
+pub fn evict_idle(after: std::time::Duration) {
+    HUBS.lock().unwrap().retain(|_, h| {
+        let sh = h.shared.lock().unwrap();
+        sh.busy || !sh.idle_since.is_some_and(|t| t.elapsed() >= after)
+    });
 }
 
 fn root_from_init(params: &Value) -> Option<PathBuf> {
@@ -333,13 +396,62 @@ impl Server {
         self.state.lock().unwrap().root.clone()
     }
 
+    fn hub(&self) -> Arc<Hub> {
+        self.state.lock().unwrap().hub.clone()
+    }
+
+    /// Serve `root`: join its hub (created on first use) and bring this client's environment.
+    fn attach(&self, root: PathBuf) {
+        let hub = HUBS.lock().unwrap().entry(root.clone()).or_insert_with(Hub::new).clone();
+        hub.clients.lock().unwrap().push(self.clone());
+        let env = {
+            let mut st = self.state.lock().unwrap();
+            st.root = Some(root);
+            st.hub = hub.clone();
+            st.env.clone()
+        };
+        let mut sh = hub.shared.lock().unwrap();
+        sh.idle_since = None;
+        if !env.is_empty() {
+            sh.env = env;
+        }
+    }
+
+    /// Leave the hub; the last client to leave stops the preview.
+    fn detach(&self) {
+        let hub = self.hub();
+        let mut clients = hub.clients.lock().unwrap();
+        clients.retain(|c| c.id != self.id);
+        if clients.is_empty() {
+            let mut sh = hub.shared.lock().unwrap();
+            sh.preview.stop();
+            sh.idle_since = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Every client of this project, this one included.
+    fn peers(&self) -> Vec<Server> {
+        let hub = self.hub();
+        let v = hub.clients.lock().unwrap().clone();
+        if v.is_empty() { vec![self.clone()] } else { v }
+    }
+
+    /// Something changed for the whole project (a cycle, a command): every editor of it republishes.
+    fn publish_everywhere(&self) {
+        for c in self.peers() {
+            c.publish_all();
+        }
+    }
+
     /// The project's language (Rust until a root is known).
     fn lang(&self) -> Lang {
         self.root().map_or(Lang::Rust, |r| Lang::detect(&r))
     }
 
     fn project(&self) -> Option<Project> {
-        Project::load(&self.root()?).ok()
+        let mut p = Project::load(&self.root()?).ok()?;
+        p.env = self.hub().shared.lock().unwrap().env.clone();
+        Some(p)
     }
 
     fn notify(&self, method: &str, params: Value) {
@@ -378,7 +490,7 @@ impl Server {
         }
         let Some(path) = uri_to_path(uri) else { return };
         let Some(p) = path.parent().and_then(Project::discover_from) else { return };
-        self.state.lock().unwrap().root = Some(p.root.clone());
+        self.attach(p.root.clone());
         self.log(&format!("wishlang: serving project {}", p.root.display()));
         if let Ok(g) = Git::open(&p.root) {
             let _ = engine::ensure_journal(&p, &g);
@@ -399,9 +511,9 @@ impl Server {
         // When your code moved (checkout, merge, pull), join in the wish
         // history of branches you merged, so their lines keep their provenance.
         let key = format!("{}@{}", g.branch(), g.code_head().unwrap_or_default());
-        let changed = self.state.lock().unwrap().checked_head.as_deref() != Some(key.as_str());
+        let changed = self.hub().shared.lock().unwrap().checked_head.as_deref() != Some(key.as_str());
         if changed {
-            self.state.lock().unwrap().checked_head = Some(key);
+            self.hub().shared.lock().unwrap().checked_head = Some(key);
             if !engine::journals_to_merge(&g, &tip).is_empty() {
                 if let Ok(m) = engine::record_save(&g, &tip, "save") {
                     self.log(&format!("wishlang: {}", g.subject(&m)));
@@ -465,10 +577,10 @@ impl Server {
     fn items_of(&self, lang: Lang, rel: &str, text: &str) -> Vec<Item> {
         match items::parse(lang, text) {
             Ok(items) => {
-                self.state.lock().unwrap().last_items.insert(rel.to_string(), items.clone());
+                self.hub().shared.lock().unwrap().last_items.insert(rel.to_string(), items.clone());
                 items
             }
-            Err(_) => self.state.lock().unwrap().last_items.get(rel).cloned().unwrap_or_default(),
+            Err(_) => self.hub().shared.lock().unwrap().last_items.get(rel).cloned().unwrap_or_default(),
         }
     }
 
@@ -476,14 +588,14 @@ impl Server {
     fn indexed(&self, p: &Project, f: &str) -> Option<(Arc<Vec<Item>>, Arc<Vec<(String, Option<String>)>>)> {
         let meta = std::fs::metadata(p.root.join(f)).ok()?;
         let stamp = (meta.len(), meta.modified().ok());
-        let cached = self.state.lock().unwrap().index.get(f).filter(|i| i.stamp == stamp).map(|i| (i.items.clone(), i.implicit.clone()));
+        let cached = self.hub().shared.lock().unwrap().index.get(f).filter(|i| i.stamp == stamp).map(|i| (i.items.clone(), i.implicit.clone()));
         if cached.is_some() {
             return cached;
         }
         let src = p.read(f)?;
         let items = Arc::new(items::parse(p.lang, &src).unwrap_or_default());
         let members = Arc::new(if p.lang == Lang::Java { crate::java::implicit_members(&src) } else { vec![] });
-        self.state.lock().unwrap().index.insert(f.to_string(), Indexed { stamp, items: items.clone(), implicit: members.clone() });
+        self.hub().shared.lock().unwrap().index.insert(f.to_string(), Indexed { stamp, items: items.clone(), implicit: members.clone() });
         Some((items, members))
     }
 
@@ -542,7 +654,7 @@ impl Server {
             let refs = git.as_ref().map(|g| (g.branch().to_string(), g.journal(), g.code_head()));
             format!("{rel}\0{:x}\0{refs:?}", h.finish())
         };
-        let cached = self.state.lock().unwrap().last_state.clone().filter(|(k, fs)| *k == key && (fs.with_pending || !with_pending));
+        let cached = self.hub().shared.lock().unwrap().last_state.clone().filter(|(k, fs)| *k == key && (fs.with_pending || !with_pending));
         if let Some((_, fs)) = cached {
             return Some(fs);
         }
@@ -570,7 +682,7 @@ impl Server {
             }
         }
         let fs = Arc::new(FileState { git, ticket, text, items, whos, shas, generated, prototype, pending, with_pending, lenses, blocks });
-        self.state.lock().unwrap().last_state = Some((key, fs.clone()));
+        self.hub().shared.lock().unwrap().last_state = Some((key, fs.clone()));
         Some(fs)
     }
 
@@ -621,7 +733,7 @@ impl Server {
     fn ticket_trace(&self, p: &Project, git: &Git) -> Option<Arc<Trace>> {
         ticket::key(git.branch())?;
         let key = format!("{}@{}", git.branch(), git.journal()?);
-        let cached = self.state.lock().unwrap().trace.as_ref().filter(|(k, _)| *k == key).map(|(_, t)| t.clone());
+        let cached = self.hub().shared.lock().unwrap().trace.as_ref().filter(|(k, _)| *k == key).map(|(_, t)| t.clone());
         if let Some(t) = cached {
             return t;
         }
@@ -632,7 +744,7 @@ impl Server {
                 None
             }
         };
-        self.state.lock().unwrap().trace = Some((key, t.clone()));
+        self.hub().shared.lock().unwrap().trace = Some((key, t.clone()));
         t
     }
 
@@ -650,7 +762,7 @@ impl Server {
             return Ok(v);
         }
         let t = ticket::trace(&p, &git)?;
-        self.state.lock().unwrap().trace = Some((format!("{}@{}", git.branch(), git.journal().unwrap_or_default()), Some(Arc::new(t.clone()))));
+        self.hub().shared.lock().unwrap().trace = Some((format!("{}@{}", git.branch(), git.journal().unwrap_or_default()), Some(Arc::new(t.clone()))));
         Ok(with_root(serde_json::to_value(t)?, &p))
     }
 
@@ -669,7 +781,7 @@ impl Server {
         let key = ticket::key(branch).with_context(|| format!("branch {branch} has no ticket"))?;
         let dir = ticket::notes_dir(&p.root, &key).with_context(|| format!("no .work/{key} in the main checkout"))?;
         ticket::save_problems(&dir, &ps)?;
-        self.state.lock().unwrap().trace = None;
+        self.hub().shared.lock().unwrap().trace = None;
         Ok(format!("{key}: {} problem(s) saved", ps.len()))
     }
 
@@ -740,7 +852,7 @@ impl Server {
                 }
             }
         }
-        out.extend(self.state.lock().unwrap().check.get(rel).cloned().unwrap_or_default());
+        out.extend(self.hub().shared.lock().unwrap().check.get(rel).cloned().unwrap_or_default());
         out
     }
 
@@ -753,10 +865,11 @@ impl Server {
 
     /// Republish everything open or previously published, and refresh hints.
     fn publish_all(&self) {
-        self.state.lock().unwrap().last_state = None;
+        self.hub().shared.lock().unwrap().last_state = None;
         let rels: std::collections::BTreeSet<String> = {
+            let checked: Vec<String> = self.hub().shared.lock().unwrap().check.keys().cloned().collect();
             let st = self.state.lock().unwrap();
-            st.docs.keys().chain(st.published.iter()).chain(st.check.keys()).cloned().collect::<std::collections::BTreeSet<_>>()
+            st.docs.keys().chain(st.published.iter()).chain(checked.iter()).cloned().collect::<std::collections::BTreeSet<_>>()
         };
         // Files with pending suggestions or untraced items too, so they all appear in Zed's project diagnostics.
         let mut rels = rels;
@@ -913,7 +1026,7 @@ impl Server {
     }
 
     fn execute(&self, params: &Value) {
-        self.state.lock().unwrap().last_state = None;
+        self.hub().shared.lock().unwrap().last_state = None;
         let Some(mut p) = self.project() else { return };
         let args = params["arguments"].as_array().cloned().unwrap_or_default();
         let s = |i: usize| args.get(i).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -925,7 +1038,7 @@ impl Server {
                 // Accepting changes your code, so regenerate right away.
                 Ok(msg) => {
                     self.show(3, &msg);
-                    self.publish_all();
+                    self.publish_everywhere();
                     self.cycle(Options::default());
                     return;
                 }
@@ -970,7 +1083,7 @@ impl Server {
             Ok(msg) => self.show(3, &msg),
             Err(e) => self.show(1, &format!("{e:#}")),
         }
-        self.publish_all();
+        self.publish_everywhere();
     }
 
     fn next_block(&self, uri: &str, line: usize, human: bool) {
@@ -988,10 +1101,11 @@ impl Server {
 
     fn cycle(&self, opts: Options) {
         {
-            let mut st = self.state.lock().unwrap();
-            if st.root.is_none() {
+            if self.root().is_none() {
                 return;
             }
+            let hub = self.hub();
+            let mut st = hub.shared.lock().unwrap();
             if st.busy {
                 // Keep the most specific request: an implement or a forced
                 // regenerate beats a plain save.
@@ -1030,7 +1144,7 @@ impl Server {
                     Lang::Rust => parse_cargo(&errors),
                     Lang::Java => parse_mvn(&errors),
                 };
-                me.state.lock().unwrap().check = diagnostics;
+                me.hub().shared.lock().unwrap().check = diagnostics;
             }
             if ok {
                 me.notify("$/progress", json!({"token": token, "value": {"kind": "report", "message": "building preview"}}));
@@ -1055,9 +1169,10 @@ impl Server {
                     }),
                 );
             }
-            me.publish_all();
+            me.publish_everywhere();
             let again = {
-                let mut st = me.state.lock().unwrap();
+                let hub = me.hub();
+                let mut st = hub.shared.lock().unwrap();
                 st.busy = false;
                 st.queued.take()
             };
@@ -1075,7 +1190,7 @@ impl Server {
             return;
         }
         let me = self.clone();
-        let r = self.state.lock().unwrap().preview.restart(&p, move |line| me.log(&format!("[app] {line}")));
+        let r = self.hub().shared.lock().unwrap().preview.restart(&p, move |line| me.log(&format!("[app] {line}")));
         if let Err(e) = r {
             self.show(1, &format!("wishlang: could not start the app: {e}"));
         }
@@ -1316,7 +1431,7 @@ fn strip_ansi(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::journal::Why;
 
@@ -1401,7 +1516,12 @@ mod tests {
     use std::process::Command as Cmd;
 
     fn temp_project() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("wish-lsp-test-{}", std::process::id()));
+        temp_project_named("lsp")
+    }
+
+    /// A Java wish project in a fresh git repository, with a ticket branch.
+    pub(crate) fn temp_project_named(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wish-{name}-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let java = dir.join("src/main/java/demo");
         std::fs::create_dir_all(&java).unwrap();
@@ -1468,7 +1588,7 @@ mod tests {
 
     fn start(dir: &Path) -> (Client, std::thread::JoinHandle<Result<()>>) {
         let (server_side, client_side) = Connection::memory();
-        let handle = std::thread::spawn(move || run_with(server_side));
+        let handle = std::thread::spawn(move || run_with(server_side, Vec::new()));
         let mut c = Client { conn: client_side, next: 0, changed: 0, shown: vec![], diagnostics: HashMap::new(), documents: vec![] };
         c.ok("initialize", json!({"capabilities": {}, "workspaceFolders": [{"uri": path_to_uri(dir)}]}));
         c.notify("initialized", json!({}));
@@ -1621,3 +1741,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
