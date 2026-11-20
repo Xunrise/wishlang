@@ -79,7 +79,10 @@ fun uriOf(file: VirtualFile): String = serverUri(file.path)
  */
 fun wishBinary(env: Map<String, String> = System.getenv(), home: String = System.getProperty("user.home")): File {
     env["WISH_BIN"]?.takeIf { it.isNotBlank() }?.let { return File(it) }
-    val candidates = listOf("$home/.local/bin/wishlang", "/opt/homebrew/bin/wishlang", "/usr/local/bin/wishlang", "$home/.cargo/bin/wishlang", "$home/.cargo/bin/wish")
+    val candidates = listOfNotNull(
+        "$home/.local/bin/wishlang", "/opt/homebrew/bin/wishlang", "/usr/local/bin/wishlang", "$home/.cargo/bin/wishlang", "$home/.cargo/bin/wish",
+        env["LOCALAPPDATA"]?.let { "$it/wishlang/bin/wishlang.exe" }, // install.ps1's default
+    )
     return candidates.map(::File).firstOrNull { it.canExecute() } ?: File(candidates[0])
 }
 
@@ -116,6 +119,7 @@ class WishService(private val project: Project) : Disposable {
 
     suspend fun start() {
         val root = project.basePath ?: "."
+        if (bridge is Bridge.Local && !wishBinary().canExecute()) return notifyMissing(project)
         val bin = bridge.command(root).joinToString(" ")
         try {
             val s = withContext(Dispatchers.IO) { launch(root) }
