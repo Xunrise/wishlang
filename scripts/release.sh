@@ -12,7 +12,7 @@ v=${v#v}
 [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "not a semver: $v" >&2; exit 1; }
 
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "working tree has uncommitted changes" >&2; exit 1; }
-[ "$(git branch --show-current)" = master ] || { echo "release from master" >&2; exit 1; }
+[ "$(git branch --show-current)" = master ] || [ -n "${RELEASE_ANY_BRANCH:-}" ] || { echo "release from master (RELEASE_ANY_BRANCH=1 to override, e.g. for rc tests)" >&2; exit 1; }
 git rev-parse "v$v" >/dev/null 2>&1 && { echo "tag v$v exists" >&2; exit 1; }
 
 # First `version = "..."` line in a TOML file (the [package] one in all ours).
