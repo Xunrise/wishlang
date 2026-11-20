@@ -1,0 +1,106 @@
+name: Release
+
+# Push a tag `vX.Y.Z` (or `vX.Y.Z-rc.1`, which becomes a pre-release) to publish.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin,       os: macos-14 }
+          - { target: x86_64-apple-darwin,        os: macos-14 }
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, musl: true, cross: true }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check tag matches Cargo.toml
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          c="$(sed -n 's/^version = "\(.*\)"/\1/p' wish/Cargo.toml | head -1)"
+          [ "$v" = "$c" ] || { echo "tag $v != Cargo.toml $c"; exit 1; }
+
+      - name: Install musl tools
+        if: matrix.musl && !matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # tree-sitter compiles C, so the aarch64 musl build needs a cross compiler.
+      - name: Install aarch64 musl cross compiler
+        if: matrix.cross
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked -p wishlang --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: scripts/package.sh "${GITHUB_REF_NAME#v}" "${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum wishlang-* > "wishlang-${GITHUB_REF_NAME#v}-checksums.txt"
+          cat "wishlang-${GITHUB_REF_NAME#v}-checksums.txt"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease";; esac
+          gh release create "$GITHUB_REF_NAME" dist/* $pre --verify-tag \
+            --title "$GITHUB_REF_NAME" --generate-notes
+
+      - name: Render Homebrew formula
+        run: scripts/brew-formula.sh "${GITHUB_REF_NAME#v}" dist > wishlang.rb
+
+      # Only stable tags update the tap, and only once the HOMEBREW_TAP_TOKEN secret exists.
+      - name: Update Homebrew tap
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then echo "HOMEBREW_TAP_TOKEN not set; skipping tap update"; exit 0; fi
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/Xunrise/homebrew-tap.git" tap
+          mkdir -p tap/Formula && cp wishlang.rb tap/Formula/wishlang.rb
+          cd tap
+          git config user.name "wishlang release"; git config user.email "actions@users.noreply.github.com"
+          git add Formula/wishlang.rb
+          git diff --cached --quiet || { git commit -m "wishlang ${GITHUB_REF_NAME#v}" && git push; }
