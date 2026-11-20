@@ -515,7 +515,8 @@ mod tests {
         let items: Vec<(&str, &str, usize)> = t.problems[0].items.iter().map(|i| (i.item.as_str(), i.file.as_str(), i.line)).collect();
         assert_eq!(items, [("Bye.say", "src/main/java/demo/Bye.java", 4)]);
         assert_eq!(t.checkout.as_deref().map(|c| c.ends_with("backend")), Some(true));
-        assert!(t.checkout.unwrap().starts_with(&wt));
+        // Canonical: on macOS the temp dir is a symlink (/var -> /private/var).
+        assert!(t.checkout.unwrap().canonicalize().unwrap().starts_with(wt.canonicalize().unwrap()));
         // ... and this branch's own ticket is unaffected.
         assert_eq!(ticket::trace(&p, &g).unwrap().problems[0].items.iter().map(|i| i.item.as_str()).collect::<Vec<_>>(), ["App.create"]);
         let _ = std::fs::remove_dir_all(&wt);
