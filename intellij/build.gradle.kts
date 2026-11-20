@@ -1,4 +1,5 @@
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
+import org.jetbrains.intellij.platform.gradle.IntelliJPlatformType
 
 plugins {
     kotlin("jvm") version "2.3.0"
@@ -39,10 +40,37 @@ kotlin { jvmToolchain(25) }
 intellijPlatform {
     buildSearchableOptions = false
     pluginConfiguration {
-        name = "Wish"
+        name = "wishlang"
+        changeNotes = """
+            <p>First Marketplace release.</p>
+            <ul>
+              <li>Generated code is tinted, with who wrote it and why on hover.</li>
+              <li>Generated code is traced to the problems of the branch's ticket.</li>
+              <li>Wish tool window: journal with diffs and reasoning, ticket problem tree.</li>
+              <li>Offers to download <code>wishlang</code> when it is not installed.</li>
+            </ul>
+        """.trimIndent()
         ideaVersion {
             sinceBuild = sinceBuildNumber
             untilBuild = provider { null }
+        }
+    }
+    // Secrets come from the environment (CI secrets or the owner's shell); never commit them.
+    signing {
+        certificateChain = providers.environmentVariable("CERTIFICATE_CHAIN")
+        privateKey = providers.environmentVariable("PRIVATE_KEY")
+        password = providers.environmentVariable("PRIVATE_KEY_PASSWORD")
+    }
+    publishing {
+        token = providers.environmentVariable("PUBLISH_TOKEN")
+    }
+    // ./gradlew verifyPlugin checks against the latest stable IntelliJ IDEA releases since sinceBuild.
+    pluginVerification {
+        ides {
+            select {
+                types = listOf(IntelliJPlatformType.IntellijIdea)
+                sinceBuild = sinceBuildNumber
+            }
         }
     }
 }
@@ -75,9 +103,9 @@ val deploy by tasks.registering {
         val target = File(dir.get()).apply { mkdirs() }
         val zipName = "wish.zip"
         zip.get().asFile.copyTo(File(target, zipName), overwrite = true)
-        val id = "io.wishlang.intellij"
+        val id = "io.wishlang"
         val entry = """  <plugin id="$id" url="${url.get().trimEnd('/')}/$zipName" version="$pluginVersion">
-            |    <name>Wish</name>
+            |    <name>wishlang</name>
             |    <idea-version since-build="$since"/>
             |  </plugin>""".trimMargin()
         val xml = File(target, "updatePlugins.xml")
