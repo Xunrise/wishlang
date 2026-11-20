@@ -33,6 +33,9 @@ pub struct Hello {
     /// For "changed": the project root.
     #[serde(default)]
     pub root: Option<PathBuf>,
+    /// The client's process, for the log.
+    #[serde(default)]
+    pub pid: u32,
     /// The client's environment variables that the project's tools need.
     #[serde(default)]
     pub env: Vec<(String, String)>,
@@ -263,11 +266,11 @@ mod unix {
                 send(&mut w, &reply)?;
                 d.connections.fetch_add(1, Ordering::SeqCst);
                 d.touch();
-                d.log("editor connected");
+                d.log(&format!("editor connected (wishlang lsp pid {})", hello.pid));
                 let r = serve_lsp(reader, w, hello.env);
                 d.connections.fetch_sub(1, Ordering::SeqCst);
                 d.touch();
-                d.log("editor disconnected");
+                d.log(&format!("editor disconnected (pid {}){}", hello.pid, r.as_ref().err().map(|e| format!(": {e:#}")).unwrap_or_default()));
                 r
             }
             ("ctl", Some("status")) => {
@@ -382,7 +385,7 @@ mod unix {
     }
 
     fn ctl(cmd: &str, root: Option<&Path>, timeout: Duration) -> Option<Reply> {
-        let h = Hello { proto: PROTO, version: VERSION.into(), kind: "ctl".into(), cmd: Some(cmd.into()), root: root.map(Path::to_path_buf), env: vec![] };
+        let h = Hello { proto: PROTO, version: VERSION.into(), kind: "ctl".into(), cmd: Some(cmd.into()), root: root.map(Path::to_path_buf), ..Default::default() };
         hello(&home(), &h, Some(timeout)).ok().map(|(_, _, r)| r)
     }
 
@@ -431,7 +434,7 @@ mod unix {
 
     /// An `lsp` connection to the daemon, starting one if needed.
     fn connect_lsp(home: &Path) -> Result<(BufReader<UnixStream>, UnixStream)> {
-        let h = Hello { proto: PROTO, version: VERSION.into(), kind: "lsp".into(), env: client_env(), ..Default::default() };
+        let h = Hello { proto: PROTO, version: VERSION.into(), kind: "lsp".into(), env: client_env(), pid: std::process::id(), ..Default::default() };
         let mut spawned: Option<Instant> = None;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -473,7 +476,7 @@ mod unix {
 
     impl Replay {
         /// Note a message from the editor.
-        pub(super) fn from_editor(&mut self, m: &Message) {
+        pub(super) fn note_editor(&mut self, m: &Message) {
             match m {
                 Message::Request(r) => {
                     if r.method == "initialize" {
@@ -506,7 +509,7 @@ mod unix {
         }
 
         /// Note a message from the daemon; false if the editor must not see it.
-        pub(super) fn from_daemon(&mut self, m: &Message) -> bool {
+        pub(super) fn note_daemon(&mut self, m: &Message) -> bool {
             if let Message::Response(r) = m {
                 if self.swallow.as_ref() == Some(&r.id) {
                     self.swallow = None;
@@ -565,7 +568,7 @@ mod unix {
             std::thread::spawn(move || {
                 let mut stdin = std::io::stdin().lock();
                 while let Ok(Some(m)) = Message::read(&mut stdin) {
-                    replay.lock().unwrap().from_editor(&m);
+                    replay.lock().unwrap().note_editor(&m);
                     let exit = matches!(&m, Message::Notification(n) if n.method == "exit");
                     // A failed write is fine: the reader reconnects and replays.
                     let _ = m.write(&mut *daemon.lock().unwrap());
@@ -583,7 +586,7 @@ mod unix {
         let mut drops: Vec<Instant> = Vec::new();
         loop {
             while let Ok(Some(m)) = Message::read(&mut reader) {
-                if replay.lock().unwrap().from_daemon(&m) {
+                if replay.lock().unwrap().note_daemon(&m) {
                     let mut out = std::io::stdout().lock();
                     m.write(&mut out)?;
                 }
@@ -593,6 +596,7 @@ mod unix {
             if drops.len() > 5 {
                 bail!("the daemon keeps going away; see {}", home.join("daemon.log").display());
             }
+            eprintln!("wishlang: the daemon went away; reconnecting");
             // Hold the writer while replaying, so the editor's next messages follow the replay.
             let mut w = daemon.lock().unwrap();
             let (r, new_w) = connect_lsp(&home)?;
@@ -694,16 +698,16 @@ mod unix {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 assert!(Instant::now() < deadline, "no wish/changed");
-                if let Some(Message::Notification(n)) = Message::read(&mut ra).unwrap() {
-                    if n.method == "wish/changed" {
-                        break;
-                    }
+                if let Some(Message::Notification(n)) = Message::read(&mut ra).unwrap()
+                    && n.method == "wish/changed"
+                {
+                    break;
                 }
             }
         }
 
         fn ctl_at(home: &Path, cmd: &str, root: &Path) {
-            let h = Hello { proto: PROTO, version: VERSION.into(), kind: "ctl".into(), cmd: Some(cmd.into()), root: Some(root.to_path_buf()), env: vec![] };
+            let h = Hello { proto: PROTO, version: VERSION.into(), kind: "ctl".into(), cmd: Some(cmd.into()), root: Some(root.to_path_buf()), ..Default::default() };
             assert!(hello(home, &h, None).unwrap().2.ok);
         }
 
@@ -712,14 +716,14 @@ mod unix {
             let mut r = Replay::default();
             let req = |id: i32, m: &str, p: Value| Message::Request(Request::new(RequestId::from(id), m.into(), p));
             let note = |m: &str, p: Value| Message::Notification(Notification::new(m.into(), p));
-            r.from_editor(&req(1, "initialize", serde_json::json!({"rootUri": "file:///p"})));
-            assert!(r.from_daemon(&Message::Response(Response::new_ok(RequestId::from(1), Value::Null))));
-            r.from_editor(&note("initialized", serde_json::json!({})));
-            r.from_editor(&note("textDocument/didOpen", serde_json::json!({"textDocument": {"uri": "file:///p/A.java", "languageId": "java", "version": 1, "text": "a"}})));
-            r.from_editor(&note("textDocument/didOpen", serde_json::json!({"textDocument": {"uri": "file:///p/B.java", "languageId": "java", "version": 1, "text": "b"}})));
-            r.from_editor(&note("textDocument/didChange", serde_json::json!({"textDocument": {"uri": "file:///p/A.java", "version": 7}, "contentChanges": [{"text": "a2"}]})));
-            r.from_editor(&note("textDocument/didClose", serde_json::json!({"textDocument": {"uri": "file:///p/B.java"}})));
-            r.from_editor(&req(2, "wish/fileState", serde_json::json!({})));
+            r.note_editor(&req(1, "initialize", serde_json::json!({"rootUri": "file:///p"})));
+            assert!(r.note_daemon(&Message::Response(Response::new_ok(RequestId::from(1), Value::Null))));
+            r.note_editor(&note("initialized", serde_json::json!({})));
+            r.note_editor(&note("textDocument/didOpen", serde_json::json!({"textDocument": {"uri": "file:///p/A.java", "languageId": "java", "version": 1, "text": "a"}})));
+            r.note_editor(&note("textDocument/didOpen", serde_json::json!({"textDocument": {"uri": "file:///p/B.java", "languageId": "java", "version": 1, "text": "b"}})));
+            r.note_editor(&note("textDocument/didChange", serde_json::json!({"textDocument": {"uri": "file:///p/A.java", "version": 7}, "contentChanges": [{"text": "a2"}]})));
+            r.note_editor(&note("textDocument/didClose", serde_json::json!({"textDocument": {"uri": "file:///p/B.java"}})));
+            r.note_editor(&req(2, "wish/fileState", serde_json::json!({})));
 
             let (errors, replay) = r.reconnect();
             assert!(matches!(&errors[..], [Message::Response(e)] if e.id == RequestId::from(2) && e.response_result.is_err()));
@@ -734,7 +738,7 @@ mod unix {
             assert_eq!(methods, ["initialize", "initialized ", "textDocument/didOpen a2"]);
             // The replayed initialize's answer is not the editor's business.
             let Message::Request(init) = &replay[0] else { unreachable!() };
-            assert!(!r.from_daemon(&Message::Response(Response::new_ok(init.id.clone(), Value::Null))));
+            assert!(!r.note_daemon(&Message::Response(Response::new_ok(init.id.clone(), Value::Null))));
         }
     }
 }

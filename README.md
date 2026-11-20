@@ -259,7 +259,8 @@ Editors and Claude Code
   wishlang setup [--uninstall] [--yes] write the hooks and permission into ~/.claude/settings.json
 
 Runtime
-  wishlang daemon, service             shared background daemon and its start at login
+  wishlang daemon status [--json] | stop    the shared background daemon (started by `lsp` on demand)
+  wishlang service install|uninstall|status [--json]   run the daemon from login on (launchd, systemd --user)
   wishlang doctor [--json]             check tools, install, hooks and editor plugins; exit 1 on failures
   wishlang update [--check] [--json] [--version X]   self-update (brew/cargo installs print their command)
   wishlang completions <shell>         bash, zsh, fish, powershell or elvish
@@ -267,6 +268,19 @@ Runtime
 ```
 
 Every command has `--help` with examples. Exit codes: 0 ok, 1 failure (a failed cycle or check, doctor problems, `update --check` with an update available, any error), 2 usage error.
+
+## How it works: the daemon
+
+Editors don't run wishlang themselves. `wishlang lsp`, which Zed and IntelliJ launch, is a thin proxy to one background process per user, `wishlang daemon`:
+
+- **One daemon, every project.** It owns each project's state: the parsed index of the files, cached answers per file, the ticket trace, the cycle queue and the running preview. Two editors on one project share all of it; a cycle started in one shows up in the other. Reopening an editor finds the project warm (on a 4,800-file project, the first file state drops from about 2 s to about 0.12 s).
+- **Started on demand.** The first `wishlang lsp` starts the daemon; it exits after 30 minutes without editors or cycles. `wishlang service install` keeps it running from login on instead.
+- **Your environment.** Each editor sends its PATH (and `WISH_CLAUDE`, `WISH_MODEL`, `CARGO_TARGET_DIR`, `JAVA_HOME`), and cycles for its project run with it, so `claude`, `cargo` and `mvn` are found even when the IDE was started from the Dock.
+- **Crashes and updates.** If the daemon dies or is replaced, `wishlang lsp` starts a new one and replays the editor's session (initialize and the open files); requests in flight get an error, the editor carries on. A client newer than the running daemon makes it hand over: it stops accepting, finishes running cycles and exits. If no daemon can be had at all, `wishlang lsp` serves in-process as before.
+- **Hooks and the CLI** run in their own process, as they always did; after writing the journal they send the daemon a one-line note so open editors refresh. They never start a daemon.
+- **Files.** `~/.wishlang/` (or `$WISHLANG_HOME`) holds `daemon.sock`, `daemon.pid` and `daemon.log` (rotated at 5 MB). `wishlang daemon status` lists the projects served; `wishlang doctor` checks the daemon's version against the CLI's.
+- **Debugging.** `WISHLANG_NO_DAEMON=1` makes `wishlang lsp` serve in-process.
+- **Windows.** The daemon runs on macOS and Linux (and inside WSL, which IntelliJ on Windows uses). Native Windows runs everything in-process for now.
 
 ## Layout
 
