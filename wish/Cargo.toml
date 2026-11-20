@@ -5,6 +5,11 @@ edition = "2024"
 description = "Create-from-usage for Rust and Java: you write the call sites, Claude writes the code underneath."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Xunrise/wishlang"
+homepage = "https://github.com/Xunrise/wishlang"
+readme = "../README.md"
+keywords = ["claude", "codegen", "rust", "java", "lsp"]
+categories = ["development-tools", "command-line-utilities"]
+rust-version = "1.85"
 
 [[bin]]
 name = "wishlang"

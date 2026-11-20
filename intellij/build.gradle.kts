@@ -6,7 +6,7 @@ plugins {
 }
 
 // deploy.sh passes -PbuildStamp so every local build is a newer version the IDE offers as an update.
-version = "0.1.0" + (providers.gradleProperty("buildStamp").orNull?.let { ".$it" } ?: "")
+version = providers.gradleProperty("pluginVersion").get() + (providers.gradleProperty("buildStamp").orNull?.let { ".$it" } ?: "")
 
 repositories {
     mavenCentral()
