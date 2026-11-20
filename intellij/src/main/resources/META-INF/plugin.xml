@@ -19,6 +19,9 @@ Rust is supported in Zed through the wishlang extension.</p>
 ]]></description>
   <depends>com.intellij.modules.platform</depends>
   <depends>com.intellij.java</depends>
+  <!-- The tool window's diffs (SimpleAsyncChangesBrowser) come from the core platform up to 2026.2 and from
+       the bundled Version Control plugin since 2026.3; the optional dependency only applies where it exists. -->
+  <depends optional="true" config-file="wish-vcs.xml">com.intellij.platform.vcs</depends>
 
   <extensions defaultExtensionNs="com.intellij">
     <postStartupActivity implementation="wish.WishStartup"/>

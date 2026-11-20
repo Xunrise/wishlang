@@ -1,0 +1,3 @@
+<idea-plugin>
+  <!-- Empty: the dependency in plugin.xml only puts the Version Control plugin's classes on the classpath. -->
+</idea-plugin>
