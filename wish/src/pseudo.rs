@@ -788,8 +788,112 @@ fn utf16(src: &str, byte: usize) -> usize {
 }
 
 /// The IntelliJ wire format: UTF-16 offsets, as a Document counts them.
+const KEYWORDS: &[&str] = &["class", "interface", "enum", "record", "annotation", "package", "implements", "extends", "permits", "new", "uses", "constants", "state", "else", "null", "true", "false", "this", "return", "throw"];
+
+/// What a word of pseudocode is, named after the editor's Java colours. `None`: plain text.
+#[derive(Default)]
+pub struct Names {
+    pub params: BTreeSet<String>,
+    pub fields: BTreeSet<String>,
+    pub methods: BTreeSet<String>,
+}
+
+/// Highlighting spans for a placeholder, in UTF-16 units: `(start, end, kind)`, kind one of
+/// keyword, method_decl, method_call, parameter, field, constant, type, string, number,
+/// annotation, operator. The names the file declares decide parameters, fields and methods; the
+/// rest goes by shape (`ALL_CAPS` constant, `Capitalised` type).
+pub fn tokens(text: &str, names: &Names) -> Vec<(usize, usize, &'static str)> {
+    let chars: Vec<char> = text.chars().collect();
+    let u16_at: Vec<usize> = std::iter::once(0).chain(chars.iter().scan(0, |acc, c| { *acc += c.len_utf16(); Some(*acc) })).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let first_word = chars.iter().position(|c| !c.is_whitespace()).unwrap_or(0);
+    while i < chars.len() {
+        let c = chars[i];
+        let start = i;
+        let kind: Option<&'static str> = if c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                i += 1;
+            }
+            i = (i + 1).min(chars.len());
+            Some("string")
+        } else if c == '@' && chars.get(i + 1).is_some_and(|n| n.is_alphabetic()) {
+            i += 1;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
+                i += 1;
+            }
+            Some("annotation")
+        } else if c.is_ascii_digit() {
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == '_') {
+                i += 1;
+            }
+            Some("number")
+        } else if c.is_alphabetic() || c == '_' || c == '<' && chars.get(i + 1) == Some(&'i') {
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '<' || chars[i] == '>') && !(chars[i] == '>' && chars[start] != '<') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let next = chars.get(i).copied();
+            let after_dot = start > 0 && chars[start - 1] == '.';
+            if KEYWORDS.contains(&word.as_str()) {
+                Some("keyword")
+            } else if next == Some('(') && start == first_word {
+                Some("method_decl")
+            } else if next == Some('(') && !word.starts_with(char::is_uppercase) || names.methods.contains(&word) && !after_dot {
+                Some("method_call")
+            } else if names.params.contains(&word) && !after_dot {
+                Some("parameter")
+            } else if names.fields.contains(&word) && !after_dot {
+                Some("field")
+            } else if word.len() > 1 && word.chars().any(|c| c.is_alphabetic()) && word.chars().all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '_') {
+                Some("constant")
+            } else if word.starts_with(char::is_uppercase) {
+                Some("type")
+            } else {
+                None
+            }
+        } else if matches!(c, '→' | '|' | ';' | '=' | '≤' | '≥' | '+') {
+            i += 1;
+            Some("operator")
+        } else {
+            i += 1;
+            None
+        };
+        if let Some(k) = kind {
+            out.push((u16_at[start], u16_at[i], k));
+        }
+    }
+    out
+}
+
+/// The names a fold's text can mention: its method's parameters, and the file's fields and methods.
+fn names_for(f: &Fold, folds: &[Fold], folded: &[Folded]) -> Names {
+    let mut n = Names::default();
+    for d in folds.iter().filter(|d| d.kind == Kind::Detail) {
+        for prefix in ["uses ", "constants ", "state "] {
+            if let Some(rest) = d.text.strip_prefix(prefix) {
+                n.fields.extend(rest.split(", ").map(str::to_string));
+            }
+        }
+    }
+    for m in folded {
+        let (name, rest) = m.short.split_once('(').unwrap_or((&m.short, ""));
+        n.methods.insert(name.to_string());
+        if m.decl.0 <= f.start && f.end <= m.decl.1 {
+            n.params.extend(rest.trim_end_matches(')').split(", ").filter(|p| !p.is_empty()).map(str::to_string));
+        }
+    }
+    n.methods.retain(|m| m != "<init>");
+    n
+}
+
 pub fn wire(src: &str, folds: &[Fold], folded: &[Folded]) -> Value {
-    json!({"folds": folds.iter().map(|x| json!({"start": utf16(src, x.start), "end": utf16(src, x.end), "placeholder": x.placeholder(), "zoom": zoom_of(folds, x)})).collect::<Vec<_>>(),
+    json!({"folds": folds.iter().map(|x| {
+        let text = x.placeholder();
+        let spans: Vec<Value> = tokens(&text, &names_for(x, folds, folded)).into_iter().map(|(s, e, k)| json!([s, e, k])).collect();
+        json!({"start": utf16(src, x.start), "end": utf16(src, x.end), "placeholder": text, "zoom": zoom_of(folds, x), "tokens": spans})
+    }).collect::<Vec<_>>(),
     "methods": folded.iter().map(|f| json!({
         "path": f.path,
         "outline": f.outline,
@@ -1192,6 +1296,28 @@ mod tests {
         let s = f.iter().find(|f| f.path == "HandOverService.statusOf").unwrap();
         assert!(s.folds.is_empty() && s.fallback.is_none());
         assert!(render(HANDOVER, &all_folds(HANDOVER, &f, &answers), 2).contains("statusOf(outcome) → StagedMessageStatus { HandedOver→HANDED_OVER }"));
+    }
+
+    #[test]
+    fn tokens_follow_the_java_palette() {
+        let names = Names {
+            params: ["outcome", "cause", "id"].map(String::from).into(),
+            fields: ["statusPort"].map(String::from).into(),
+            methods: ["report"].map(String::from).into(),
+        };
+        let kinds = |t: &str| -> Vec<(String, &'static str)> {
+            let u: Vec<u16> = t.encode_utf16().collect();
+            tokens(t, &names).into_iter().map(|(s, e, k)| (String::from_utf16(&u[s..e]).unwrap(), k)).collect()
+        };
+        assert_eq!(kinds("record Ended(outcome, cause)"), [("record", "keyword"), ("Ended", "type"), ("outcome", "parameter"), ("cause", "parameter")].map(|(a, b)| (a.to_string(), b)));
+        assert_eq!(
+            kinds("    handOver(id): claim via statusPort → HANDED_OVER | Rejected; report it"),
+            [("handOver", "method_decl"), ("id", "parameter"), ("statusPort", "field"), ("→", "operator"), ("HANDED_OVER", "constant"), ("|", "operator"), ("Rejected", "type"), (";", "operator"), ("report", "method_call")].map(|(a, b)| (a.to_string(), b))
+        );
+        assert_eq!(kinds("@PostMapping(\"/pay\") new A(x)")[..2], [("@PostMapping".to_string(), "annotation"), ("\"/pay\"".to_string(), "string")]);
+        // UTF-16: the arrow is one unit, an emoji two.
+        let t = tokens("😀 → X", &names);
+        assert_eq!(t, [(3, 4, "operator"), (5, 6, "type")]);
     }
 
     #[test]
