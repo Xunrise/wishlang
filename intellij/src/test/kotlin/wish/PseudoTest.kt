@@ -41,15 +41,17 @@ class PseudoTest : BasePlatformTestCase() {
         val ours = editor.foldingModel.allFoldRegions.filter { it.placeholderText.isEmpty() }
         assertEquals(5, ours.size)
         assertTrue(ours.none { it.isExpanded })
-        // Only the class fold is on screen: one inlay, at offset 0.
+        // Only the class fold is on screen: one inlay, drawn where the class starts.
         val inlays = editor.inlayModel.getInlineElementsInRange(0, text.length)
-        assertEquals(listOf(0), inlays.map { it.offset })
+        assertEquals(listOf(cls.end), inlays.map { it.offset })
+        assertEquals(editor.offsetToXY(0).x, inlays.single().bounds!!.x)
 
         // Open the class: its heading and the method show, each as its own inlay.
         val clsRegion = ours.first { it.endOffset == cls.end }
         editor.foldingModel.runBatchFoldingOperation { clsRegion.isExpanded = true }
         PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue()
-        val after = editor.inlayModel.getInlineElementsInRange(0, text.length).map { it.offset }.sorted()
-        assertEquals(listOf(0, f.start), after)
+        val after = editor.inlayModel.getInlineElementsInRange(0, text.length)
+        assertEquals(listOf(head.end, f.end), after.map { it.offset }.sorted())
+        assertTrue("every inlay is drawn", after.all { it.bounds != null })
     }
 }

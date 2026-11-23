@@ -95,7 +95,8 @@ fun fragments(text: String, spans: List<Span>): List<Pair<String, TextAttributes
 
 /**
  * Draws a collapsed fold's pseudocode like code: each word in the scheme's colour and font style for
- * what it is. The fold itself has an empty placeholder; this inlay sits at its start.
+ * what it is. The fold itself has an empty placeholder; this inlay sits at its end offset, because the
+ * editor hides inlays at a collapsed fold's start, and an empty fold leaves its end at the same spot.
  */
 private class PseudoRenderer(val region: FoldRegion, val text: String, val spans: List<Span>) : EditorCustomElementRenderer {
     private fun styled(editor: Editor): List<Triple<String, Font, Color>> {
@@ -162,7 +163,7 @@ private class Pseudo(val editor: Editor) : Disposable {
                     // Same start: the longer one is the outer fold (a class around its heading).
                     (o.startOffset < r.startOffset || o.endOffset > r.endOffset)
             }
-        }.mapNotNull { (r, p) -> editor.inlayModel.addInlineElement(r.startOffset, true, PseudoRenderer(r, p.placeholder, p.spans)) }
+        }.mapNotNull { (r, p) -> editor.inlayModel.addInlineElement(r.endOffset, false, PseudoRenderer(r, p.placeholder, p.spans)) }
     }
 
     override fun dispose() {

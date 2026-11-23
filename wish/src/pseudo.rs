@@ -836,7 +836,10 @@ pub fn tokens(text: &str, names: &Names) -> Vec<(usize, usize, &'static str)> {
             let word: String = chars[start..i].iter().collect();
             let next = chars.get(i).copied();
             let after_dot = start > 0 && chars[start - 1] == '.';
-            if KEYWORDS.contains(&word.as_str()) {
+            // Keywords only where Java puts them: the heading word, and a class heading's clauses.
+            // In prose "record an outcome" is a verb.
+            let heading = KEYWORDS.contains(&chars[first_word..].iter().take_while(|c| c.is_alphabetic()).collect::<String>().as_str());
+            if KEYWORDS.contains(&word.as_str()) && (start == first_word || heading && matches!(word.as_str(), "implements" | "extends" | "permits")) {
                 Some("keyword")
             } else if next == Some('(') && start == first_word {
                 Some("method_decl")
@@ -844,10 +847,10 @@ pub fn tokens(text: &str, names: &Names) -> Vec<(usize, usize, &'static str)> {
                 Some("method_call")
             } else if names.params.contains(&word) && !after_dot {
                 Some("parameter")
-            } else if names.fields.contains(&word) && !after_dot {
-                Some("field")
             } else if word.len() > 1 && word.chars().any(|c| c.is_alphabetic()) && word.chars().all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '_') {
                 Some("constant")
+            } else if names.fields.contains(&word) && !after_dot {
+                Some("field")
             } else if word.starts_with(char::is_uppercase) {
                 Some("type")
             } else {
@@ -884,7 +887,8 @@ fn names_for(f: &Fold, folds: &[Fold], folded: &[Folded]) -> Names {
             n.params.extend(rest.trim_end_matches(')').split(", ").filter(|p| !p.is_empty()).map(str::to_string));
         }
     }
-    n.methods.retain(|m| m != "<init>");
+    // A constructor is named like its class: that word is a type.
+    n.methods.retain(|m| !m.starts_with(char::is_uppercase));
     n
 }
 
@@ -1309,6 +1313,8 @@ mod tests {
             let u: Vec<u16> = t.encode_utf16().collect();
             tokens(t, &names).into_iter().map(|(s, e, k)| (String::from_utf16(&u[s..e]).unwrap(), k)).collect()
         };
+        assert_eq!(kinds("claim; record a result"), [(";".to_string(), "operator")]);
+        assert_eq!(kinds("class A implements B"), [("class", "keyword"), ("A", "type"), ("implements", "keyword"), ("B", "type")].map(|(a, b)| (a.to_string(), b)));
         assert_eq!(kinds("record Ended(outcome, cause)"), [("record", "keyword"), ("Ended", "type"), ("outcome", "parameter"), ("cause", "parameter")].map(|(a, b)| (a.to_string(), b)));
         assert_eq!(
             kinds("    handOver(id): claim via statusPort → HANDED_OVER | Rejected; report it"),
