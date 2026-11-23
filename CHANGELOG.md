@@ -5,6 +5,7 @@ All notable changes are listed here. Versions follow [semver](https://semver.org
 ## [Unreleased]
 
 ### Added
+- `wishlang pseudo`: reads any Java file as pseudocode, each method folded into its business steps or into a one-line outline. The IntelliJ plugin's **Read as Pseudocode** action applies the same folds in editors and diffs.
 - Neovim plugin (`nvim/`): starts `wishlang lsp` for Rust and Java, tints generated code, hover reasons, code lenses for Implement and Accept/Reject, `:WishLog` and `:WishTicket`, and `:checkhealth wishlang`.
 
 ## [0.1.1] - 2026-11-20

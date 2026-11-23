@@ -124,6 +124,23 @@ The **Wish** tool window has two tabs:
 
 The tool window's title bar has **Fulfil Wishes** (run a cycle for your edits now) and **Build on Save** (on by default, per project): turn it off to save freely and trigger cycles only with Fulfil Wishes.
 
+## Reading code as pseudocode
+
+`wishlang pseudo` goes the other way: it reads any Java file (no `wish.toml` needed) and folds every method body into its business steps, one line each, with a decision's outcomes indented below. With `--outline`, each method folds to a single line.
+
+```java
+public StagedReceipt handOver(UUID id) {
+    claim (RECEIVED|FAILED → PROCESSING, attempt counted); unclaimable → NotAllowed | NotFound
+    hand over claimed message → HandedOver | Rejected | Failed(cause)
+    record outcome; store unavailable → log PROCESSING (may have committed), receipt PROCESSING
+    map outcome to status, log it, return receipt with status and attempts
+}
+```
+
+Folds only ever cover whole statements, or whole parts of one (a `try` block, a `catch`, an `else`, a `case`). Claude picks and words them; when its answer doesn't cover the body exactly once, that method falls back to one step per statement (`--baseline` shows that fallback). Answers are cached per file content in `~/.wishlang/pseudo`. `WISH_PSEUDO_MODEL` picks the model (default `haiku`). `-` reads the file from stdin, for example `git show main:App.java | wishlang pseudo -`.
+
+In IntelliJ, **Read as Pseudocode** (editor and diff context menu, <kbd>⌥⇧⌘P</kbd> / <kbd>Ctrl+Alt+Shift+P</kbd>) applies the same folds to the open editor, including both sides of a diff or pull request review. Expand a step to see its code; collapse a method body to see its outline; toggle again, or edit the file, to remove them.
+
 ## Ticket tracing
 
 When the branch belongs to a ticket, wish traces generated code back to the ticket's problems. It works with protoflow notes:
@@ -296,6 +313,9 @@ Project
   wishlang items                       items per file and their owner
   wishlang adopt|unadopt <item>        e.g. Mode, Window::open, Mode::Maximized (see `wishlang items`)
   wishlang check                       adopted intact + dependencies decided + build
+
+Reading code
+  wishlang pseudo [--outline] <file|->  any Java file folded into business steps (or one line per method)
 
 Cycles
   wishlang compile [--json] [--force] [--no-run] [--note TEXT]
