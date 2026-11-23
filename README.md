@@ -145,7 +145,7 @@ class HandOverService implements HandOverPort
 
 Imports, Javadoc, annotations, modifiers, types, fields and constructors that only store their arguments are folded at every level. Steps only ever cover whole statements, or whole parts of one (a `try` block, a `catch`, an `else`, a `case`). Claude picks and words them; when its answer doesn't cover a body exactly once, that method falls back to one step per statement (`--baseline` shows that fallback). Answers are cached per file content in `~/.wishlang/pseudo`. `WISH_PSEUDO_MODEL` picks the model (default `haiku`). `-` reads the file from stdin, for example `git show main:App.java | wishlang pseudo -`.
 
-In IntelliJ, **Read as Pseudocode** (editor and diff context menu, <kbd>⌥⇧⌘P</kbd> / <kbd>Ctrl+Alt+Shift+P</kbd>) applies the same folds to the open editor, including both sides of a diff or pull request review. The file opens as one line per class; expanding a fold opens one level: the class's methods, then a method's steps, then a step's code. Toggle again, or edit the file, to remove them.
+In IntelliJ, **Read as Pseudocode** (editor and diff context menu, <kbd>⌥⇧⌘P</kbd> / <kbd>Ctrl+Alt+Shift+P</kbd>) applies the same folds to the open editor, including both sides of a diff or pull request review. The file opens as one line per class, coloured like the code. Clicking a line opens one level: the class's methods, then a method's steps, then a step's code; clicking a class heading or a signature folds its class or method back. Lines under a collapsed fold can't be edited, fully expanded lines can. Toggle again to restore the code.
 
 ## Ticket tracing
 

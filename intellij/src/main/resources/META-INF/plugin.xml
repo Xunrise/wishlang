@@ -35,7 +35,7 @@ Rust is supported in Zed through the wishlang extension.</p>
 
   <actions>
     <action id="wish.ReadAsPseudocode" class="wish.ReadAsPseudocode" text="Read as Pseudocode"
-            description="Fold each method into its business steps (expand a step to see its code); toggle again to restore">
+            description="Read the file as pseudocode you zoom into: click a line to open it, click a heading to fold its class or method back. The editor is read-only until you toggle again">
       <keyboard-shortcut keymap="$default" first-keystroke="control alt shift P"/>
       <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt shift P"/>
       <add-to-group group-id="EditorPopupMenu" anchor="last"/>

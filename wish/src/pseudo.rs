@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use tree_sitter::Node;
 
 /// Bump when the prompt or the unit ids change: cached answers are keyed by it.
-pub const PROMPT_VERSION: u32 = 5;
+pub const PROMPT_VERSION: u32 = 6;
 const DEFAULT_MODEL: &str = "haiku";
 const MAX_LINE: usize = 100;
 
@@ -31,8 +31,8 @@ const PROMPT: &str = r#"You turn Java methods into pseudocode for a code reviewe
 The file is marked up. Every method body starts with ⟦method PATH⟧. Inside it, ⟦ID⟧ marks where a unit starts. A unit is a statement; ids with a dot are nested: `4.try`, `4.catch1`, `4.finally` are the parts of try statement 4; `3.if`, `3.elif1`, `3.else` the parts of an if chain; `5.case1` the cases of a switch; `4.try.2` is the second statement inside part `4.try`, `6.1` the first statement inside loop 6.
 
 Answer in three passes, with `path` exactly as listed:
-- `types` first, for every listed type: one line, at most 120 characters, saying what the type is for and what its public methods do for a caller. This is what the reader sees when the whole type is collapsed.
-- `outlines`, for every listed method: one line, at most 100 characters, saying what the method does and which outcomes it has. This is what the reader sees when the whole method is collapsed.
+- `types` first, for every listed type: one plain sentence, at most 120 characters, saying what the type is for, as you would explain it to a new colleague.
+- `outlines`, for every listed method: one plain sentence, at most 100 characters, saying what the method does and what comes out of it, for a reader who has not seen the code: "hands a staged message to its handler and records whether it was handed over, rejected or failed". No arrows, no `|`, no lists of constants; name a status only when it is the point.
 - then `methods`, for every listed method, its `steps`: the method body cut into steps. Each step is a run of sibling units `from`..`to` (same parent, in order; `from` = `to` for a single unit) with a `depth` and a `text`. Every unit of the body must be covered exactly once, either directly or because all of its parts/children are covered. A unit and one of its parts or children can never both be in steps, and a run never mixes levels: `4..6` or `4.try..4.catch1`, never `4..4.try` or `3..4.try`. To split statement 4 into its parts, list `4.try`, `4.catch1`, … as steps of their own.
 
 How to cut steps:
@@ -43,7 +43,7 @@ How to cut steps:
 5. Each step is ONE line. When a single statement has an outcome (an orElseThrow, a ternary), put it on the same line after "; else" or "→".
 6. Keep domain words verbatim: statuses, exception names, port and service names, constants, reasons. Drop Java words (Optional, stream, lambda, try, catch, null).
 7. A call to a method of the same file reads as what that method does (its outline from the first pass), never as its name and never as "see X": "route to handler → HandedOver | Rejected | Failed", not "handOverClaimed(claimed)".
-8. At most 100 characters per line. Terse: arrows (→) for results, `|` between alternatives, no full stops.
+8. Steps (not outlines): at most 100 characters per line, terse: arrows (→) for results, `|` between alternatives, no full stops. Still readable to someone who does not know the code: say "claim the message" rather than "claim".
 9. A method with nothing but plumbing or a single step returns one step covering the whole body; its outline carries the meaning. So does a method whose body is one mapping (a switch or if chain that only translates one value into another): never split a pure mapping into cases.
 10. Prefer the fewest steps that still show every decision. Guards that all reject the input share one step ("no amount → 400; ≤ 0 → 422"); a lookup and its "not found" share one ("find handler; none → Failed NO_HANDLER"). Start lines lowercase.
 

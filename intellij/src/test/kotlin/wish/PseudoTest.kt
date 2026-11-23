@@ -32,11 +32,11 @@ class PseudoTest : BasePlatformTestCase() {
         myFixture.configureByText("A.java", "class A {\n  void f() {\n    a();\n    b();\n  }\n}\n")
         val editor = myFixture.editor
         val text = editor.document.text
-        val cls = PseudoRegion(0, text.lastIndexOf('}') + 1, "class A: does a")
-        val head = PseudoRegion(0, text.indexOf('{') + 1, "class A")
-        val f = PseudoRegion(text.indexOf("void"), text.indexOf("  }") + 3, "f(): does f")
-        val sig = PseudoRegion(text.indexOf("void"), text.indexOf("() {") + 2, "f()")
-        val step = PseudoRegion(text.indexOf("a();"), text.indexOf("b();") + 4, "a then b")
+        val cls = PseudoRegion(0, text.lastIndexOf('}') + 1, "class A: does a", zoom = 0)
+        val head = PseudoRegion(0, text.indexOf('{') + 1, "class A", zoom = DETAIL)
+        val f = PseudoRegion(text.indexOf("void"), text.indexOf("  }") + 3, "f(): does f", zoom = 1)
+        val sig = PseudoRegion(text.indexOf("void"), text.indexOf("() {") + 2, "f()", zoom = DETAIL)
+        val step = PseudoRegion(text.indexOf("a();"), text.indexOf("b();") + 4, "a then b", zoom = 2)
         applyPseudo(editor, listOf(cls, head, f, sig, step))
         val ours = editor.foldingModel.allFoldRegions.filter { it.placeholderText.isEmpty() }
         assertEquals(5, ours.size)
@@ -53,5 +53,28 @@ class PseudoTest : BasePlatformTestCase() {
         val after = editor.inlayModel.getInlineElementsInRange(0, text.length)
         assertEquals(listOf(head.end, f.end), after.map { it.offset }.sorted())
         assertTrue("every inlay is drawn", after.all { it.bounds != null })
+        PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue()
+
+        // Lines under a collapsed fold are guarded; nothing is guarded once everything is open.
+        val doc = editor.document
+        val methodLine = doc.getLineNumber(f.start)
+        assertNotNull("collapsed method line is guarded", doc.getRangeGuard(doc.getLineStartOffset(methodLine), doc.getLineEndOffset(methodLine)))
+
+        // Clicking the class heading folds the class back; clicking the method line opens it instead.
+        val headRegion = ours.first { it.endOffset == head.end }
+        assertSame(clsRegion, pseudoZoomOut(editor, headRegion))
+        val fRegion = ours.first { it.endOffset == f.end }
+        assertNull(pseudoZoomOut(editor, fRegion))
+
+        editor.foldingModel.runBatchFoldingOperation { ours.forEach { it.isExpanded = true } }
+        PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue()
+        assertNull("fully expanded lines are editable", doc.getRangeGuard(0, doc.textLength))
+
+        // An edit in open code keeps the folds; toggling off removes them.
+        com.intellij.openapi.command.WriteCommandAction.runWriteCommandAction(project) { doc.insertString(doc.getLineEndOffset(methodLine), " ") }
+        PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue()
+        assertTrue(pseudoActive(editor))
+        pseudoOff(editor)
+        assertTrue(editor.foldingModel.allFoldRegions.none { it.placeholderText.isEmpty() })
     }
 }

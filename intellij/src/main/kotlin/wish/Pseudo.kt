@@ -17,6 +17,7 @@ import com.intellij.ide.ui.UISettings
 import com.intellij.openapi.editor.EditorCustomElementRenderer
 import com.intellij.openapi.editor.HighlighterColors
 import com.intellij.openapi.editor.Inlay
+import com.intellij.openapi.editor.RangeMarker
 import com.intellij.openapi.editor.colors.EditorFontType
 import com.intellij.openapi.editor.colors.TextAttributesKey
 import com.intellij.openapi.editor.event.EditorMouseEvent
@@ -50,7 +51,13 @@ data class PseudoFold(val start: Int = 0, val end: Int = 0, val placeholder: Str
 data class Span(val start: Int, val end: Int, val kind: String)
 
 /** A fold to add. All start collapsed: the file opens as one line per class, and each fold opens one level. */
-data class PseudoRegion(val start: Int, val end: Int, val placeholder: String, val spans: List<Span> = emptyList())
+data class PseudoRegion(val start: Int, val end: Int, val placeholder: String, val spans: List<Span> = emptyList(), val zoom: Int = 0) {
+    /** Shorthand for code (a heading, fields, a signature), not a zoom level. */
+    val detail get() = zoom >= DETAIL
+}
+
+/** The zoom the CLI gives a detail fold. */
+const val DETAIL = 255
 
 /** Outer folds first, so nested ones are added inside them. */
 fun pseudoRegions(file: PseudoFile): List<PseudoRegion> =
@@ -61,7 +68,7 @@ fun pseudoRegions(file: PseudoFile): List<PseudoRegion> =
             val k = t.getOrNull(2) as? String
             if (s != null && e != null && k != null && 0 <= s && s < e && e <= f.placeholder.length) Span(s, e, k) else null
         }
-        PseudoRegion(f.start, f.end, f.placeholder, spans)
+        PseudoRegion(f.start, f.end, f.placeholder, spans, f.zoom)
     }
 
 /** The editor's Java colours for each kind of pseudocode word. */
@@ -129,45 +136,77 @@ private class PseudoRenderer(val region: FoldRegion, val text: String, val spans
 
 private val PSEUDO = Key.create<Pseudo>("wish.pseudo")
 
-/** The pseudo folds of one editor, gone on toggle-off or on the first edit (their offsets would be stale). */
+/**
+ * The pseudo folds of one editor, until toggled off. Lines a collapsed fold touches are guarded, so a
+ * stray keystroke can't change code you are not looking at; fully expanded lines stay editable, and
+ * the folds move with the edits.
+ */
 private class Pseudo(val editor: Editor) : Disposable {
     /** Our fold regions and what each one reads as. */
     var regions: Map<FoldRegion, PseudoRegion> = emptyMap()
     /** The IDE's own folds that crossed ours (a code block's braces inside a step): rebuilt when we go. */
     var displaced = false
     private var inlays: List<Inlay<*>> = emptyList()
+    private var guards: List<RangeMarker> = emptyList()
+
+    /**
+     * Clicking a heading (a class heading, a signature) folds back the class or method it heads: that
+     * level's own gutter arrow is taken by the heading, which starts on the same line. Null for any other
+     * fold, which a click opens.
+     */
+    fun zoomOutFrom(r: FoldRegion): FoldRegion? {
+        if (regions[r]?.detail != true) return null
+        return regions.entries.filter { (o, p) -> o !== r && !p.detail && o.isValid && o.isExpanded && o.startOffset == r.startOffset && r.endOffset <= o.endOffset }
+            .minByOrNull { it.key.endOffset - it.key.startOffset }?.key
+    }
 
     init {
+        val later = { ApplicationManager.getApplication().invokeLater { if (!editor.isDisposed && editor.getUserData(PSEUDO) === this@Pseudo) refresh() } }
         editor.document.addDocumentListener(object : DocumentListener {
-            override fun documentChanged(event: DocumentEvent) = clear(editor)
+            override fun documentChanged(event: DocumentEvent) { later() }
         }, this)
         (editor.foldingModel as? FoldingModelEx)?.addListener(object : FoldingListener {
-            override fun onFoldProcessingEnd() = ApplicationManager.getApplication().invokeLater { if (!editor.isDisposed && editor.getUserData(PSEUDO) === this@Pseudo) refresh() }
+            override fun onFoldProcessingEnd() { later() }
         }, this)
         editor.addEditorMouseListener(object : EditorMouseListener {
             override fun mouseClicked(e: EditorMouseEvent) {
                 val r = (e.inlay?.renderer as? PseudoRenderer)?.region ?: return
-                if (r.isValid) editor.foldingModel.runBatchFoldingOperation { r.isExpanded = true }
+                if (r.isValid) editor.foldingModel.runBatchFoldingOperation { (zoomOutFrom(r) ?: r).isExpanded = (zoomOutFrom(r) == null) }
                 e.consume()
             }
         }, this)
     }
 
-    /** One inlay per collapsed fold that is not inside another collapsed fold: exactly the ones on screen. */
-    fun refresh() {
-        inlays.forEach(Disposer::dispose)
+    /** Our collapsed folds that are not inside another collapsed fold: exactly the ones on screen. */
+    private fun visible(): Map<FoldRegion, PseudoRegion> {
         val collapsed = editor.foldingModel.allFoldRegions.filter { it.isValid && !it.isExpanded }
-        inlays = regions.filter { (r, _) ->
+        return regions.filter { (r, _) ->
             r.isValid && !r.isExpanded && collapsed.none { o ->
                 o !== r && o.startOffset <= r.startOffset && r.endOffset <= o.endOffset &&
                     // Same start: the longer one is the outer fold (a class around its heading).
                     (o.startOffset < r.startOffset || o.endOffset > r.endOffset)
             }
-        }.mapNotNull { (r, p) -> editor.inlayModel.addInlineElement(r.endOffset, false, PseudoRenderer(r, p.placeholder, p.spans)) }
+        }
+    }
+
+    /** One inlay per fold on screen, and a guard over every line one of them touches. */
+    fun refresh() {
+        inlays.forEach(Disposer::dispose)
+        val doc = editor.document
+        guards.forEach { if (it.isValid) doc.removeGuardedBlock(it) }
+        val shown = visible()
+        inlays = shown.mapNotNull { (r, p) -> editor.inlayModel.addInlineElement(r.endOffset, false, PseudoRenderer(r, p.placeholder, p.spans)) }
+        guards = shown.keys.map { r ->
+            doc.createGuardedBlock(doc.getLineStartOffset(doc.getLineNumber(r.startOffset)), doc.getLineEndOffset(doc.getLineNumber(r.endOffset))).apply {
+                isGreedyToLeft = true
+                isGreedyToRight = true
+            }
+        }
     }
 
     override fun dispose() {
         inlays.forEach(Disposer::dispose)
+        guards.forEach { if (it.isValid) editor.document.removeGuardedBlock(it) }
         if (editor.isDisposed) return
         val live = regions.keys.filter { it.isValid }
         if (live.isNotEmpty()) editor.foldingModel.runBatchFoldingOperation { live.forEach(editor.foldingModel::removeFoldRegion) }
@@ -188,6 +227,13 @@ private fun clashes(o: FoldRegion, start: Int, end: Int): Boolean {
 }
 
 /** Adds the regions, collapsed. The IDE's own folds that clash with one (it folds every `{}` block) make way. */
+/** For tests: what clicking [region]'s line folds back, null when the click opens it. */
+internal fun pseudoZoomOut(editor: Editor, region: FoldRegion): FoldRegion? = editor.getUserData(PSEUDO)?.zoomOutFrom(region)
+
+internal fun pseudoActive(editor: Editor) = editor.getUserData(PSEUDO) != null
+
+internal fun pseudoOff(editor: Editor) = clear(editor)
+
 internal fun applyPseudo(editor: Editor, regions: List<PseudoRegion>) {
     clear(editor)
     val pseudo = Pseudo(editor)
