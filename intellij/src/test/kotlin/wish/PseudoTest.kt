@@ -34,5 +34,8 @@ class PseudoTest : BasePlatformTestCase() {
         val added = editor.foldingModel.allFoldRegions.map { it.placeholderText }
         assertTrue(added.toString(), added.containsAll(listOf("class A: does a", "class A", "f(): does f", "f()", "a then b")))
         assertTrue(editor.foldingModel.allFoldRegions.filter { it.placeholderText in setOf("class A: does a", "a then b") }.none { it.isExpanded })
+        val folded = editor.colorsScheme.getAttributes(com.intellij.openapi.editor.colors.EditorColors.FOLDED_TEXT_ATTRIBUTES)
+        assertNull("placeholders have no grey box", folded.backgroundColor)
+        assertEquals(editor.colorsScheme.defaultForeground, folded.foregroundColor)
     }
 }

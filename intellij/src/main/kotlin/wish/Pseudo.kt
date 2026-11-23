@@ -12,6 +12,13 @@ import com.intellij.openapi.actionSystem.ToggleAction
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.FoldRegion
+import com.intellij.openapi.editor.colors.EditorColors
+import com.intellij.openapi.editor.colors.EditorColorsScheme
+import com.intellij.openapi.editor.colors.TextAttributesKey
+import com.intellij.openapi.editor.colors.impl.DelegateColorScheme
+import com.intellij.openapi.editor.ex.EditorEx
+import com.intellij.openapi.editor.markup.TextAttributes
+import java.awt.Font
 import com.intellij.openapi.editor.impl.EditorImpl
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.editor.event.DocumentListener
@@ -44,6 +51,8 @@ private class Pseudo(val editor: Editor) : Disposable {
     var regions: List<FoldRegion> = emptyList()
     /** The IDE's own folds that crossed ours (a code block's braces inside a step): rebuilt when we go. */
     var displaced = false
+    /** The editor's own scheme, put back when we go (ours only restyles the placeholders). */
+    var scheme: EditorColorsScheme? = null
 
     init {
         editor.document.addDocumentListener(object : DocumentListener {
@@ -56,6 +65,7 @@ private class Pseudo(val editor: Editor) : Disposable {
         val live = regions.filter { it.isValid }
         if (live.isNotEmpty()) editor.foldingModel.runBatchFoldingOperation { live.forEach(editor.foldingModel::removeFoldRegion) }
         if (displaced) editor.project?.let { CodeFoldingManager.getInstance(it).updateFoldRegions(editor) }
+        scheme?.let { (editor as? EditorEx)?.colorsScheme = it }
     }
 }
 
@@ -89,9 +99,23 @@ internal fun applyPseudo(editor: Editor, regions: List<PseudoRegion>) {
         }
     }
     pseudo.regions = added
+    (editor as? EditorEx)?.let {
+        pseudo.scheme = it.colorsScheme
+        it.colorsScheme = ReadableFolds(it.colorsScheme)
+    }
     editor.putUserData(PSEUDO, pseudo)
     // Goes with the editor; outside an EditorImpl (tests, previews) with the toggle or the next edit.
     (editor as? EditorImpl)?.let { Disposer.register(it.disposable, pseudo) }
+}
+
+/**
+ * Pseudocode is the text to read, not a hint: placeholders in the editor's normal text colour, without
+ * the grey box the scheme gives folded text.
+ */
+private class ReadableFolds(base: EditorColorsScheme) : DelegateColorScheme(base) {
+    override fun getAttributes(key: TextAttributesKey?): TextAttributes? =
+        if (key == EditorColors.FOLDED_TEXT_ATTRIBUTES) TextAttributes(defaultForeground, null, null, null, Font.PLAIN)
+        else super.getAttributes(key)
 }
 
 private fun notify(project: Project?, message: String) =
