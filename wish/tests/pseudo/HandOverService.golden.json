@@ -1,0 +1,37 @@
+{
+  "HandOverService.<init>": [],
+  "HandOverService.handOver": [
+    [
+      "1",
+      "2"
+    ],
+    [
+      "3"
+    ],
+    [
+      "4"
+    ],
+    [
+      "5",
+      "7"
+    ]
+  ],
+  "HandOverService.handOverClaimed": [
+    [
+      "1",
+      "2"
+    ],
+    [
+      "3.try"
+    ],
+    [
+      "3.catch1"
+    ],
+    [
+      "3.catch2"
+    ]
+  ],
+  "HandOverService.notClaimable": [],
+  "HandOverService.report": [],
+  "HandOverService.statusOf": []
+}

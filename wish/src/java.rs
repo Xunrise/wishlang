@@ -16,18 +16,18 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tree_sitter::{Node, Parser, Tree};
 
 /// The syntax tree, or None if the source has errors.
-fn parse_tree(src: &str) -> Option<Tree> {
+pub(crate) fn parse_tree(src: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_java::LANGUAGE.into()).ok()?;
     let tree = parser.parse(src, None)?;
     (!tree.root_node().has_error()).then_some(tree)
 }
 
-fn text<'a>(n: Node, src: &'a str) -> &'a str {
+pub(crate) fn text<'a>(n: Node, src: &'a str) -> &'a str {
     &src[n.byte_range()]
 }
 
-fn hash(s: &str) -> String {
+pub(crate) fn hash(s: &str) -> String {
     let norm = s.split_whitespace().collect::<Vec<_>>().join(" ");
     Sha256::digest(norm.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
