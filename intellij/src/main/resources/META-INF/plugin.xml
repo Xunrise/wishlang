@@ -10,6 +10,7 @@ first as a skimmable prototype, then, once you are happy, as the real implementa
   <li><b>Reasons on hover:</b> who wrote a line and, for generated code, why and which of your edits triggered it.</li>
   <li><b>Ticket tracing:</b> generated code is traced to the problems of the branch's ticket; code that serves none is flagged red.</li>
   <li><b>No false errors:</b> <code>Cannot resolve symbol</code> is hidden for symbols you wished for; they show as <i>will be generated</i>.</li>
+  <li><b>Read as Pseudocode:</b> fold any Java file, also in diffs and PR reviews, into one line per business step, and each method into one line.</li>
   <li><b>Wish tool window:</b> the journal of every cycle with diffs and Claude's reasoning, and the ticket as a problem tree.</li>
 </ul>
 <p>Requires the <code>wishlang</code> command-line tool and <a href="https://claude.com/claude-code">Claude Code</a>.
@@ -31,4 +32,14 @@ Rust is supported in Zed through the wishlang extension.</p>
     <codeInsight.lineMarkerProvider language="JAVA" implementationClass="wish.WishLenses"/>
     <notificationGroup id="Wish" displayType="BALLOON"/>
   </extensions>
+
+  <actions>
+    <action id="wish.ReadAsPseudocode" class="wish.ReadAsPseudocode" text="Read as Pseudocode"
+            description="Fold each method into its business steps (expand a step to see its code); toggle again to restore">
+      <keyboard-shortcut keymap="$default" first-keystroke="control alt shift P"/>
+      <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt shift P"/>
+      <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+      <add-to-group group-id="Diff.EditorPopupMenu" anchor="last"/>
+    </action>
+  </actions>
 </idea-plugin>
