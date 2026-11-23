@@ -126,20 +126,26 @@ The tool window's title bar has **Fulfil Wishes** (run a cycle for your edits no
 
 ## Reading code as pseudocode
 
-`wishlang pseudo` goes the other way: it reads any Java file (no `wish.toml` needed) and folds every method body into its business steps, one line each, with a decision's outcomes indented below. With `--outline`, each method folds to a single line.
+`wishlang pseudo` goes the other way: it reads any Java file (no `wish.toml` needed) as pseudocode you can zoom into. `--zoom 0` shows each class as one line, `--zoom 1` one line per method, and `--zoom 2` (the default) each method's business steps, with a decision's outcomes indented below:
 
-```java
-public StagedReceipt handOver(UUID id) {
-    claim (RECEIVED|FAILED → PROCESSING, attempt counted); unclaimable → NotAllowed | NotFound
-    hand over claimed message → HandedOver | Rejected | Failed(cause)
-    record outcome; store unavailable → log PROCESSING (may have committed), receipt PROCESSING
-    map outcome to status, log it, return receipt with status and attempts
-}
+```
+class HandOverService implements HandOverPort
+
+    constants TECHNICAL_FAILURE, NO_HANDLER
+
+    uses statusPort, handlers, auditCorrelation, log
+
+    handOver(id) → StagedReceipt {
+        claim RECEIVED|FAILED → PROCESSING; else NotAllowed | NotFound
+        route to handler → HandedOver | Rejected | Failed, with cause for the log
+        record outcome; store unavailable → report PROCESSING, return receipt with no outcome
+        status from outcome (HANDED_OVER | REJECTED | FAILED); report with cause; return receipt
+    }
 ```
 
-Folds only ever cover whole statements, or whole parts of one (a `try` block, a `catch`, an `else`, a `case`). Claude picks and words them; when its answer doesn't cover the body exactly once, that method falls back to one step per statement (`--baseline` shows that fallback). Answers are cached per file content in `~/.wishlang/pseudo`. `WISH_PSEUDO_MODEL` picks the model (default `haiku`). `-` reads the file from stdin, for example `git show main:App.java | wishlang pseudo -`.
+Imports, Javadoc, annotations, modifiers, types, fields and constructors that only store their arguments are folded at every level. Steps only ever cover whole statements, or whole parts of one (a `try` block, a `catch`, an `else`, a `case`). Claude picks and words them; when its answer doesn't cover a body exactly once, that method falls back to one step per statement (`--baseline` shows that fallback). Answers are cached per file content in `~/.wishlang/pseudo`. `WISH_PSEUDO_MODEL` picks the model (default `haiku`). `-` reads the file from stdin, for example `git show main:App.java | wishlang pseudo -`.
 
-In IntelliJ, **Read as Pseudocode** (editor and diff context menu, <kbd>⌥⇧⌘P</kbd> / <kbd>Ctrl+Alt+Shift+P</kbd>) applies the same folds to the open editor, including both sides of a diff or pull request review. Expand a step to see its code; collapse a method body to see its outline; toggle again, or edit the file, to remove them.
+In IntelliJ, **Read as Pseudocode** (editor and diff context menu, <kbd>⌥⇧⌘P</kbd> / <kbd>Ctrl+Alt+Shift+P</kbd>) applies the same folds to the open editor, including both sides of a diff or pull request review. The file opens as one line per class; expanding a fold opens one level: the class's methods, then a method's steps, then a step's code. Toggle again, or edit the file, to remove them.
 
 ## Ticket tracing
 
@@ -315,7 +321,7 @@ Project
   wishlang check                       adopted intact + dependencies decided + build
 
 Reading code
-  wishlang pseudo [--outline] <file|->  any Java file folded into business steps (or one line per method)
+  wishlang pseudo [--zoom 0|1|2] <file|->  any Java file as zoomable pseudocode: class, methods, steps
 
 Cycles
   wishlang compile [--json] [--force] [--no-run] [--note TEXT]

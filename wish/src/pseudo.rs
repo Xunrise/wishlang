@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use tree_sitter::Node;
 
 /// Bump when the prompt or the unit ids change: cached answers are keyed by it.
-pub const PROMPT_VERSION: u32 = 4;
+pub const PROMPT_VERSION: u32 = 5;
 const DEFAULT_MODEL: &str = "haiku";
 const MAX_LINE: usize = 100;
 
@@ -30,8 +30,9 @@ const PROMPT: &str = r#"You turn Java methods into pseudocode for a code reviewe
 
 The file is marked up. Every method body starts with ⟦method PATH⟧. Inside it, ⟦ID⟧ marks where a unit starts. A unit is a statement; ids with a dot are nested: `4.try`, `4.catch1`, `4.finally` are the parts of try statement 4; `3.if`, `3.elif1`, `3.else` the parts of an if chain; `5.case1` the cases of a switch; `4.try.2` is the second statement inside part `4.try`, `6.1` the first statement inside loop 6.
 
-Answer in two passes, with `path` exactly as listed:
-- `outlines` first, for every listed method: one line, at most 100 characters, saying what the method does and which outcomes it has. This is what the reader sees when the whole method is collapsed.
+Answer in three passes, with `path` exactly as listed:
+- `types` first, for every listed type: one line, at most 120 characters, saying what the type is for and what its public methods do for a caller. This is what the reader sees when the whole type is collapsed.
+- `outlines`, for every listed method: one line, at most 100 characters, saying what the method does and which outcomes it has. This is what the reader sees when the whole method is collapsed.
 - then `methods`, for every listed method, its `steps`: the method body cut into steps. Each step is a run of sibling units `from`..`to` (same parent, in order; `from` = `to` for a single unit) with a `depth` and a `text`. Every unit of the body must be covered exactly once, either directly or because all of its parts/children are covered. A unit and one of its parts or children can never both be in steps, and a run never mixes levels: `4..6` or `4.try..4.catch1`, never `4..4.try` or `3..4.try`. To split statement 4 into its parts, list `4.try`, `4.catch1`, … as steps of their own.
 
 How to cut steps:
@@ -88,6 +89,10 @@ pub struct Unit {
 #[derive(Debug, Clone)]
 pub struct Method {
     pub path: String,
+    /// The whole declaration, Javadoc and annotations included.
+    pub decl: (usize, usize),
+    /// `handOver(id)`: name and parameter names.
+    pub short: String,
     /// The body's braces, `{` to `}` inclusive.
     pub body: (usize, usize),
     pub units: Vec<Unit>,
@@ -300,7 +305,8 @@ pub fn methods(src: &str) -> Result<Vec<Method>> {
         if matches!(n.kind(), "method_declaration" | "constructor_declaration") {
             if let (Some(body), Some(name)) = (n.child_by_field_name("body"), n.child_by_field_name("name")) {
                 if let Some(path) = by_line.get(&(name.start_position().row + 1)) {
-                    out.push(Method { path: path.clone(), body: (body.start_byte(), body.end_byte()), units: block_units(body, src, "") });
+                    let short = format!("{}{}", java::text(name, src), param_names(n, src));
+                    out.push(Method { path: path.clone(), decl: (member_start(n), n.end_byte()), short, body: (body.start_byte(), body.end_byte()), units: block_units(body, src, "") });
                 }
             }
             continue; // ponytail: lambdas and local/anonymous classes stay inside their statement; give a block lambda child units if reviewers need them.
@@ -366,9 +372,21 @@ pub struct Answer {
 pub struct Fold {
     pub start: usize,
     pub end: usize,
+    pub kind: Kind,
     pub lead: String,
     pub depth: usize,
     pub text: String,
+}
+
+/// What a fold stands for. Class, method, step and body folds are the zoom levels; a detail fold
+/// (imports, a class heading, fields, a signature) is shorthand that stays folded at every level.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum Kind {
+    Class,
+    Method,
+    Body,
+    Step,
+    Detail,
 }
 
 impl Fold {
@@ -380,6 +398,8 @@ impl Fold {
 #[derive(Debug, Clone, Serialize)]
 pub struct Folded {
     pub path: String,
+    pub decl: (usize, usize),
+    pub short: String,
     pub outline: String,
     pub body: (usize, usize),
     /// Step folds; empty for a method that only has its outline.
@@ -434,7 +454,7 @@ pub fn folds(m: &Method, steps: &[Step]) -> std::result::Result<Vec<Fold>, Strin
         if text.is_empty() {
             return Err(format!("{}..{} has no text", s.from, s.to));
         }
-        out.push(Fold { start: a.start, end: b.end, lead: a.lead.clone(), depth: s.depth.min(3), text });
+        out.push(Fold { start: a.start, end: b.end, kind: Kind::Step, lead: a.lead.clone(), depth: s.depth.min(3), text });
     }
     for id in &covered {
         let mut p = parent(id);
@@ -510,7 +530,7 @@ pub fn fold_all(src: &str, methods: &[Method], answers: &[Answer]) -> Vec<Folded
             });
             let outline = answer.map(|a| a.outline.trim().replace('\n', " ")).filter(|o| !o.is_empty()).unwrap_or_else(|| "…".into());
             if m.units.is_empty() {
-                return Folded { path: m.path.clone(), outline, body: m.body, folds: Vec::new(), fallback: None, runs: Vec::new() };
+                return Folded { path: m.path.clone(), decl: m.decl, short: m.short.clone(), outline, body: m.body, folds: Vec::new(), fallback: None, runs: Vec::new() };
             }
             let (steps, fallback) = match answer {
                 None => (baseline(m, src), Some("no answer for this method".to_string())),
@@ -523,39 +543,241 @@ pub fn fold_all(src: &str, methods: &[Method], answers: &[Answer]) -> Vec<Folded
             let runs = steps.iter().map(|s| (s.from.clone(), s.to.clone())).collect();
             // A single step says no more than the outline: show the outline only.
             let f = if f.len() <= 1 { Vec::new() } else { f };
-            Folded { path: m.path.clone(), outline, body: m.body, folds: f, fallback, runs }
+            Folded { path: m.path.clone(), decl: m.decl, short: m.short.clone(), outline, body: m.body, folds: f, fallback, runs }
         })
         .collect()
 }
 
-// ---------- rendering ----------
+// ---------- the frame: everything around the bodies ----------
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Level {
-    Outline,
-    Steps,
+/// Annotations that say nothing to a reader of the logic.
+const QUIET_ANNOTATIONS: &[&str] = &["Override", "SuppressWarnings", "Nullable", "NonNull", "Nonnull", "NotNull", "Autowired", "Inject", "Deprecated", "SafeVarargs", "FunctionalInterface"];
+
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The file as the editor shows it with every pseudo fold collapsed to `level`.
-pub fn render(src: &str, folded: &[Folded], level: Level) -> String {
-    let mut cuts: Vec<(usize, usize, String)> = Vec::new();
-    for f in folded {
-        if level == Level::Steps && !f.folds.is_empty() {
-            cuts.extend(f.folds.iter().map(|x| (x.start, x.end, x.placeholder())));
-        } else {
-            cuts.push((f.body.0, f.body.1, format!("{{ {} }}", f.outline)));
+/// Where a member starts once the comments directly above it are counted in.
+fn member_start(n: Node) -> usize {
+    let mut start = n.start_byte();
+    let mut p = n.prev_sibling();
+    while let Some(c) = p.filter(|c| is_comment(*c)) {
+        start = c.start_byte();
+        p = c.prev_sibling();
+    }
+    start
+}
+
+/// The annotations worth keeping (`@RestController`, `@PostMapping("/pay")`), each followed by a space.
+fn loud_annotations(n: Node, src: &str) -> String {
+    let Some(mods) = n.named_children(&mut n.walk()).find(|c| c.kind() == "modifiers") else { return String::new() };
+    mods.named_children(&mut mods.walk())
+        .filter(|a| matches!(a.kind(), "annotation" | "marker_annotation"))
+        .filter(|a| a.child_by_field_name("name").is_none_or(|nm| !QUIET_ANNOTATIONS.contains(&java::text(nm, src).rsplit('.').next().unwrap_or(""))))
+        .map(|a| format!("{} ", squash(java::text(a, src))))
+        .collect()
+}
+
+fn is_static(n: Node, src: &str) -> bool {
+    n.named_children(&mut n.walk()).find(|c| c.kind() == "modifiers").is_some_and(|m| java::text(m, src).split_whitespace().any(|w| w == "static"))
+}
+
+fn is_final(n: Node, src: &str) -> bool {
+    n.named_children(&mut n.walk()).find(|c| c.kind() == "modifiers").is_some_and(|m| java::text(m, src).split_whitespace().any(|w| w == "final"))
+}
+
+/// `(id, request)`: parameter names only.
+fn param_names(n: Node, src: &str) -> String {
+    let names: Vec<&str> = n
+        .child_by_field_name("parameters")
+        .map(|ps| {
+            ps.named_children(&mut ps.walk())
+                .filter_map(|p| match p.kind() {
+                    "formal_parameter" => p.child_by_field_name("name"),
+                    "spread_parameter" => p.named_children(&mut p.walk()).find(|c| c.kind() == "variable_declarator").and_then(|d| d.child_by_field_name("name")),
+                    _ => None,
+                })
+                .map(|nm| java::text(nm, src))
+                .collect()
+        })
+        .unwrap_or_default();
+    format!("({})", names.join(", "))
+}
+
+/// `handOver(id) → StagedReceipt`, `POST … pay(accountId, request) → ResponseEntity<PaymentView>`, `new PaymentService(…)`.
+fn signature(n: Node, src: &str) -> String {
+    let name = n.child_by_field_name("name").map_or("", |nm| java::text(nm, src));
+    let head = format!("{}{name}{}", loud_annotations(n, src), param_names(n, src));
+    match n.kind() {
+        "constructor_declaration" => format!("{}new {name}{}", loud_annotations(n, src), param_names(n, src)),
+        _ => match n.child_by_field_name("type").map(|t| squash(java::text(t, src))) {
+            Some(t) if t != "void" => format!("{head} → {t}"),
+            _ => head,
+        },
+    }
+}
+
+/// `class HandOverService implements HandOverPort`, `record Ended(outcome, cause)`.
+fn type_header(n: Node, src: &str) -> String {
+    let kind = match n.kind() {
+        "class_declaration" => "class",
+        "interface_declaration" => "interface",
+        "enum_declaration" => "enum",
+        "record_declaration" => "record",
+        _ => "annotation",
+    };
+    let name = n.child_by_field_name("name").map_or("", |nm| java::text(nm, src));
+    let mut out = format!("{}{kind} {name}", loud_annotations(n, src));
+    if kind == "record" {
+        out.push_str(&param_names(n, src));
+    }
+    for c in n.named_children(&mut n.walk()) {
+        if matches!(c.kind(), "superclass" | "super_interfaces" | "extends_interfaces" | "permits") {
+            out.push(' ');
+            out.push_str(&squash(java::text(c, src)));
         }
     }
-    cuts.sort_by_key(|c| c.0);
-    let mut out = String::new();
-    let mut at = 0;
-    for (s, e, text) in cuts {
-        if s < at {
+    out
+}
+
+/// A constructor that only stores its arguments (`this.x = requireNonNull(x)`): it tells a reader nothing the fields don't.
+fn is_wiring(n: Node, src: &str) -> bool {
+    n.kind() == "constructor_declaration"
+        && n.child_by_field_name("body").is_some_and(|b| {
+            b.named_children(&mut b.walk()).filter(|c| !is_comment(*c)).all(|st| {
+                let t = java::text(st, src).trim_start();
+                st.kind() == "expression_statement" && (t.starts_with("this.") || t.starts_with("Objects.requireNonNull") || t.starts_with("requireNonNull"))
+            })
+        })
+}
+
+fn field_names(n: Node, src: &str) -> Vec<String> {
+    n.children_by_field_name("declarator", &mut n.walk()).filter_map(|d| d.child_by_field_name("name")).map(|nm| java::text(nm, src).to_string()).collect()
+}
+
+/// The folds around the bodies, no model involved. Each type folds to `class Name: <outline>`; inside
+/// it its heading folds to `class Name implements X`, runs of fields to `uses a, b` / `constants A, B` /
+/// `state x` (swallowing a constructor that only wires them), and each method's Javadoc, annotations,
+/// modifiers and types to `name(params) → Type`. Package and imports fold to `package x.y`.
+pub fn frame(src: &str, type_outlines: &HashMap<String, String>) -> Vec<Fold> {
+    let Some(tree) = java::parse_tree(src) else { return Vec::new() };
+    let root = tree.root_node();
+    let mut out = Vec::new();
+    let heads: Vec<Node> = root.named_children(&mut root.walk()).filter(|c| matches!(c.kind(), "package_declaration" | "import_declaration")).collect();
+    if let (Some(first), Some(last)) = (heads.first(), heads.last()) {
+        let text = match heads.iter().find(|h| h.kind() == "package_declaration") {
+            Some(p) => squash(java::text(*p, src).trim_end_matches(';')),
+            None => "imports".into(),
+        };
+        out.push(Fold { start: first.start_byte(), end: last.end_byte(), kind: Kind::Detail, lead: String::new(), depth: 0, text });
+    }
+    types(root, "", src, type_outlines, &mut out);
+    out.sort_by_key(|f| (f.start, std::cmp::Reverse(f.end)));
+    out.dedup_by_key(|f| (f.start, f.end));
+    out
+}
+
+fn is_type(n: Node) -> bool {
+    matches!(n.kind(), "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration")
+}
+
+fn types(parent: Node, prefix: &str, src: &str, outlines: &HashMap<String, String>, out: &mut Vec<Fold>) {
+    let detail = |start: usize, end: usize, text: String| Fold { start, end, kind: Kind::Detail, lead: String::new(), depth: 0, text };
+    for t in parent.named_children(&mut parent.walk()).filter(|c| is_type(*c)) {
+        let start = member_start(t);
+        let name = t.child_by_field_name("name").map_or("", |nm| java::text(nm, src));
+        let path = format!("{prefix}{name}");
+        let Some(body) = t.child_by_field_name("body") else { continue };
+        let members: Vec<Node> = body.named_children(&mut body.walk()).filter(|c| !is_comment(*c)).collect();
+        if members.is_empty() {
+            out.push(detail(start, t.end_byte(), type_header(t, src)));
             continue;
         }
-        out.push_str(&src[at..s]);
-        out.push_str(&text);
-        at = e;
+        let outline = outlines.get(&path).map(|o| o.trim().replace('\n', " ")).filter(|o| !o.is_empty());
+        let kind = type_header(t, src).split_whitespace().find(|w| matches!(*w, "class" | "interface" | "enum" | "record" | "annotation")).unwrap_or("class").to_string();
+        out.push(Fold { start, end: t.end_byte(), kind: Kind::Class, lead: String::new(), depth: 0, text: format!("{kind} {name}: {}", outline.unwrap_or_else(|| "…".into())) });
+        // Down to and including the body's `{`, so the expanded class reads as a heading.
+        out.push(detail(start, body.start_byte() + 1, type_header(t, src)));
+        let mut i = 0;
+        while i < members.len() {
+            let m = members[i];
+            match m.kind() {
+                "field_declaration" | "constant_declaration" => {
+                    let kind = |f: Node| if is_static(f, src) { "constants" } else if is_final(f, src) { "uses" } else { "state" };
+                    let k = kind(m);
+                    let mut j = i;
+                    let mut names = Vec::new();
+                    while j < members.len() && matches!(members[j].kind(), "field_declaration" | "constant_declaration") && kind(members[j]) == k {
+                        names.extend(field_names(members[j], src));
+                        j += 1;
+                    }
+                    let mut end = members[j - 1].end_byte();
+                    if k == "uses" && j < members.len() && is_wiring(members[j], src) {
+                        end = members[j].end_byte();
+                        j += 1;
+                    }
+                    out.push(detail(member_start(m), end, format!("{k} {}", names.join(", "))));
+                    i = j;
+                    continue;
+                }
+                "method_declaration" | "constructor_declaration" => {
+                    let s = member_start(m);
+                    let end = m.child_by_field_name("body").map_or(m.end_byte(), |b| trim_back(src, b.start_byte()));
+                    out.push(detail(s, end, signature(m, src)));
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        types(body, &format!("{path}."), src, outlines, out);
+    }
+}
+
+/// Every fold of the file: the frame, each method folded to `name(params): <outline>`, and inside it
+/// either its steps or, for a method without steps, its body folded to `{ <outline> }`.
+pub fn all_folds(src: &str, folded: &[Folded], answers: &[Answer]) -> Vec<Fold> {
+    let types: HashMap<String, String> = answers.iter().map(|a| (a.path.clone(), a.outline.clone())).collect();
+    let mut out = frame(src, &types);
+    let wired: Vec<(usize, usize)> = out.iter().filter(|f| f.kind == Kind::Detail && f.text.starts_with("uses ")).map(|f| (f.start, f.end)).collect();
+    for f in folded {
+        // A wiring constructor already went into its `uses` line.
+        if wired.iter().any(|(s, e)| *s <= f.decl.0 && f.decl.1 <= *e) {
+            continue;
+        }
+        out.push(Fold { start: f.decl.0, end: f.decl.1, kind: Kind::Method, lead: String::new(), depth: 0, text: format!("{}: {}", f.short, f.outline) });
+        if f.folds.is_empty() {
+            out.push(Fold { start: f.body.0, end: f.body.1, kind: Kind::Body, lead: String::new(), depth: 0, text: format!("{{ {} }}", f.outline) });
+        } else {
+            out.extend(f.folds.iter().cloned());
+        }
+    }
+    out.sort_by_key(|f| (f.start, std::cmp::Reverse(f.end)));
+    out
+}
+
+/// The zoom level at which a fold shows as its placeholder: the number of zoomable folds around
+/// it. Detail folds never open by zooming.
+pub fn zoom_of(folds: &[Fold], f: &Fold) -> u8 {
+    if f.kind == Kind::Detail {
+        return u8::MAX;
+    }
+    folds.iter().filter(|o| o.kind != Kind::Detail && !std::ptr::eq(*o, f) && o.start <= f.start && f.end <= o.end && (o.start, o.end) != (f.start, f.end)).count() as u8
+}
+
+// ---------- rendering ----------
+
+/// The file as the editor shows it zoomed to `zoom`: 0 the class as one line, 1 one line per
+/// method, 2 each method's steps, 3 the code.
+pub fn render(src: &str, folds: &[Fold], zoom: u8) -> String {
+    let mut out = String::new();
+    let mut at = 0;
+    for f in folds {
+        if f.start < at || zoom_of(folds, f) < zoom {
+            continue;
+        }
+        out.push_str(&src[at..f.start]);
+        out.push_str(&f.placeholder());
+        at = f.end;
     }
     out.push_str(&src[at..]);
     out
@@ -566,8 +788,9 @@ fn utf16(src: &str, byte: usize) -> usize {
 }
 
 /// The IntelliJ wire format: UTF-16 offsets, as a Document counts them.
-pub fn wire(src: &str, folded: &[Folded]) -> Value {
-    json!({"methods": folded.iter().map(|f| json!({
+pub fn wire(src: &str, folds: &[Fold], folded: &[Folded]) -> Value {
+    json!({"folds": folds.iter().map(|x| json!({"start": utf16(src, x.start), "end": utf16(src, x.end), "placeholder": x.placeholder(), "zoom": zoom_of(folds, x)})).collect::<Vec<_>>(),
+    "methods": folded.iter().map(|f| json!({
         "path": f.path,
         "outline": f.outline,
         "body": [utf16(src, f.body.0), utf16(src, f.body.1)],
@@ -581,8 +804,12 @@ pub fn wire(src: &str, folded: &[Folded]) -> Value {
 fn schema() -> Value {
     json!({
         "type": "object",
-        "required": ["outlines", "methods"],
-        "properties": {"outlines": {"type": "array", "items": {
+        "required": ["types", "outlines", "methods"],
+        "properties": {"types": {"type": "array", "items": {
+            "type": "object",
+            "required": ["path", "outline"],
+            "properties": {"path": {"type": "string"}, "outline": {"type": "string"}}
+        }}, "outlines": {"type": "array", "items": {
             "type": "object",
             "required": ["path", "outline"],
             "properties": {"path": {"type": "string"}, "outline": {"type": "string"}}
@@ -620,7 +847,8 @@ pub fn ask(src: &str, methods: &[Method], model: &str) -> Result<Vec<Answer>> {
         return Ok(Vec::new());
     }
     let list: Vec<&str> = methods.iter().map(|m| m.path.as_str()).collect();
-    let prompt = format!("Methods: {}\n\n```java\n{}\n```\n", list.join(", "), marked(src, methods));
+    let types: Vec<String> = java::parse(src)?.into_iter().filter(|i| matches!(i.kind, "class" | "interface" | "enum" | "record")).map(|i| i.path).collect();
+    let prompt = format!("Types: {}\nMethods: {}\n\n```java\n{}\n```\n", types.join(", "), list.join(", "), marked(src, methods));
     let exe = std::env::var("WISH_CLAUDE").unwrap_or_else(|_| "claude".into());
     let mut child = Command::new(&exe)
         .env(crate::session::IN_CYCLE, "1")
@@ -649,7 +877,7 @@ pub fn ask(src: &str, methods: &[Method], model: &str) -> Result<Vec<Answer>> {
         serde_json::from_str(&text[s..e]).context("claude's answer is not JSON")?
     };
     let mut answers: Vec<Answer> = serde_json::from_value(v["methods"].clone()).context("claude's answer has no methods")?;
-    for o in v["outlines"].as_array().into_iter().flatten() {
+    for o in v["outlines"].as_array().into_iter().chain(v["types"].as_array()).flatten() {
         let (path, outline) = (o["path"].as_str().unwrap_or(""), o["outline"].as_str().unwrap_or(""));
         match answers.iter_mut().find(|a| a.path == path) {
             Some(a) if a.outline.is_empty() => a.outline = outline.to_string(),
@@ -685,7 +913,7 @@ fn read_input(file: &str) -> Result<String> {
 }
 
 /// `wishlang pseudo`.
-pub fn run(file: &str, json_out: bool, outline: bool, baseline_only: bool) -> Result<String> {
+pub fn run(file: &str, json_out: bool, zoom: u8, baseline_only: bool) -> Result<String> {
     let src = read_input(file)?;
     let ms = methods(&src)?;
     let answers = if baseline_only {
@@ -694,10 +922,11 @@ pub fn run(file: &str, json_out: bool, outline: bool, baseline_only: bool) -> Re
         answers(&src, &ms, &model())?
     };
     let folded = fold_all(&src, &ms, &answers);
+    let folds = all_folds(&src, &folded, &answers);
     if json_out {
-        return Ok(wire(&src, &folded).to_string());
+        return Ok(wire(&src, &folds, &folded).to_string());
     }
-    let mut out = render(&src, &folded, if outline { Level::Outline } else { Level::Steps });
+    let mut out = render(&src, &folds, zoom);
     for f in folded.iter().filter(|f| f.fallback.is_some() && !baseline_only) {
         out.push_str(&format!("\n// pseudo: {} fell back to one step per statement: {}", f.path, f.fallback.as_deref().unwrap_or("")));
     }
@@ -895,14 +1124,43 @@ mod tests {
         let folded = fold_all(HANDOVER, &ms, &answers);
         let h = folded.iter().find(|f| f.path == "HandOverService.handOver").unwrap();
         assert_eq!(h.fallback, None);
-        let text = render(HANDOVER, &folded, Level::Steps);
+        let text = render(HANDOVER, &steps_only(&folded), 0);
         assert!(text.contains(
             "    public StagedReceipt handOver(UUID id) {\n        claim message RECEIVED|FAILED → PROCESSING; else NotFound | NotAllowed\n        hand to route's handler → HandedOver | Rejected | Failed\n        record outcome\n          store down → stays PROCESSING; log, return\n        log hand-over, return receipt\n    }\n"
         ), "{text}");
-        let outline = render(HANDOVER, &folded, Level::Outline);
-        assert!(outline.contains("public StagedReceipt handOver(UUID id) { claim, hand to handler, record outcome → receipt }\n"), "{outline}");
-        // Step folds sit inside the outline fold.
         assert!(h.folds.iter().all(|f| f.start > h.body.0 && f.end < h.body.1));
+    }
+
+    fn steps_only(folded: &[Folded]) -> Vec<Fold> {
+        folded.iter().flat_map(|f| f.folds.clone()).collect()
+    }
+
+    #[test]
+    fn zoom_levels_class_then_methods_then_steps() {
+        let ms = methods(HANDOVER).unwrap();
+        let answers = vec![
+            Answer { path: "HandOverService".into(), outline: "hands staged messages over".into(), steps: vec![] },
+            Answer {
+                path: "HandOverService.handOver".into(),
+                outline: "claim, hand over, record → receipt".into(),
+                steps: vec![step("1", "3", 0, "claim and hand over"), step("4", "7", 0, "record, return receipt")],
+            },
+        ];
+        let folded = fold_all(HANDOVER, &ms, &answers);
+        let folds = all_folds(HANDOVER, &folded, &answers);
+        let z0 = render(HANDOVER, &folds, 0);
+        assert!(z0.starts_with("package com.example.staging.application.service\n\nclass HandOverService: hands staged messages over\n"), "{z0}");
+        let z1 = render(HANDOVER, &folds, 1);
+        assert!(z1.contains("class HandOverService implements HandOverPort\n\n    constants TECHNICAL_FAILURE, NO_HANDLER\n\n    uses statusPort, handlers, auditCorrelation, log\n\n    handOver(id): claim, hand over, record → receipt\n"), "{z1}");
+        assert!(!z1.contains("@Override") && !z1.contains("/**") && !z1.contains("requireNonNull"), "{z1}");
+        let z2 = render(HANDOVER, &folds, 2);
+        assert!(z2.contains("    handOver(id) → StagedReceipt {\n        claim and hand over\n        record, return receipt\n    }\n"), "{z2}");
+        assert!(z2.contains("    record Ended(outcome, cause)\n}"), "{z2}");
+        // Every zoomable fold nests inside the class fold; detail folds never open by zooming.
+        let class = folds.iter().find(|f| f.kind == Kind::Class).unwrap();
+        assert_eq!(zoom_of(&folds, class), 0);
+        assert!(folds.iter().filter(|f| f.kind == Kind::Step).all(|f| zoom_of(&folds, f) == 2));
+        assert!(folds.iter().filter(|f| f.kind == Kind::Detail).all(|f| zoom_of(&folds, f) == u8::MAX));
     }
 
     #[test]
@@ -933,7 +1191,7 @@ mod tests {
         let f = fold_all(HANDOVER, &ms, &answers);
         let s = f.iter().find(|f| f.path == "HandOverService.statusOf").unwrap();
         assert!(s.folds.is_empty() && s.fallback.is_none());
-        assert!(render(HANDOVER, &f, Level::Steps).contains("statusOf(HandOverOutcome outcome) { HandedOver→HANDED_OVER }"));
+        assert!(render(HANDOVER, &all_folds(HANDOVER, &f, &answers), 2).contains("statusOf(outcome) → StagedMessageStatus { HandedOver→HANDED_OVER }"));
     }
 
     #[test]
@@ -941,7 +1199,7 @@ mod tests {
         let src = "class A {\n  void f() {\n    String s = \"é😀\";\n    g(s);\n  }\n  void g(String s) {}\n}\n";
         let ms = methods(src).unwrap();
         let a = vec![Answer { path: "A.f".into(), outline: "o".into(), steps: vec![step("1", "1", 0, "x"), step("2", "2", 0, "y")] }];
-        let w = wire(src, &fold_all(src, &ms, &a));
+        let w = wire(src, &[], &fold_all(src, &ms, &a));
         let f = &w["methods"][0]["folds"][1];
         let byte = src.find("g(s)").unwrap();
         assert_eq!(f["start"].as_u64().unwrap() as usize, src[..byte].encode_utf16().count());
@@ -969,7 +1227,7 @@ mod tests {
         assert_eq!(first[0].outline, "does f");
         assert_eq!(second[0].steps, first[0].steps);
         assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1, "second call hits the cache");
-        let text = render(src, &fold_all(src, &ms, &first), Level::Steps);
+        let text = render(src, &steps_only(&fold_all(src, &ms, &first)), 0);
         assert!(text.contains("  void f() {\n    one\n    two\n  }"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }

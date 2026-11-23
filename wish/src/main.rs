@@ -47,16 +47,16 @@ enum Cmd {
     Dev,
     /// Claude Code hook (UserPromptSubmit and Stop) that records ordinary Claude sessions in the journal.
     Session,
-    /// Show a Java file as pseudocode: each method body folded to steps (or, with --outline, to one line).
+    /// Show a Java file as pseudocode, zoomable: each class as one line, then one line per method, then its steps.
     Pseudo {
         /// The Java file, or - for stdin.
         file: String,
         /// The fold ranges and texts as JSON (UTF-16 offsets), for editors.
         #[arg(long)]
         json: bool,
-        /// Fold each method to its one-line outline instead of its steps.
-        #[arg(long)]
-        outline: bool,
+        /// How far to zoom in: 0 each class as one line, 1 one line per method, 2 each method's steps.
+        #[arg(long, default_value_t = 2)]
+        zoom: u8,
         /// One step per statement, without asking Claude.
         #[arg(long)]
         baseline: bool,
@@ -251,7 +251,7 @@ Claude's proposals:
   decide       Accept or reject a decision
 
 Reading code:
-  pseudo       Show a Java file as pseudocode: folded steps and outlines
+  pseudo       Show a Java file as zoomable pseudocode: class, methods, steps
 
 History and tickets:
   log          The journal: every save and every Claude cycle with its reasoning
@@ -285,7 +285,7 @@ const DOCS: &[(&str, &str, &str)] = &[
     ("init", "Creates wish.toml in the current cargo or Maven project, a git journal and (for Rust) .zed/settings.json. Without --protect-existing, only src/main.rs (or the Java entry point) is protected.", "  wishlang init\n  wishlang init --protect-existing"),
     ("dev", "Terminal loop: compiles when you save, shows a live preview and lists Claude's decisions and suggestions.", "  wishlang dev"),
     ("session", "Hook for Claude Code (UserPromptSubmit and Stop). It records what an ordinary Claude session changed in the journal. Installed by `wishlang setup`; not meant to be run by hand.", "  wishlang setup"),
-    ("pseudo", "Folds every method body of a Java file into pseudocode: one line per business step, outcomes indented below, or with --outline one line per method. Claude only picks runs of whole statements; anything it gets wrong falls back to one step per statement. Answers are cached in ~/.wishlang/pseudo per file content. Works on any Java file, no wish.toml needed. WISH_PSEUDO_MODEL picks the model (default haiku).", "  wishlang pseudo src/main/java/demo/App.java\n  wishlang pseudo --outline App.java\n  git show main:App.java | wishlang pseudo -"),
+    ("pseudo", "Folds every method body of a Java file into pseudocode: one line per business step, outcomes indented below, --zoom 0 shows each class as one line, --zoom 1 one line per method. Claude only picks runs of whole statements; anything it gets wrong falls back to one step per statement. Answers are cached in ~/.wishlang/pseudo per file content. Works on any Java file, no wish.toml needed. WISH_PSEUDO_MODEL picks the model (default haiku).", "  wishlang pseudo src/main/java/demo/App.java\n  wishlang pseudo --zoom 1 App.java\n  git show main:App.java | wishlang pseudo -"),
     ("explain", "Reads {\"summary\", \"changes\"} JSON on stdin and keeps it for the Stop hook, which commits it as the turn's explanation. The hook tells Claude when to call it.", "  wishlang explain --session <id> < explanation.json"),
     ("import", "Rebuilds the branch's journal: the code at <since> is yours, every later commit that touches the project is Claude's, uncommitted changes are yours.", "  wishlang import main\n  wishlang import HEAD~5 --report report.json"),
     ("compile", "Runs one cycle: asks Claude to fill in what you wished for, verifies the result, records it in the journal, then launches the app. Exits 1 if the cycle fails.", "  wishlang compile\n  wishlang compile --force --note \"use tokio\"\n  wishlang compile --json"),
@@ -349,8 +349,8 @@ fn run() -> anyhow::Result<()> {
         Cmd::Init { protect_existing } => print(commands::init(protect_existing)),
         Cmd::Dev => dev::run(Project::discover()?),
         Cmd::Session => session::hook(),
-        Cmd::Pseudo { file, json, outline, baseline, eval, runs } => {
-            if eval { print(pseudo::eval(std::path::Path::new(&file), runs)) } else { print(pseudo::run(&file, json, outline, baseline)) }
+        Cmd::Pseudo { file, json, zoom, baseline, eval, runs } => {
+            if eval { print(pseudo::eval(std::path::Path::new(&file), runs)) } else { print(pseudo::run(&file, json, zoom, baseline)) }
         }
         Cmd::Explain { session } => print(session::explain(&session)),
         Cmd::Import { since, report } => print(session::import(&Project::discover()?, &since, report.as_deref())),

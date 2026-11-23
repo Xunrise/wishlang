@@ -1,6 +1,7 @@
 package wish
 
 import com.google.gson.Gson
+import com.intellij.codeInsight.folding.CodeFoldingManager
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
@@ -22,28 +23,27 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.Key
 import com.intellij.util.EnvironmentUtil
 
-/** `wishlang pseudo --json`: per method its outline, body range and step folds, in Document offsets. */
-data class PseudoFile(val methods: List<PseudoMethod> = emptyList())
-data class PseudoMethod(val path: String = "", val outline: String = "", val body: List<Int> = emptyList(), val folds: List<PseudoFold> = emptyList(), val fallback: String? = null)
-data class PseudoFold(val start: Int = 0, val end: Int = 0, val placeholder: String = "")
-
-/** A fold to add: outline folds hold the step folds of their method. */
-data class PseudoRegion(val start: Int, val end: Int, val placeholder: String, val expanded: Boolean)
-
 /**
- * The regions for a file: each method body folds to `{ outline }`, expanded when it has steps so the
- * steps show; each step folds to its line (the CLI already indented it).
+ * `wishlang pseudo --json`: every fold in Document offsets, nested as zoom levels (class, then its
+ * methods, then their steps) plus detail folds (imports, headings, fields, signatures).
  */
-fun pseudoRegions(file: PseudoFile): List<PseudoRegion> = file.methods.filter { it.body.size == 2 }.flatMap { m ->
-    listOf(PseudoRegion(m.body[0], m.body[1], "{ ${m.outline} }", expanded = m.folds.isNotEmpty())) +
-        m.folds.map { PseudoRegion(it.start, it.end, it.placeholder, expanded = false) }
-}
+data class PseudoFile(val folds: List<PseudoFold> = emptyList())
+data class PseudoFold(val start: Int = 0, val end: Int = 0, val placeholder: String = "", val zoom: Int = 0)
+
+/** A fold to add. All start collapsed: the file opens as one line per class, and each fold opens one level. */
+data class PseudoRegion(val start: Int, val end: Int, val placeholder: String)
+
+/** Outer folds first, so nested ones are added inside them. */
+fun pseudoRegions(file: PseudoFile): List<PseudoRegion> =
+    file.folds.filter { it.end > it.start }.sortedWith(compareBy({ it.start }, { -it.end })).map { PseudoRegion(it.start, it.end, it.placeholder) }
 
 private val PSEUDO = Key.create<Pseudo>("wish.pseudo")
 
 /** The pseudo folds of one editor, gone on toggle-off or on the first edit (their offsets would be stale). */
 private class Pseudo(val editor: Editor) : Disposable {
     var regions: List<FoldRegion> = emptyList()
+    /** The IDE's own folds that crossed ours (a code block's braces inside a step): rebuilt when we go. */
+    var displaced = false
 
     init {
         editor.document.addDocumentListener(object : DocumentListener {
@@ -52,10 +52,10 @@ private class Pseudo(val editor: Editor) : Disposable {
     }
 
     override fun dispose() {
+        if (editor.isDisposed) return
         val live = regions.filter { it.isValid }
-        if (live.isNotEmpty() && !editor.isDisposed) {
-            editor.foldingModel.runBatchFoldingOperation { live.forEach(editor.foldingModel::removeFoldRegion) }
-        }
+        if (live.isNotEmpty()) editor.foldingModel.runBatchFoldingOperation { live.forEach(editor.foldingModel::removeFoldRegion) }
+        if (displaced) editor.project?.let { CodeFoldingManager.getInstance(it).updateFoldRegions(editor) }
     }
 }
 
@@ -63,20 +63,28 @@ private fun clear(editor: Editor) {
     editor.getUserData(PSEUDO)?.let { editor.putUserData(PSEUDO, null); Disposer.dispose(it) }
 }
 
-/** Adds the regions; a body whose exact range is taken (the IDE's own method fold) folds just inside its braces. */
-private fun apply(editor: Editor, regions: List<PseudoRegion>) {
+/** Does [o] cross the range without one containing the other, or cover exactly the same range? */
+private fun clashes(o: FoldRegion, start: Int, end: Int): Boolean {
+    val same = o.startOffset == start && o.endOffset == end
+    val crosses = o.startOffset < end && start < o.endOffset &&
+        !(o.startOffset <= start && end <= o.endOffset) && !(start <= o.startOffset && o.endOffset <= end)
+    return same || crosses
+}
+
+/** Adds the regions, collapsed. The IDE's own folds that clash with one (it folds every `{}` block) make way. */
+internal fun applyPseudo(editor: Editor, regions: List<PseudoRegion>) {
     clear(editor)
     val pseudo = Pseudo(editor)
     val added = mutableListOf<FoldRegion>()
     val model = editor.foldingModel
     model.runBatchFoldingOperation {
         for (r in regions) {
-            val region = model.addFoldRegion(r.start, r.end, r.placeholder)
-                ?: model.getFoldRegion(r.start, r.end)?.takeIf { it.placeholderText != r.placeholder }?.let {
-                    model.addFoldRegion(r.start + 1, r.end - 1, r.placeholder.removePrefix("{").removeSuffix("}"))
-                }
-                ?: continue
-            region.isExpanded = r.expanded
+            model.allFoldRegions.filter { it !in added && clashes(it, r.start, r.end) }.forEach {
+                model.removeFoldRegion(it)
+                pseudo.displaced = true
+            }
+            val region = model.addFoldRegion(r.start, r.end, r.placeholder) ?: continue
+            region.isExpanded = false
             added += region
         }
     }
@@ -127,7 +135,7 @@ class ReadAsPseudocode : ToggleAction(), DumbAware {
             override fun run(indicator: ProgressIndicator) {
                 val file = pseudoOf(project, text) ?: return
                 ApplicationManager.getApplication().invokeLater {
-                    if (!editor.isDisposed && editor.document.modificationStamp == stamp) apply(editor, pseudoRegions(file))
+                    if (!editor.isDisposed && editor.document.modificationStamp == stamp) applyPseudo(editor, pseudoRegions(file))
                 }
             }
         }.queue()
